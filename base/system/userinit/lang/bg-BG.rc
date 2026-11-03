@@ -1,0 +1,7 @@
+LANGUAGE LANG_BULGARIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Приложението userinit не успя да пусне обвивката!"
+    IDS_INSTALLER_FAIL "Приложението userinit не успя да стартира инсталатор!"
+END

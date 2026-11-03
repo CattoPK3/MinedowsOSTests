@@ -1,0 +1,15 @@
+/*
+ * PROJECT:     ReactOS Userinit Logon Application
+ * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
+ * PURPOSE:     German resource file
+ * TRANSLATORS: Copyright 2005 Kevin Schnabel (FooDerGrosse) <kevin_schnabel@gmx.de>
+ *              Copyright 2024 Václav Zouzalík (Venca24) <vaclav.zouzalik@seznam.cz>
+ */
+
+LANGUAGE LANG_GERMAN, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit konnte die Shell nicht starten!"
+    IDS_INSTALLER_FAIL "Userinit konnte das Setup nicht starten!"
+END

@@ -1,0 +1,9 @@
+/* Translation by Vytis 'CMan' Girdžijauskas cman@cman.us */
+
+LANGUAGE LANG_LITHUANIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit nepavyko paleisti aplinkos!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

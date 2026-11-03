@@ -1,0 +1,7 @@
+LANGUAGE LANG_HEBREW, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit נכשל להפעיל את הממשק!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

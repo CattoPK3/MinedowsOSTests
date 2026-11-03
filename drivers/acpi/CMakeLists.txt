@@ -1,0 +1,6 @@
+add_subdirectory(cmbatt)
+add_subdirectory(acpiplat)
+add_subdirectory(acpipmi)
+add_subdirectory(acpitime)
+add_subdirectory(genbtn)
+add_subdirectory(wmiacpi)

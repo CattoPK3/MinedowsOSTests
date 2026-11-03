@@ -1,0 +1,14 @@
+/*
+ * PROJECT:     ReactOS Userinit Logon Application
+ * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
+ * PURPOSE:     Spanish (Basque) resource file
+ * TRANSLATOR:  Copyright 2021 Julen Urizar Compains <julenuri@hotmail.com>
+ */
+
+LANGUAGE LANG_BASQUE, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "¡Userinit no pudo iniciar el shell con éxito!"
+    IDS_INSTALLER_FAIL "¡Userinit no pudo iniciar el instalador!"
+END

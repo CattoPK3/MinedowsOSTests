@@ -1,0 +1,71 @@
+/*
+ * PROJECT:         ReactOS Kernel
+ * LICENSE:         GPL - See COPYING in the top level directory
+ * FILE:            base/applications/osk/lang/de-DE.rc
+ * PURPOSE:         On screen keyboard (German resources).
+ * PROGRAMMERS:     Denis ROBERT
+ */
+
+LANGUAGE LANG_GERMAN, SUBLANG_NEUTRAL
+
+IDR_OSK_MENU MENU
+BEGIN
+    POPUP "Datei"
+    BEGIN
+        MENUITEM "B&eenden", IDM_EXIT
+    END
+
+    POPUP "Tastatur"
+    BEGIN
+        MENUITEM "Erweiterte Tastatur", IDM_ENHANCED_KB, CHECKED
+        MENUITEM "Standard Tastatur", IDM_STANDARD_KB
+        MENUITEM SEPARATOR
+        MENUITEM "Reguläres Layout", IDM_REG_LAYOUT, CHECKED, GRAYED
+        MENUITEM "Block Layout", IDM_BLOCK_LAYOUT, GRAYED
+        MENUITEM SEPARATOR
+        MENUITEM "101 Tasten", IDM_101_KEYS, CHECKED, GRAYED
+        MENUITEM "102 Tasten", IDM_102_KEYS, GRAYED
+        MENUITEM "106 Tasten", IDM_106_KEYS, GRAYED
+    END
+
+    POPUP "Einstellungen"
+    BEGIN
+        MENUITEM "Immer im Vordergrund", IDM_ON_TOP, CHECKED
+        MENUITEM SEPARATOR
+        MENUITEM "Klick-Ton ben&utzen", IDM_CLICK_SOUND
+        MENUITEM SEPARATOR
+        MENUITEM "Eingabemodus...", IDM_TYPE_MODE, GRAYED
+        MENUITEM SEPARATOR
+        MENUITEM "&Schriftart...", IDM_FONT
+    END
+
+    POPUP "Hilfe"
+    BEGIN
+        MENUITEM "&Hilfethemen", IDM_HELP_TOPICS, GRAYED
+        MENUITEM SEPARATOR
+        MENUITEM "&Über Bildschirmtastatur...", IDM_ABOUT
+    END
+END
+
+STRINGTABLE
+BEGIN
+    IDS_OSK "Bildschirmtastatur"
+    IDS_AUTHORS "Copyright Denis Robert"
+    IDS_NUMLOCK "Num"
+    IDS_CAPSLOCK "Caps"
+    IDS_SCROLLLOCK "Scroll"
+    /* Make sure the text fits onto the buttons */
+    IDS_ESCAPE "Esc"
+    IDS_PRN "Prn"
+    IDS_STOP "Stop"
+    IDS_ATTN "Attn"
+    IDS_INSERT "ins"
+    IDS_NUMLOCKKEY "nlk"
+    IDS_DELETE "del"
+    IDS_END "end"
+    IDS_CTRL "ctrl"
+    IDS_LEFTALT "alt"
+    IDS_RIGHTALT "alt"
+END
+
+/* EOF */

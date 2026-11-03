@@ -1,0 +1,15 @@
+/*
+ *    Translated by xrogers (http://rogers.cyberdusk.pl/)
+ *    xxrogers@users.sourceforge.net
+ *    https://sourceforge.net/projects/reactospl
+ *    UTF-8 conversion by Caemyr (May, 2011)
+ *    Updated by Marcin Mikołajczak <me@m4sk.in> (September, 2017)
+ */
+
+LANGUAGE LANG_POLISH, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Uruchomienie powłoki przez userinit nie powiodło się!"
+    IDS_INSTALLER_FAIL "Rozpoczęcie instalatora przez userinit nie powiodło się!"
+END

@@ -1,0 +1,7 @@
+LANGUAGE LANG_ITALIAN, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit non ha potuto avviare l'ambiente grafico!"
+    IDS_INSTALLER_FAIL "Userinit non ha potuto avviare l'installazione!"
+END

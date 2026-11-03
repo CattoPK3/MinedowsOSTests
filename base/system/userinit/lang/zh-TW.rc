@@ -1,0 +1,15 @@
+/*
+ * PROJECT:     ReactOS Userinit Logon Application
+ * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
+ * PURPOSE:     Chinese (Traditional) resource file
+ * TRANSLATORS: Copyright 2016 Henry Tang Ih <henrytang2@hotmail.com>
+ *              Copyright 2020-2021 Chan Chilung <eason066@gmail.com>
+ */
+
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit 無法啟動殼層！"
+    IDS_INSTALLER_FAIL "Userinit 無法啟動安裝程式！"
+END

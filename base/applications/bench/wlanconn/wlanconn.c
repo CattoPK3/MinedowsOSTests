@@ -1,0 +1,621 @@
+/*
+ * PROJECT:     LiberNT Native WiFi
+ * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
+ * PURPOSE:     Command-line connect to a WPA2 network (bring-up test harness)
+ * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
+ */
+
+#include <stdarg.h>
+#include <windows.h>
+#include <wlanapi.h>
+#include <objbase.h>
+#include <stdio.h>
+#include <wchar.h>
+
+static void
+WlanEmit(PCWSTR Format, ...)
+{
+    WCHAR WideBuffer[1024];
+    CHAR AnsiBuffer[1024];
+    va_list Args;
+
+    va_start(Args, Format);
+    _vsnwprintf(WideBuffer, ARRAYSIZE(WideBuffer) - 1, Format, Args);
+    va_end(Args);
+    WideBuffer[ARRAYSIZE(WideBuffer) - 1] = L'\0';
+
+    fputws(WideBuffer, stdout);
+    fflush(stdout);
+
+    WideCharToMultiByte(CP_UTF8, 0, WideBuffer, -1, AnsiBuffer, sizeof(AnsiBuffer), NULL, NULL);
+    OutputDebugStringA(AnsiBuffer);
+}
+#define wprintf WlanEmit
+
+static BOOL
+WlanXmlEscape(
+    _Out_writes_(DestinationLength) PWCHAR Destination,
+    _In_ SIZE_T DestinationLength,
+    _In_ PCWSTR Source)
+{
+    SIZE_T Position = 0;
+
+    while (*Source != L'\0')
+    {
+        PCWSTR Replacement = NULL;
+
+        switch (*Source)
+        {
+            case L'&': Replacement = L"&amp;"; break;
+            case L'<': Replacement = L"&lt;"; break;
+            case L'>': Replacement = L"&gt;"; break;
+            case L'\"': Replacement = L"&quot;"; break;
+            case L'\'': Replacement = L"&apos;"; break;
+        }
+
+        if (Replacement != NULL)
+        {
+            SIZE_T ReplacementLength = wcslen(Replacement);
+
+            if (Position + ReplacementLength >= DestinationLength)
+                return FALSE;
+
+            RtlCopyMemory(&Destination[Position], Replacement, ReplacementLength * sizeof(WCHAR));
+            Position += ReplacementLength;
+        }
+        else
+        {
+            if (Position + 1 >= DestinationLength)
+                return FALSE;
+
+            Destination[Position++] = *Source;
+        }
+
+        Source++;
+    }
+
+    Destination[Position] = L'\0';
+    return TRUE;
+}
+
+typedef struct _WLANCONN_SCAN_WAIT
+{
+    HANDLE Event;
+    DWORD Code;
+} WLANCONN_SCAN_WAIT, *PWLANCONN_SCAN_WAIT;
+
+static VOID WINAPI
+WlanScanNotify(PWLAN_NOTIFICATION_DATA Data, PVOID Context)
+{
+    PWLANCONN_SCAN_WAIT Wait = (PWLANCONN_SCAN_WAIT)Context;
+
+    if (Data == NULL || Wait == NULL ||
+        Data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM)
+    {
+        return;
+    }
+    if (Data->NotificationCode == wlan_notification_acm_scan_complete ||
+        Data->NotificationCode == wlan_notification_acm_scan_fail)
+    {
+        Wait->Code = Data->NotificationCode;
+        SetEvent(Wait->Event);
+    }
+}
+
+static BOOL
+WlanLoadKeyFile(
+    _In_ PCWSTR Path,
+    _Out_writes_(KeyChars) PWCHAR Key,
+    _In_ DWORD KeyChars)
+{
+    HANDLE File;
+    CHAR Bytes[256];
+    DWORD Size;
+    DWORD Read = 0;
+    INT Chars;
+
+    RtlZeroMemory(Bytes, sizeof(Bytes));
+    Key[0] = L'\0';
+    File = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (File == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    Size = GetFileSize(File, NULL);
+    if (Size == INVALID_FILE_SIZE || Size == 0 || Size >= sizeof(Bytes) ||
+        !ReadFile(File, Bytes, Size, &Read, NULL) || Read != Size)
+    {
+        CloseHandle(File);
+        SecureZeroMemory(Bytes, sizeof(Bytes));
+        return FALSE;
+    }
+    CloseHandle(File);
+
+    while (Size != 0 && (Bytes[Size - 1] == '\r' || Bytes[Size - 1] == '\n'))
+        Size--;
+    if (Size == 0 || memchr(Bytes, '\0', Size) != NULL)
+    {
+        SecureZeroMemory(Bytes, sizeof(Bytes));
+        return FALSE;
+    }
+
+    Chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                Bytes, Size, Key, KeyChars - 1);
+    SecureZeroMemory(Bytes, sizeof(Bytes));
+    if (Chars <= 0 || (DWORD)Chars >= KeyChars)
+        return FALSE;
+    Key[Chars] = L'\0';
+    return TRUE;
+}
+
+static BOOL
+WlanValidWpa2Key(PCWSTR Key)
+{
+    SIZE_T Length = wcslen(Key);
+    SIZE_T Index;
+
+    if (Length < 8 || Length > 64)
+        return FALSE;
+    if (Length != 64)
+        return TRUE;
+    for (Index = 0; Index < Length; Index++)
+    {
+        WCHAR Character = Key[Index];
+
+        if (!((Character >= L'0' && Character <= L'9') ||
+              (Character >= L'a' && Character <= L'f') ||
+              (Character >= L'A' && Character <= L'F')))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL
+WlanContains(
+    _In_ PCWSTR Text,
+    _In_ PCWSTR Pattern)
+{
+    SIZE_T PatternLength = wcslen(Pattern);
+
+    for (; *Text; Text++)
+    {
+        if (_wcsnicmp(Text, Pattern, PatternLength) == 0)
+            return TRUE;
+    }
+    return PatternLength == 0;
+}
+
+static VOID WINAPI
+WlanMonitorNotify(PWLAN_NOTIFICATION_DATA Data, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if (Data == NULL)
+        return;
+
+    if (Data->NotificationSource == WLAN_NOTIFICATION_SOURCE_MSM &&
+        Data->NotificationCode == wlan_notification_msm_signal_quality_change &&
+        Data->pData != NULL && Data->dwDataSize >= sizeof(WLAN_SIGNAL_QUALITY))
+    {
+        wprintf(L"WLANCONN: msm %lu quality %lu\n", Data->NotificationCode, *(PWLAN_SIGNAL_QUALITY)Data->pData);
+    }
+    else if (Data->NotificationSource == WLAN_NOTIFICATION_SOURCE_MSM &&
+             Data->pData != NULL && Data->dwDataSize >= sizeof(WLAN_MSM_NOTIFICATION_DATA))
+    {
+        PWLAN_MSM_NOTIFICATION_DATA Msm = (PWLAN_MSM_NOTIFICATION_DATA)Data->pData;
+
+        wprintf(L"WLANCONN: msm %lu %02x:%02x:%02x:%02x:%02x:%02x reason %lu\n", Data->NotificationCode,
+                Msm->dot11MacAddr[0], Msm->dot11MacAddr[1], Msm->dot11MacAddr[2],
+                Msm->dot11MacAddr[3], Msm->dot11MacAddr[4], Msm->dot11MacAddr[5], Msm->wlanReasonCode);
+    }
+    else
+    {
+        wprintf(L"WLANCONN: %s %lu\n",
+                Data->NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM ? L"acm" : L"msm",
+                Data->NotificationCode);
+    }
+}
+
+static int
+WlanMonitor(
+    _In_ DWORD Seconds)
+{
+    HANDLE hClient = NULL;
+    DWORD dwVersion = 0;
+    DWORD Result;
+
+    Result = WlanOpenHandle(2, NULL, &dwVersion, &hClient);
+    if (Result != ERROR_SUCCESS)
+    {
+        wprintf(L"WLANCONN: WlanOpenHandle failed %lu\n", Result);
+        return 1;
+    }
+
+    Result = WlanRegisterNotification(hClient, WLAN_NOTIFICATION_SOURCE_ACM | WLAN_NOTIFICATION_SOURCE_MSM,
+                                      FALSE, WlanMonitorNotify, NULL, NULL, NULL);
+    if (Result != ERROR_SUCCESS)
+    {
+        wprintf(L"WLANCONN: WlanRegisterNotification failed %lu\n", Result);
+        WlanCloseHandle(hClient, NULL);
+        return 1;
+    }
+
+    Sleep(Seconds * 1000);
+    WlanRegisterNotification(hClient, WLAN_NOTIFICATION_SOURCE_NONE, FALSE, NULL, NULL, NULL, NULL);
+    WlanCloseHandle(hClient, NULL);
+    return 0;
+}
+
+static int
+WlanDisconnectInterface(
+    _In_opt_ PCWSTR InterfaceMatch)
+{
+    HANDLE hClient = NULL;
+    DWORD dwVersion = 0;
+    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
+    const GUID *InterfaceGuid = NULL;
+    PWLAN_CONNECTION_ATTRIBUTES Attributes;
+    WLAN_OPCODE_VALUE_TYPE ValueType;
+    DWORD DataSize;
+    DWORD Result;
+    DWORD Index;
+    ULONG Attempt;
+    BOOL Disconnected = FALSE;
+
+    Result = WlanOpenHandle(2, NULL, &dwVersion, &hClient);
+    if (Result != ERROR_SUCCESS)
+    {
+        wprintf(L"WLANCONN: WlanOpenHandle failed %lu\n", Result);
+        return 1;
+    }
+
+    Result = WlanEnumInterfaces(hClient, NULL, &pIfList);
+    if (Result != ERROR_SUCCESS || pIfList == NULL || pIfList->dwNumberOfItems == 0)
+    {
+        wprintf(L"WLANCONN: no WLAN interface (%lu)\n", Result);
+        goto Cleanup;
+    }
+
+    for (Index = 0; Index < pIfList->dwNumberOfItems; Index++)
+    {
+        if (!InterfaceMatch || WlanContains(pIfList->InterfaceInfo[Index].strInterfaceDescription, InterfaceMatch))
+        {
+            InterfaceGuid = &pIfList->InterfaceInfo[Index].InterfaceGuid;
+            break;
+        }
+    }
+    if (InterfaceGuid == NULL)
+    {
+        wprintf(L"WLANCONN: no WLAN interface matches %s\n", InterfaceMatch);
+        goto Cleanup;
+    }
+
+    Result = WlanDisconnect(hClient, InterfaceGuid, NULL);
+    wprintf(L"WLANCONN: WlanDisconnect 0x%lx\n", Result);
+    if (Result != ERROR_SUCCESS)
+        goto Cleanup;
+
+    for (Attempt = 0; Attempt < 40 && !Disconnected; Attempt++)
+    {
+        DataSize = 0;
+        Attributes = NULL;
+        Result = WlanQueryInterface(hClient, InterfaceGuid, wlan_intf_opcode_current_connection,
+                                    NULL, &DataSize, (PVOID *)&Attributes, &ValueType);
+        if (Result != ERROR_SUCCESS ||
+            Attributes == NULL ||
+            Attributes->isState == wlan_interface_state_disconnected)
+        {
+            Disconnected = TRUE;
+        }
+        if (Attributes != NULL)
+            WlanFreeMemory(Attributes);
+        if (!Disconnected)
+            Sleep(250);
+    }
+    wprintf(Disconnected ? L"WLANCONN: disconnected\n" : L"WLANCONN: still connected after 10 seconds\n");
+
+Cleanup:
+    if (pIfList != NULL)
+        WlanFreeMemory(pIfList);
+    WlanCloseHandle(hClient, NULL);
+    return Disconnected ? 0 : 1;
+}
+
+int
+wmain(int argc, WCHAR **argv)
+{
+    HANDLE hClient = NULL;
+    DWORD dwVersion = 0;
+    PWLAN_INTERFACE_INFO_LIST pIfList = NULL;
+    WLAN_CONNECTION_PARAMETERS Params;
+    PCWSTR Ssid;
+    PCWSTR InterfaceMatch = NULL;
+    PCWSTR Authentication = L"WPA2PSK";
+    const GUID *InterfaceGuid = NULL;
+    INT ArgIndex;
+    DWORD Index;
+    WCHAR Key[128];
+    WCHAR SsidXml[512];
+    WCHAR KeyXml[512];
+    WCHAR ProfileXml[2048];
+    CHAR SsidBytes[DOT11_SSID_MAX_LENGTH + 1];
+    INT SsidByteLength;
+    INT ProfileLength;
+    DWORD Result;
+    DWORD Reason = 0;
+    DWORD PreviousSource = 0;
+    DWORD DataSize;
+    WLAN_OPCODE_VALUE_TYPE ValueType;
+    PWLAN_CONNECTION_ATTRIBUTES Attributes = NULL;
+    WLANCONN_SCAN_WAIT ScanWait;
+    BOOL ProfileSet = FALSE;
+    BOOL Connected = FALSE;
+    ULONG Attempt;
+    DOT11_BSSID_LIST BssidList;
+    BOOL HaveBssid = FALSE;
+    BOOL SkipScan = FALSE;
+
+    RtlZeroMemory(Key, sizeof(Key));
+    RtlZeroMemory(KeyXml, sizeof(KeyXml));
+    RtlZeroMemory(ProfileXml, sizeof(ProfileXml));
+
+    if (argc == 3 && _wcsicmp(argv[1], L"--monitor") == 0)
+        return WlanMonitor(wcstoul(argv[2], NULL, 10));
+
+    if (argc >= 2 && _wcsicmp(argv[1], L"--disconnect") == 0)
+    {
+        if (argc == 2)
+            return WlanDisconnectInterface(NULL);
+        if (argc == 4 && _wcsicmp(argv[2], L"--interface") == 0)
+            return WlanDisconnectInterface(argv[3]);
+    }
+
+    ArgIndex = (argc >= 3 && _wcsicmp(argv[2], L"--key-file") == 0) ? 4 : 3;
+    for (Index = ArgIndex; Index < (DWORD)argc; Index++)
+    {
+        if (_wcsicmp(argv[Index], L"--interface") == 0 && Index + 1 < (DWORD)argc)
+            InterfaceMatch = argv[++Index];
+        else if (_wcsicmp(argv[Index], L"--wpa3") == 0)
+            Authentication = L"WPA3SAE";
+        else if (_wcsicmp(argv[Index], L"--no-scan") == 0)
+            SkipScan = TRUE;
+        else if (_wcsicmp(argv[Index], L"--bssid") == 0 && Index + 1 < (DWORD)argc)
+        {
+            UINT Octets[6];
+            UINT Octet;
+
+            if (swscanf(argv[++Index], L"%2x:%2x:%2x:%2x:%2x:%2x",
+                        &Octets[0], &Octets[1], &Octets[2], &Octets[3], &Octets[4], &Octets[5]) != 6)
+                break;
+            ZeroMemory(&BssidList, sizeof(BssidList));
+            BssidList.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+            BssidList.Header.Revision = DOT11_BSSID_LIST_REVISION_1;
+            BssidList.Header.Size = sizeof(BssidList);
+            BssidList.uNumOfEntries = 1;
+            BssidList.uTotalNumOfEntries = 1;
+            for (Octet = 0; Octet < 6; Octet++)
+                BssidList.BSSIDs[0][Octet] = (UCHAR)Octets[Octet];
+            HaveBssid = TRUE;
+        }
+        else
+            break;
+    }
+    if (argc < 3 || ArgIndex > (DWORD)argc || Index != (DWORD)argc)
+    {
+        wprintf(L"usage: wlanconn <ssid> <passphrase> [--interface <description>] [--wpa3] [--bssid <xx:xx:xx:xx:xx:xx>] [--no-scan]\n"
+                L"       wlanconn <ssid> --key-file <path> [--interface <description>] [--wpa3] [--bssid <xx:xx:xx:xx:xx:xx>] [--no-scan]\n"
+                L"       wlanconn --disconnect [--interface <description>]\n"
+                L"       wlanconn --monitor <seconds>\n");
+        return 1;
+    }
+
+    Ssid = argv[1];
+    if (ArgIndex == 4)
+    {
+        if (!WlanLoadKeyFile(argv[3], Key, ARRAYSIZE(Key)))
+        {
+            wprintf(L"WLANCONN: cannot read key file\n");
+            goto Cleanup;
+        }
+    }
+    else
+    {
+        SIZE_T KeyLength = wcslen(argv[2]);
+
+        if (KeyLength >= ARRAYSIZE(Key))
+        {
+            wprintf(L"WLANCONN: key is too long\n");
+            goto Cleanup;
+        }
+        wcscpy(Key, argv[2]);
+        SecureZeroMemory(argv[2], KeyLength * sizeof(WCHAR));
+    }
+    if (!WlanValidWpa2Key(Key))
+    {
+        wprintf(L"WLANCONN: invalid WPA2 key length or format\n");
+        goto Cleanup;
+    }
+
+    SsidByteLength = WideCharToMultiByte(CP_UTF8, 0, Ssid, -1,
+                                         SsidBytes, sizeof(SsidBytes),
+                                         NULL, NULL);
+    if (SsidByteLength <= 1 || SsidByteLength - 1 > DOT11_SSID_MAX_LENGTH)
+    {
+        wprintf(L"WLANCONN: invalid SSID\n");
+        goto Cleanup;
+    }
+    SsidByteLength--;
+
+    if (!WlanXmlEscape(SsidXml, ARRAYSIZE(SsidXml), Ssid) ||
+        !WlanXmlEscape(KeyXml, ARRAYSIZE(KeyXml), Key))
+    {
+        wprintf(L"WLANCONN: profile value is too long\n");
+        goto Cleanup;
+    }
+
+    ProfileLength = _snwprintf(ProfileXml, ARRAYSIZE(ProfileXml) - 1, L"<?xml version=\"1.0\"?>\r\n" L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">\r\n" L"<name>%s</name>\r\n" L"<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>\r\n" L"<connectionType>ESS</connectionType>\r\n" L"<connectionMode>manual</connectionMode>\r\n" L"<MSM><security>\r\n" L"<authEncryption><authentication>%s</authentication>" L"<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>\r\n" L"<sharedKey><keyType>passPhrase</keyType><protected>false</protected>" L"<keyMaterial>%s</keyMaterial></sharedKey>\r\n" L"</security></MSM>\r\n" L"</WLANProfile>\r\n", SsidXml, SsidXml, Authentication, KeyXml);
+    ProfileXml[ARRAYSIZE(ProfileXml) - 1] = L'\0';
+    if (ProfileLength < 0 || ProfileLength >= ARRAYSIZE(ProfileXml))
+    {
+        wprintf(L"WLANCONN: profile XML is too long\n");
+        goto Cleanup;
+    }
+
+    Result = WlanOpenHandle(2, NULL, &dwVersion, &hClient);
+    if (Result != ERROR_SUCCESS)
+    {
+        wprintf(L"WLANCONN: WlanOpenHandle failed %lu\n", Result);
+        goto Cleanup;
+    }
+
+    Result = WlanEnumInterfaces(hClient, NULL, &pIfList);
+    if (Result != ERROR_SUCCESS || pIfList == NULL || pIfList->dwNumberOfItems == 0)
+    {
+        wprintf(L"WLANCONN: no WLAN interface (%lu)\n", Result);
+        goto Cleanup;
+    }
+
+    for (Index = 0; Index < pIfList->dwNumberOfItems; Index++)
+    {
+        WCHAR GuidText[40];
+
+        if (!StringFromGUID2(&pIfList->InterfaceInfo[Index].InterfaceGuid, GuidText, ARRAYSIZE(GuidText)))
+            GuidText[0] = L'\0';
+        if (!InterfaceMatch ||
+            WlanContains(pIfList->InterfaceInfo[Index].strInterfaceDescription, InterfaceMatch) ||
+            WlanContains(GuidText, InterfaceMatch))
+        {
+            InterfaceGuid = &pIfList->InterfaceInfo[Index].InterfaceGuid;
+            wprintf(L"WLANCONN: using %s\n", pIfList->InterfaceInfo[Index].strInterfaceDescription);
+            break;
+        }
+    }
+    if (InterfaceGuid == NULL)
+    {
+        wprintf(L"WLANCONN: no WLAN interface matches %s\n", InterfaceMatch);
+        goto Cleanup;
+    }
+
+    if (SkipScan)
+        goto Profile;
+
+    RtlZeroMemory(&ScanWait, sizeof(ScanWait));
+    ScanWait.Event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (ScanWait.Event == NULL)
+    {
+        wprintf(L"WLANCONN: cannot create scan event\n");
+        goto Cleanup;
+    }
+    Result = WlanRegisterNotification(hClient, WLAN_NOTIFICATION_SOURCE_ACM,
+                                      FALSE, WlanScanNotify, &ScanWait,
+                                      NULL, &PreviousSource);
+    if (Result != ERROR_SUCCESS)
+    {
+        wprintf(L"WLANCONN: scan notification registration failed %lu\n", Result);
+        CloseHandle(ScanWait.Event);
+        goto Cleanup;
+    }
+    Result = WlanScan(hClient, InterfaceGuid,
+                      NULL, NULL, NULL);
+    if (Result != ERROR_SUCCESS ||
+        WaitForSingleObject(ScanWait.Event, 15000) != WAIT_OBJECT_0 ||
+        ScanWait.Code != wlan_notification_acm_scan_complete)
+    {
+        wprintf(L"WLANCONN: scan did not complete (%lu)\n", Result);
+        WlanRegisterNotification(hClient, WLAN_NOTIFICATION_SOURCE_NONE,
+                                 FALSE, NULL, NULL, NULL, &PreviousSource);
+        CloseHandle(ScanWait.Event);
+        goto Cleanup;
+    }
+    WlanRegisterNotification(hClient, WLAN_NOTIFICATION_SOURCE_NONE,
+                             FALSE, NULL, NULL, NULL, &PreviousSource);
+    CloseHandle(ScanWait.Event);
+
+Profile:
+    Result = WlanSetProfile(hClient, InterfaceGuid, 0, ProfileXml, NULL, TRUE, NULL, &Reason);
+    wprintf(L"WLANCONN: WlanSetProfile 0x%lx (reason %lu)\n", Result, Reason);
+    SecureZeroMemory(Key, sizeof(Key));
+    SecureZeroMemory(KeyXml, sizeof(KeyXml));
+    SecureZeroMemory(ProfileXml, sizeof(ProfileXml));
+    if (Result != ERROR_SUCCESS)
+        goto Cleanup;
+    ProfileSet = TRUE;
+
+    ZeroMemory(&Params, sizeof(Params));
+    Params.wlanConnectionMode = wlan_connection_mode_profile;
+    Params.strProfile = Ssid;
+    Params.dot11BssType = dot11_BSS_type_infrastructure;
+    if (HaveBssid)
+        Params.pDesiredBssidList = &BssidList;
+
+    Result = WlanConnect(hClient, InterfaceGuid, &Params, NULL);
+    wprintf(L"WLANCONN: WlanConnect 0x%lx\n", Result);
+    if (Result != ERROR_SUCCESS)
+        goto Cleanup;
+
+    for (Attempt = 0; Attempt < 120; Attempt++)
+    {
+        DataSize = 0;
+        Attributes = NULL;
+        Result = WlanQueryInterface(hClient,
+                                    InterfaceGuid,
+                                    wlan_intf_opcode_current_connection,
+                                    NULL,
+                                    &DataSize,
+                                    (PVOID *)&Attributes,
+                                    &ValueType);
+        if (Result == ERROR_SUCCESS && Attributes != NULL)
+        {
+            PDOT11_SSID ConnectedSsid =
+                &Attributes->wlanAssociationAttributes.dot11Ssid;
+
+            if (Attributes->isState == wlan_interface_state_connected &&
+                ConnectedSsid->uSSIDLength == (ULONG)SsidByteLength &&
+                memcmp(ConnectedSsid->ucSSID, SsidBytes, SsidByteLength) == 0)
+            {
+                PDOT11_MAC_ADDRESS Bssid =
+                    &Attributes->wlanAssociationAttributes.dot11Bssid;
+
+                wprintf(L"WLANCONN: connected BSSID "
+                        L"%02x:%02x:%02x:%02x:%02x:%02x signal %lu%% "
+                        L"RX %lu.%03lu Mbit/s TX %lu.%03lu Mbit/s\n",
+                        (*Bssid)[0], (*Bssid)[1], (*Bssid)[2],
+                        (*Bssid)[3], (*Bssid)[4], (*Bssid)[5],
+                        Attributes->wlanAssociationAttributes.wlanSignalQuality,
+                        Attributes->wlanAssociationAttributes.ulRxRate / 1000,
+                        Attributes->wlanAssociationAttributes.ulRxRate % 1000,
+                        Attributes->wlanAssociationAttributes.ulTxRate / 1000,
+                        Attributes->wlanAssociationAttributes.ulTxRate % 1000);
+                Connected = TRUE;
+            }
+            WlanFreeMemory(Attributes);
+            Attributes = NULL;
+            if (Connected)
+                break;
+        }
+        Sleep(250);
+    }
+    if (!Connected)
+        wprintf(L"WLANCONN: connection was not authorized within 30 seconds\n");
+
+Cleanup:
+    if (Attributes != NULL)
+        WlanFreeMemory(Attributes);
+    if (ProfileSet && hClient != NULL && InterfaceGuid != NULL)
+    {
+        WlanDeleteProfile(hClient,
+                          InterfaceGuid,
+                          Ssid,
+                          NULL);
+    }
+    SecureZeroMemory(Key, sizeof(Key));
+    SecureZeroMemory(KeyXml, sizeof(KeyXml));
+    SecureZeroMemory(ProfileXml, sizeof(ProfileXml));
+    if (pIfList != NULL)
+        WlanFreeMemory(pIfList);
+    if (hClient != NULL)
+        WlanCloseHandle(hClient, NULL);
+    return Connected ? 0 : 1;
+}

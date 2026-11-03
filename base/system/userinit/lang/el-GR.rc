@@ -1,0 +1,9 @@
+/* Greek translation by Dj Apal */
+
+LANGUAGE LANG_GREEK, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "H Userinit δε μπόρεσε να εκκινήσει το κέλυφος!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

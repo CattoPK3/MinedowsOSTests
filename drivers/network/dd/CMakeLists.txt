@@ -1,0 +1,47 @@
+
+#
+# PROJECT:     ReactOS Network Drivers
+# LICENSE:     GPL-2.0+ (https://spdx.org/licenses/GPL-2.0+)
+# FILE:        drivers/network/dd/CMakeLists.txt
+# PURPOSE:     Network driver build rules
+# COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
+#
+
+add_subdirectory(dc21x4)
+math(EXPR _E1000E_NT_NUM "${REACTOS_TARGET_NT} + 0")
+if(_E1000E_NT_NUM GREATER_EQUAL 1536)
+    add_subdirectory(e1000e)
+    add_subdirectory(vmxnet3)
+endif()
+if((ARCH STREQUAL "arm64") AND RPI5_SUPPORT AND (_E1000E_NT_NUM GREATER_EQUAL 1536))
+    add_subdirectory(rp1gem)
+endif()
+if((ARCH STREQUAL "riscv64") AND SPACEMIT_K1_SUPPORT AND (_E1000E_NT_NUM GREATER_EQUAL 1536))
+    add_subdirectory(k1xemac)
+endif()
+if(NOT ARCH STREQUAL "riscv64")
+    add_subdirectory(ne2000)
+endif()
+add_subdirectory(netkvm)
+if(ARCH STREQUAL "amd64")
+    add_subdirectory(netvsc)
+endif()
+if(ARCH STREQUAL "amd64")
+    add_subdirectory(netr28ux)
+endif()
+if(ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64")
+    add_subdirectory(nvnet)
+endif()
+add_subdirectory(pcnet)
+add_subdirectory(rtl8139)
+add_subdirectory(vwifi)
+if(ENABLE_RT2800USB AND (_E1000E_NT_NUM GREATER_EQUAL 1536))
+    add_subdirectory(rt2800usb)
+endif()
+if(ENABLE_RTW8852BS AND (_E1000E_NT_NUM GREATER_EQUAL 1536))
+    add_subdirectory(rtw8852bs)
+endif()
+if((ARCH STREQUAL "arm64") AND (RPI3_SUPPORT OR RPI5_SUPPORT))
+    add_subdirectory(cyw43455sdio)
+    add_subdirectory(cyw43455)
+endif()

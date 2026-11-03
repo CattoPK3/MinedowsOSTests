@@ -1,0 +1,164 @@
+; Monitor.INF
+;
+; Installation file for monitors
+;
+[Version]
+Signature  = "$Windows NT$"
+;Signature  = "$ReactOS$"
+LayoutFile = layout.inf
+Class      = Monitor
+ClassGUID  = {4D36E96E-E325-11CE-BFC1-08002BE10318}
+Provider   = %ReactOS%
+DriverVer  = 03/11/2012,1.00
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[ClassInstall32.NT]
+AddReg = MonitorClass.NT.AddReg
+
+[MonitorClass.NT.AddReg]
+HKR, , ,                0, %MonitorClassName%
+HKR, , Icon,            0, "-35"
+HKR, , Installer32,     0, "desk.cpl,MonitorClassInstaller"
+
+[Manufacturer]
+%StdMfg% = StdMfg
+
+[StdMfg]
+%DefaultMonitor.DeviceDesc% = NonPnPMonitor_Inst,Monitor\Default_Monitor
+%PnPMonitor.DeviceDesc% = PnPMonitor_Inst,*PNP09FF
+
+;---------------------------- MONITOR DRIVER ----------------------------
+
+[NonPnPMonitor_Inst.NT]
+CopyFiles = Monitor_Inst_CopyFiles.NT
+DelReg = Monitor_DelReg
+AddReg = NonPnPMonitor_AddReg
+
+[PnPMonitor_Inst.NT]
+CopyFiles = Monitor_Inst_CopyFiles.NT
+DelReg = Monitor_DelReg
+AddReg = PnPMonitor_AddReg
+
+[Monitor_Inst_CopyFiles.NT]
+monitor.sys
+
+[Monitor_DelReg]
+HKR,MODES
+HKR,,MaxResolution
+HKR,,DPMS
+HKR,,ICMProfile
+
+[NonPnPMonitor_AddReg]
+HKR,"MODES\640,480"
+HKR,,MaxResolution,,"1600,1200"
+HKR,,DPMS,0x00010001,1
+
+[PnPMonitor_AddReg]
+HKR,"MODES\1600,1200"
+HKR,,MaxResolution,,"1600,1200"
+HKR,,DPMS,,1
+
+[NonPnPMonitor_Inst.NT.Services]
+AddService = monitor, 0x00000002, Monitor_Service_Inst
+
+[PnPMonitor_Inst.NT.Services]
+AddService = monitor, 0x00000002, Monitor_Service_Inst
+
+[Monitor_Service_Inst]
+DisplayName   = %Monitor.SvcDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\monitor.sys
+
+;-------------------------------- STRINGS -------------------------------
+
+[Strings]
+; Non-localizable
+ReactOS = "LiberNT Project"
+
+; Localizable
+MonitorClassName = "Monitors"
+Monitor.SvcDesc = "Monitor Class Function Driver Service"
+
+StdMfg = "(Standard monitor types)"
+DefaultMonitor.DeviceDesc = "Generic Non-PnP Monitor"
+PnPMonitor.DeviceDesc = "Generic PnP Monitor"
+
+[Strings.0404]
+MonitorClassName = "顯示器"
+
+StdMfg = "(標準顯示器類型)"
+DefaultMonitor.DeviceDesc = "預設顯示器"
+PnPMonitor.DeviceDesc = "隨插即用顯示器"
+
+[Strings.0405]
+MonitorClassName = "Monitory"
+
+StdMfg = "(Obecné monitory)"
+DefaultMonitor.DeviceDesc = "Výchozí monitor"
+PnPMonitor.DeviceDesc = "Plug and Play monitor"
+
+[Strings.0407]
+MonitorClassName = "Monitore"
+
+StdMfg = "(Generische Monitore)"
+PnPMonitor.DeviceDesc = "Plug and Play Monitor"
+
+[Strings.0a]
+MonitorClassName = "Monitores"
+
+StdMfg = "(Monitores genéricos)"
+DefaultMonitor.DeviceDesc = "Monitor predeterminado"
+PnPMonitor.DeviceDesc = "Monitor Plug and Play"
+
+[Strings.0415]
+MonitorClassName = "Monitory"
+
+StdMfg = "(Standardowe typy monitorów)"
+DefaultMonitor.DeviceDesc = "Domyślny monitor"
+PnPMonitor.DeviceDesc = "Monitor Plug and Play"
+
+[Strings.0418]
+MonitorClassName = "Ecrane"
+
+StdMfg = "(ecrane de tip standard)"
+DefaultMonitor.DeviceDesc = "Ecran implicit"
+PnPMonitor.DeviceDesc = "Ecran cuplare dinamică (PnP)"
+
+[Strings.0419]
+MonitorClassName = "Мониторы"
+
+StdMfg = "(Стандартные мониторы)"
+DefaultMonitor.DeviceDesc = "Модуль подключения монитора"
+PnPMonitor.DeviceDesc = "Монитор Plug and Play"
+
+[Strings.041f]
+MonitorClassName = "Monitörler"
+
+StdMfg = "(Standart Monitör Türleri)"
+DefaultMonitor.DeviceDesc = "Varsayılan Monitör"
+PnPMonitor.DeviceDesc = "Tak ve Çalıştır Monitör"
+
+[Strings.0804]
+MonitorClassName = "监视器"
+
+StdMfg = "(标准监视器类型)"
+DefaultMonitor.DeviceDesc = "默认监视器"
+PnPMonitor.DeviceDesc = "即插即用监视器"
+
+[Strings.0816]
+MonitorClassName = "Monitores"
+
+StdMfg = "(Monitores genéricos)"
+DefaultMonitor.DeviceDesc = "Monitor predefinido"
+PnPMonitor.DeviceDesc = "Monitor Plug and Play"
+
+[Strings.0C04]
+MonitorClassName = "顯示器"
+
+StdMfg = "(標準顯示器類型)"
+DefaultMonitor.DeviceDesc = "預設顯示器"
+PnPMonitor.DeviceDesc = "隨插即用顯示器"

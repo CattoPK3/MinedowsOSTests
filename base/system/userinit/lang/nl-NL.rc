@@ -1,0 +1,9 @@
+/* Dutch translation by Wouter De Vlieger */
+
+LANGUAGE LANG_DUTCH, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit kon de shell niet starten!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

@@ -1,0 +1,36 @@
+
+#define STANDALONE
+#include <apitest.h>
+
+extern void func_GetExtendedTcpTable(void);
+extern void func_GetExtendedUdpTable(void);
+extern void func_GetIfEntry(void);
+extern void func_GetInterfaceName(void);
+extern void func_GetIpNetEntry2(void);
+extern void func_GetNetworkParams(void);
+extern void func_GetOwnerModuleFromTcpEntry(void);
+extern void func_GetOwnerModuleFromUdpEntry(void);
+extern void func_icmp(void);
+extern void func_icmp_echo(void);
+extern void func_InitializeIpInterfaceEntry(void);
+extern void func_NotifyIpInterfaceChange(void);
+extern void func_SendARP(void);
+
+const struct test winetest_testlist[] =
+{
+    { "GetExtendedTcpTable",        func_GetExtendedTcpTable },
+    { "GetExtendedUdpTable",        func_GetExtendedUdpTable },
+    { "GetIfEntry",                 func_GetIfEntry },
+    { "GetInterfaceName",           func_GetInterfaceName },
+    { "GetIpNetEntry2",             func_GetIpNetEntry2 },
+    { "GetNetworkParams",           func_GetNetworkParams },
+    { "GetOwnerModuleFromTcpEntry", func_GetOwnerModuleFromTcpEntry },
+    { "GetOwnerModuleFromUdpEntry", func_GetOwnerModuleFromUdpEntry },
+    { "icmp",                       func_icmp },
+    { "icmp_echo",                  func_icmp_echo },
+    { "InitializeIpInterfaceEntry", func_InitializeIpInterfaceEntry },
+    { "NotifyIpInterfaceChange",    func_NotifyIpInterfaceChange },
+    { "SendARP",                    func_SendARP },
+
+    { 0, 0 }
+};

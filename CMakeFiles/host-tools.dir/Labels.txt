@@ -1,0 +1,13 @@
+# Target labels
+ host-tools
+# Source files and their labels
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools-complete.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-build.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-configure.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-download.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-install.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-mkdir.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-patch.rule
+C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-update.rule

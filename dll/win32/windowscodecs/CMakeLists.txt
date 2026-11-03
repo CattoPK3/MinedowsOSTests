@@ -1,0 +1,95 @@
+
+add_definitions(
+    -DENTRY_PREFIX=WIC_
+    -DPROXY_DELEGATION
+    -DWINE_REGISTER_DLL)
+
+remove_definitions(-D_CRT_NON_CONFORMING_SWPRINTFS)
+
+include_directories(
+    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/libjpeg
+    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/zlib
+    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/libpng
+    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/libtiff)
+
+spec2def(windowscodecs.dll windowscodecs.spec ADD_IMPORTLIB)
+add_rpcproxy_files(windowscodecs_wincodec.idl)
+
+list(APPEND SOURCE
+    bmpdecode.c
+    bmpencode.c
+    clipper.c
+    clsfactory.c
+    colorcontext.c
+    colortransform.c
+    converter.c
+    ddsformat.c
+    decoder.c
+    encoder.c
+    fliprotate.c
+    gifformat.c
+    icoformat.c
+    imgfactory.c
+    info.c
+    libjpeg.c
+    libpng.c
+    libtiff.c
+    main.c
+    metadatahandler.c
+    metadataquery.c
+    palette.c
+    pngformat.c
+    propertybag.c
+    proxy.c
+    regsvr.c
+    scaler.c
+    stream.c
+    ungif.c
+    uuid.c
+    wincodecs_common.c
+    wmpformat.c
+    xmpmetadata.c)
+
+list(APPEND SOURCE bitmap.c)
+
+if(MSVC AND (ARCH STREQUAL "i386"))
+    add_definitions(-D__ASM_EXTERN_THISCALL_WRAPPER)
+    add_asm_files(windowscodecs_asm i386/thiscall.s)
+    list(APPEND SOURCE ${windowscodecs_asm})
+endif()
+
+list(APPEND PCH_SKIP_SOURCE
+    guid.c
+    uuid.c
+    ${CMAKE_CURRENT_BINARY_DIR}/proxy.dlldata.c
+    ${CMAKE_CURRENT_BINARY_DIR}/windowscodecs_stubs.c
+    ${CMAKE_CURRENT_BINARY_DIR}/windowscodecs_wincodec_p.c)
+
+add_library(windowscodecs MODULE
+    ${SOURCE}
+    ${PCH_SKIP_SOURCE}
+    version.rc
+    ${CMAKE_CURRENT_BINARY_DIR}/windowscodecs.def)
+
+if(MSVC)
+    target_compile_definitions(windowscodecs PRIVATE isfinite=_finite)
+else()
+    target_compile_definitions(windowscodecs PRIVATE isfinite=__builtin_isfinite)
+endif()
+
+if(MSVC)
+    # Disable warning C4133: 'function': incompatible types - from 'WICPixelFormatNumericRepresentation *' to 'DWORD *'
+    # Disable warning C4146: unary minus operator applied to unsigned type, result still unsigned
+    target_compile_options(windowscodecs PRIVATE /wd4133 /wd4146)
+
+    target_compile_options(windowscodecs PRIVATE /FItypeof.h)
+    target_compile_definitions(windowscodecs PRIVATE __thiscall=__stdcall)
+endif()
+
+set_module_type(windowscodecs win32dll)
+add_idl_reg_scripts(windowscodecs registry windowscodecs_wincodec.idl)
+target_link_libraries(windowscodecs jxr wine wine_dll_canunload uuid ${PSEH_LIB} oldnames)
+add_importlibs(windowscodecs libjpeg libpng libtiff ole32 oleaut32 rpcrt4 shlwapi user32 gdi32 advapi32 advapi32_vista propsys msvcrt kernel32 ntdll)
+add_pch(windowscodecs precomp.h "${PCH_SKIP_SOURCE}")
+add_cd_file(TARGET windowscodecs DESTINATION reactos/system32 FOR all)
+set_wine_module_FIXME(windowscodecs) # CORE-5743: No CONST_VTABLE

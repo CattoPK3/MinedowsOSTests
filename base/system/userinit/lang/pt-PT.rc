@@ -1,0 +1,7 @@
+LANGUAGE LANG_PORTUGUESE, SUBLANG_PORTUGUESE
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit falhou ao iniciar o shell!"
+    IDS_INSTALLER_FAIL "Userinit falhou ao iniciar o instalador!"
+END

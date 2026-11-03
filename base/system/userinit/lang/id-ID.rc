@@ -1,0 +1,7 @@
+LANGUAGE LANG_INDONESIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit gagal untuk memulai shell!"
+    IDS_INSTALLER_FAIL "Userinit gagal untuk memulai pemasang!"
+END

@@ -1,0 +1,13 @@
+; PROJECT:     ReactOS Raspberry Pi 3 boot hive
+; LICENSE:     GPL-2.0+ (https://spdx.org/licenses/GPL-2.0+)
+; COPYRIGHT:   Copyright 2026 Ahmed Arif <arif193@gmail.com>
+; FILE:        boot/bootdata/hivesys_rpi3.inf
+; PURPOSE:     Raspberry Pi 3 profile-specific boot driver bindings
+
+[AddReg]
+
+HKLM,"SYSTEM\CurrentControlSet\Services\usbdwc2","ErrorControl",0x00010001,0x00000001
+HKLM,"SYSTEM\CurrentControlSet\Services\usbdwc2","Group",0x00000000,"Boot Bus Extender"
+HKLM,"SYSTEM\CurrentControlSet\Services\usbdwc2","ImagePath",0x00020000,"system32\drivers\usbdwc2.sys"
+HKLM,"SYSTEM\CurrentControlSet\Services\usbdwc2","Start",0x00010001,0x00000000
+HKLM,"SYSTEM\CurrentControlSet\Services\usbdwc2","Type",0x00010001,0x00000001

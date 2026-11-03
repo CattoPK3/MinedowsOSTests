@@ -1,0 +1,49 @@
+/*
+ * COPYRIGHT:   See COPYING in the top level directory
+ * PROJECT:     ReactOS TCP/IP protocol driver
+ * FILE:        include/ticonsts.h
+ * PURPOSE:     TCP/IP protocol driver constants
+ */
+
+#pragma once
+
+/* NDIS version this driver supports */
+#define NDIS_VERSION_MAJOR 6
+#define NDIS_VERSION_MINOR 0
+
+#ifdef _NTTEST_
+/* Name of devices */
+#define DD_TCP_DEVICE_NAME      L"\\Device\\NTTcp"
+#define DD_UDP_DEVICE_NAME      L"\\Device\\NTUdp"
+#define DD_IP_DEVICE_NAME       L"\\Device\\NTIp"
+#define DD_RAWIP_DEVICE_NAME    L"\\Device\\NTRawIp"
+
+/* For NDIS protocol registration */
+#define IP_DEVICE_NAME          L"\\Device\\NTIp"
+#else
+#define DD_TCP_DEVICE_NAME      L"\\Device\\Tcp"
+#define DD_UDP_DEVICE_NAME      L"\\Device\\Udp"
+#define DD_IP_DEVICE_NAME       L"\\Device\\Ip"
+#define DD_RAWIP_DEVICE_NAME    L"\\Device\\RawIp"
+#define DD_IPV6_DEVICE_NAME     L"\\Device\\Ip6"
+#define DD_TCPV6_DEVICE_NAME    L"\\Device\\Tcp6"
+#define DD_UDPV6_DEVICE_NAME    L"\\Device\\Udp6"
+#define DD_RAWIPV6_DEVICE_NAME  L"\\Device\\RawIp6"
+
+/* For NDIS protocol registration */
+/* The DDK says you have to register with the name that's registered with SCM, e.g. tcpip */
+#define IP_DEVICE_NAME          L"\\Device\\Ip"
+#define TCPIP_PROTOCOL_NAME     L"Tcpip"
+#endif /* _NTTEST_ */
+
+/* Unique error values for log entries */
+#define TI_ERROR_DRIVERENTRY 0
+
+#define WS_IPPROTO_IP 0
+#define WS_IP_TOS 3
+#define WS_IP_TTL 4
+#define WS_IP_PKTINFO 19
+#define WS_IP_RECVDSTADDR 25
+#define WS_IP_ECN 50
+
+/* EOF */

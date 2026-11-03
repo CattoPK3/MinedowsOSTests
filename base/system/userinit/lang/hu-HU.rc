@@ -1,0 +1,9 @@
+/*  Hungarian translation by Peter Nagy <nagylakas@gmail.com> */
+
+LANGUAGE LANG_HUNGARIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Az Userinit nem tudja elindítani a rendszert!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

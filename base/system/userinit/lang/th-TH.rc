@@ -1,0 +1,7 @@
+LANGUAGE LANG_THAI, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "ค่าผู้ใช้ผิดพลาดในตอนเข้าสู่ชั้นสถานะ!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

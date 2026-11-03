@@ -1,0 +1,11 @@
+/* TRANSLATOR : Ardit Dani (Ard1t) (ardit.dani@gmail.com)
+ * DATE OF TR:  29-11-2013
+*/
+
+LANGUAGE LANG_ALBANIAN, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit dështuar për të filluar shell'in!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

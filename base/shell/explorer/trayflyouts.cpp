@@ -1,0 +1,12521 @@
+#include "precomp.h"
+#include <math.h>
+#include <commctrl.h>
+#include <windowsx.h>
+#include <reactos/dwmframe.h>
+#include <shellframe.h>
+#include <winioctl.h>
+#include <ntddvdeo.h>
+#include <reactos/rddm/rxgkmonitor.h>
+
+static VOID TfyW11Position(HWND hwndOwner, const RECT *prcAnchor, SIZE size, BOOL bCenter, POINT *ppt);
+static VOID TrayNotifCenter_Open(HWND hwndCalendar);
+static VOID TrayNotifCenter_Close(VOID);
+static VOID TrayNotifCenter_Refresh(VOID);
+
+enum
+{
+    TFY_TIMER_ANIM = 1,
+    TFY_TIMER_TICK = 2,
+    TFY_TIMER_ALIVE = 3,
+    TFY_TIMER_HOVER = 4
+};
+
+enum TFYANIM { TFY_NONE, TFY_OPEN, TFY_CLOSE };
+
+enum
+{
+    TFY_ANIM_INTERVAL = 15,
+    TFY_ANIM_OPEN_MS = 120,
+    TFY_ANIM_CLOSE_MS = 90,
+    TFY_ANIM_INITIAL_ALPHA = 48,
+    TFY_ANIM_OFFSET = 8,
+    TFY_REOPEN_GUARD_MS = TFY_ANIM_CLOSE_MS + 20,
+    TFY_ANIM_MORPH_MS = 175,
+    TFY_MORPH_HANDOFF_MS = 400,
+    TFY_FLYOUT_RADIUS = 8
+};
+
+static RECT g_rcTfyMorphFrom;
+static ULONGLONG g_TfyMorphTick;
+
+static int
+TfyFlyoutRadius(VOID)
+{
+    return IsThemeActive() ? ShellScaleForDpi(TFY_FLYOUT_RADIUS) : 0;
+}
+
+#define TFY_PANE_WIDTH 346
+
+static VOID
+TfyPanePosition(const RECT *prcAnchor, SIZE *pSize, POINT *ppt)
+{
+    MONITORINFO mi;
+
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromRect(prcAnchor, MONITOR_DEFAULTTONEAREST), &mi);
+    pSize->cy = mi.rcWork.bottom - mi.rcWork.top;
+    ppt->x = mi.rcWork.right - pSize->cx;
+    ppt->y = mi.rcWork.top;
+}
+static ULONG g_TfyTransitionSeq;
+
+static VOID
+TfyRequestTransition(HWND hWnd, const RECT *prcFrom, BYTE FromAlpha, BYTE ToAlpha, UINT Ms)
+{
+    ULONG Seq = (++g_TfyTransitionSeq) & 0xFFu;
+
+    if (!Seq)
+        Seq = g_TfyTransitionSeq = 1;
+    if (prcFrom)
+    {
+        SetPropW(hWnd, DWM_PROP_TRANSITION_FROM_LT,
+                 (HANDLE)(ULONG_PTR)DWM_TRANSITION_POINT(prcFrom->left, prcFrom->top));
+        SetPropW(hWnd, DWM_PROP_TRANSITION_FROM_RB,
+                 (HANDLE)(ULONG_PTR)DWM_TRANSITION_POINT(prcFrom->right, prcFrom->bottom));
+    }
+    else
+    {
+        RemovePropW(hWnd, DWM_PROP_TRANSITION_FROM_LT);
+        RemovePropW(hWnd, DWM_PROP_TRANSITION_FROM_RB);
+    }
+    SetPropW(hWnd, DWM_PROP_TRANSITION,
+             (HANDLE)(ULONG_PTR)DWM_TRANSITION_PACK(Seq, FromAlpha, ToAlpha, Ms));
+}
+
+class CTrayFlyoutAnimation
+{
+public:
+    int m_AnimPhase;
+    ULONGLONG m_AnimT0;
+    POINT m_ptFinal;
+    BYTE m_AnimAlpha;
+    BYTE m_AnimStartAlpha;
+    BOOL m_bSlideFromRight;
+    HTHEME m_hFlyoutTheme;
+    HTHEME m_hFlyoutButtonTheme;
+
+    CTrayFlyoutAnimation() : m_AnimPhase(TFY_NONE), m_AnimT0(0),
+                             m_AnimAlpha(255), m_AnimStartAlpha(255), m_bSlideFromRight(FALSE),
+                             m_hFlyoutTheme(NULL), m_hFlyoutButtonTheme(NULL)
+    {
+        ZeroMemory(&m_ptFinal, sizeof(m_ptFinal));
+    }
+
+    ~CTrayFlyoutAnimation()
+    {
+        if (m_hFlyoutTheme)
+            CloseThemeData(m_hFlyoutTheme);
+        if (m_hFlyoutButtonTheme)
+            CloseThemeData(m_hFlyoutButtonTheme);
+    }
+
+    VOID RefreshFlyoutMaterial(HWND hWnd, COLORREF crBackground)
+    {
+        LPCWSTR pszClass = ((GetRValue(crBackground) * 299 +
+                             GetGValue(crBackground) * 587 +
+                             GetBValue(crBackground) * 114) / 1000 < 128)
+                                ? L"FlyoutDark" : L"FlyoutLight";
+
+        if (m_hFlyoutTheme)
+        {
+            CloseThemeData(m_hFlyoutTheme);
+            m_hFlyoutTheme = NULL;
+        }
+        if (m_hFlyoutButtonTheme)
+        {
+            CloseThemeData(m_hFlyoutButtonTheme);
+            m_hFlyoutButtonTheme = NULL;
+        }
+        SetWindowTheme(hWnd, pszClass, NULL);
+        m_hFlyoutTheme = OpenThemeData(hWnd, pszClass);
+        m_hFlyoutButtonTheme = OpenThemeData(hWnd, L"Button");
+    }
+
+    VOID BeginFlyoutOpen(HWND hWnd, int x, int y, int cx, int cy,
+                         COLORREF crBackground, BOOL bActivate = TRUE)
+    {
+        int nOffset = ShellScaleForDpi(TFY_ANIM_OFFSET);
+        RECT rcFrom;
+
+        RefreshFlyoutMaterial(hWnd, crBackground);
+        m_ptFinal.x = x;
+        m_ptFinal.y = y;
+        m_AnimPhase = TFY_NONE;
+        m_AnimT0 = GetTickCount64();
+        m_AnimAlpha = 255;
+        m_AnimStartAlpha = 255;
+        SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
+        SetPropW(hWnd, DWM_PROP_CORNER_RADIUS,
+                 (HANDLE)(ULONG_PTR)TfyFlyoutRadius());
+        if (g_TfyMorphTick && m_AnimT0 - g_TfyMorphTick < TFY_MORPH_HANDOFF_MS)
+        {
+            rcFrom = g_rcTfyMorphFrom;
+            TfyRequestTransition(hWnd, &rcFrom, 255, 255, TFY_ANIM_MORPH_MS);
+        }
+        else
+        {
+            if (m_bSlideFromRight)
+                SetRect(&rcFrom, x + nOffset * 4, y, x + nOffset * 4 + cx, y + cy);
+            else
+                SetRect(&rcFrom, x, y + nOffset, x + cx, y + nOffset + cy);
+            TfyRequestTransition(hWnd, &rcFrom, TFY_ANIM_INITIAL_ALPHA, 255, TFY_ANIM_OPEN_MS);
+        }
+        g_TfyMorphTick = 0;
+        SetWindowPos(hWnd, HWND_TOPMOST, x, y, cx, cy,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (bActivate)
+            SetForegroundWindow(hWnd);
+        InvalidateRect(hWnd, NULL, FALSE);
+        UpdateWindow(hWnd);
+    }
+
+    BOOL HandleFlyoutAnimation(HWND hWnd, WPARAM wParam)
+    {
+        if (wParam != TFY_TIMER_ANIM)
+            return FALSE;
+
+        KillTimer(hWnd, TFY_TIMER_ANIM);
+        if (m_AnimPhase == TFY_CLOSE)
+            DestroyWindow(hWnd);
+        return TRUE;
+    }
+
+    BOOL BeginFlyoutClose(HWND hWnd)
+    {
+        if (m_AnimPhase == TFY_CLOSE)
+            return FALSE;
+        m_AnimPhase = TFY_CLOSE;
+        m_AnimT0 = GetTickCount64();
+        m_AnimStartAlpha = m_AnimAlpha;
+        m_AnimAlpha = 0;
+        TfyRequestTransition(hWnd, NULL, 255, 0, TFY_ANIM_CLOSE_MS);
+        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        SetTimer(hWnd, TFY_TIMER_ANIM, TFY_ANIM_CLOSE_MS + TFY_ANIM_INTERVAL, NULL);
+        return TRUE;
+    }
+
+    VOID HandOffFlyout(HWND hWnd)
+    {
+        if (::GetWindowRect(hWnd, &g_rcTfyMorphFrom))
+            g_TfyMorphTick = GetTickCount64();
+    }
+};
+
+static COLORREF
+TfyMix(COLORREF a, COLORREF b, int t)
+{
+    if (t <= 0) return a;
+    if (t >= 255) return b;
+    return RGB(GetRValue(a) + MulDiv(GetRValue(b) - GetRValue(a), t, 255),
+               GetGValue(a) + MulDiv(GetGValue(b) - GetGValue(a), t, 255),
+               GetBValue(a) + MulDiv(GetBValue(b) - GetBValue(a), t, 255));
+}
+
+static VOID
+TfyDrawFlyoutFrame(HDC hdc, const RECT *prc, const SM2_FLYOUT_PALETTE *pPal)
+{
+    HBRUSH hbr = CreateSolidBrush(TfyMix(pPal->PanelBg, pPal->PanelText, 40));
+    FrameRect(hdc, prc, hbr);
+    DeleteObject(hbr);
+}
+
+static VOID
+TfyDrawThemeButton(HTHEME hTheme, HDC hdc, const RECT *prc, int iState, const SM2_FLYOUT_PALETTE *pPal)
+{
+    if (hTheme && SUCCEEDED(DrawThemeBackground(hTheme, hdc, BP_PUSHBUTTON, iState, prc, NULL)))
+        return;
+    COLORREF crFill = (iState > 4) ? pPal->AccentBg : TfyMix(pPal->PanelBg, pPal->DimText, 60);
+    HBRUSH hbr = CreateSolidBrush(crFill);
+    FillRect(hdc, prc, hbr);
+    DeleteObject(hbr);
+    hbr = CreateSolidBrush(TfyMix(crFill, pPal->PanelText, 60));
+    FrameRect(hdc, prc, hbr);
+    DeleteObject(hbr);
+}
+
+static HFONT
+TfyCreateFont(int nHeight, int nWeight)
+{
+    return CreateFontW(-ShellScaleForDpi(nHeight), 0, 0, 0, nWeight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+}
+
+static HICON
+TfyFluentIcon(UINT nId, int cx)
+{
+    static struct { UINT nId; int cx; HICON hIcon; } s_Cache[48];
+
+    for (UINT i = 0; i < _countof(s_Cache); i++)
+    {
+        if (s_Cache[i].nId == nId && s_Cache[i].cx == cx)
+            return s_Cache[i].hIcon;
+    }
+
+    HICON hIcon = (HICON)LoadImageW(hExplorerInstance, MAKEINTRESOURCEW(nId),
+                                    IMAGE_ICON, cx, cx, 0);
+    for (UINT i = 0; i < _countof(s_Cache); i++)
+    {
+        if (!s_Cache[i].nId)
+        {
+            s_Cache[i].nId = nId;
+            s_Cache[i].cx = cx;
+            s_Cache[i].hIcon = hIcon;
+            break;
+        }
+    }
+    return hIcon;
+}
+
+static int
+TfyFluentNativeSize(int n)
+{
+    static const int s_Sizes[] = { 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 256 };
+    int best = s_Sizes[0];
+
+    for (UINT i = 0; i < _countof(s_Sizes); i++)
+    {
+        if (s_Sizes[i] <= n)
+            best = s_Sizes[i];
+    }
+    return best;
+}
+
+static VOID
+TfyDrawFluent(HDC hdc, const RECT *prc, UINT nId)
+{
+    int cx = prc->right - prc->left;
+    int cy = prc->bottom - prc->top;
+    int n = TfyFluentNativeSize(min(cx, cy));
+    HICON hIcon = TfyFluentIcon(nId, n);
+    SM2_FLYOUT_PALETTE Pal;
+
+    if (!hIcon)
+        return;
+    StartMenu2_GetFlyoutPalette(&Pal);
+    if (ShellColorIsLight(Pal.PanelBg))
+    {
+        if (FindResourceW(hExplorerInstance, MAKEINTRESOURCEW(nId + SHELL_TRAY_ICON_LIGHT), (LPCWSTR)RT_GROUP_ICON))
+        {
+            hIcon = TfyFluentIcon(nId + SHELL_TRAY_ICON_LIGHT, n);
+        }
+        else
+        {
+            ShellDrawIconTinted(hdc, prc->left + (cx - n) / 2, prc->top + (cy - n) / 2, hIcon, n, n, Pal.PanelText);
+            return;
+        }
+    }
+    if (hIcon)
+        DrawIconEx(hdc, prc->left + (cx - n) / 2, prc->top + (cy - n) / 2,
+                   hIcon, n, n, 0, NULL, DI_NORMAL);
+}
+
+struct TFYAA
+{
+    HDC hdc;
+    HBITMAP hbm;
+    HGDIOBJ hbmOld;
+    PULONG pBits;
+    RECT rc;
+    int ss;
+};
+
+static HDC
+TfyAABegin(TFYAA *pAA, HDC hdcRef, const RECT *prc, int ss, COLORREF crBg)
+{
+    BITMAPINFO bmi;
+    int w = (prc->right - prc->left) * ss;
+    int h = (prc->bottom - prc->top) * ss;
+
+    ZeroMemory(pAA, sizeof(*pAA));
+    pAA->rc = *prc;
+    pAA->ss = ss;
+    pAA->hdc = CreateCompatibleDC(hdcRef);
+    if (!pAA->hdc)
+        return NULL;
+
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    pAA->hbm = CreateDIBSection(hdcRef, &bmi, DIB_RGB_COLORS, (PVOID *)&pAA->pBits, NULL, 0);
+    if (!pAA->hbm)
+    {
+        DeleteDC(pAA->hdc);
+        pAA->hdc = NULL;
+        return NULL;
+    }
+
+    pAA->hbmOld = SelectObject(pAA->hdc, pAA->hbm);
+
+    int nOldMode = SetStretchBltMode(pAA->hdc, COLORONCOLOR);
+    if (!StretchBlt(pAA->hdc, 0, 0, w, h, hdcRef, prc->left, prc->top,
+                    prc->right - prc->left, prc->bottom - prc->top, SRCCOPY))
+    {
+        RECT rcFill = { 0, 0, w, h };
+        HBRUSH hbr = CreateSolidBrush(crBg);
+        FillRect(pAA->hdc, &rcFill, hbr);
+        DeleteObject(hbr);
+    }
+    SetStretchBltMode(pAA->hdc, nOldMode);
+    return pAA->hdc;
+}
+
+static VOID
+TfyAAEnd(TFYAA *pAA, HDC hdcTarget)
+{
+    BITMAPINFO bmi;
+    int w = pAA->rc.right - pAA->rc.left;
+    int h = pAA->rc.bottom - pAA->rc.top;
+    int srcW = w * pAA->ss;
+    ULONG count = pAA->ss * pAA->ss;
+
+    for (int y = 0; y < h; y++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            ULONG red = 0, green = 0, blue = 0;
+
+            for (int yy = 0; yy < pAA->ss; yy++)
+            {
+                PULONG pSrc = pAA->pBits + (y * pAA->ss + yy) * srcW + x * pAA->ss;
+                for (int xx = 0; xx < pAA->ss; xx++)
+                {
+                    ULONG color = pSrc[xx];
+                    blue += color & 0xFF;
+                    green += (color >> 8) & 0xFF;
+                    red += (color >> 16) & 0xFF;
+                }
+            }
+
+            pAA->pBits[y * w + x] = (blue + count / 2) / count |
+                                      ((green + count / 2) / count) << 8 |
+                                      ((red + count / 2) / count) << 16;
+        }
+    }
+
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(hdcTarget, pAA->rc.left, pAA->rc.top, w, h, 0, 0, 0, h, pAA->pBits, &bmi, DIB_RGB_COLORS);
+
+    SelectObject(pAA->hdc, pAA->hbmOld);
+    DeleteObject(pAA->hbm);
+    DeleteDC(pAA->hdc);
+}
+
+static VOID
+TfyPrintOne(HWND hwnd, HDC hdc, const RECT *prcRoot, int nDepth)
+{
+    RECT rcClient;
+    POINT ptClient;
+    DWORD_PTR dwResult;
+    HWND ahChildren[64];
+    UINT cChildren = 0, i;
+    HWND hChild;
+    int cw, ch;
+
+    if (nDepth > 4 || !::IsWindowVisible(hwnd))
+        return;
+
+    ::GetClientRect(hwnd, &rcClient);
+    cw = rcClient.right;
+    ch = rcClient.bottom;
+    if (cw <= 0 || ch <= 0)
+        return;
+
+    ptClient.x = ptClient.y = 0;
+    ::ClientToScreen(hwnd, &ptClient);
+
+    SaveDC(hdc);
+    SetViewportOrgEx(hdc, ptClient.x - prcRoot->left, ptClient.y - prcRoot->top, NULL);
+    IntersectClipRect(hdc, 0, 0, cw, ch);
+
+    SendMessageTimeoutW(hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0,
+                        SMTO_ABORTIFHUNG, 200, &dwResult);
+    SendMessageTimeoutW(hwnd, WM_PRINTCLIENT, (WPARAM)hdc, PRF_CLIENT,
+                        SMTO_ABORTIFHUNG, 200, &dwResult);
+
+    RestoreDC(hdc, -1);
+
+    for (hChild = ::GetWindow(hwnd, GW_CHILD);
+         hChild != NULL && cChildren < _countof(ahChildren);
+         hChild = ::GetWindow(hChild, GW_HWNDNEXT))
+    {
+        ahChildren[cChildren++] = hChild;
+    }
+
+    for (i = cChildren; i > 0; i--)
+        TfyPrintOne(ahChildren[i - 1], hdc, prcRoot, nDepth + 1);
+}
+
+static HBITMAP
+TfyCaptureThumb(HWND hwnd, int maxW, int maxH, SIZE *pSize)
+{
+    RECT rcWnd;
+    HDC hdcScreen, hdcSrc, hdcDst;
+    HBITMAP hbmSrc, hbmDst = NULL;
+    HGDIOBJ hOldSrc, hOldDst;
+    int w, h, tw, th;
+
+    pSize->cx = pSize->cy = 0;
+
+    if (!::IsWindow(hwnd) || ::IsIconic(hwnd))
+        return NULL;
+
+    if (!::GetWindowRect(hwnd, &rcWnd))
+        return NULL;
+
+    w = rcWnd.right - rcWnd.left;
+    h = rcWnd.bottom - rcWnd.top;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096)
+        return NULL;
+
+    hdcScreen = ::GetDC(NULL);
+    if (!hdcScreen)
+        return NULL;
+
+    hdcSrc = CreateCompatibleDC(hdcScreen);
+    hdcDst = CreateCompatibleDC(hdcScreen);
+    hbmSrc = CreateCompatibleBitmap(hdcScreen, w, h);
+
+    if (hdcSrc && hdcDst && hbmSrc)
+    {
+        BOOL bCaptured = FALSE;
+        hOldSrc = SelectObject(hdcSrc, hbmSrc);
+
+        if (hwnd == ::GetForegroundWindow())
+        {
+            bCaptured = BitBlt(hdcSrc, 0, 0, w, h, hdcScreen,
+                               rcWnd.left, rcWnd.top, SRCCOPY);
+        }
+
+        if (!bCaptured)
+            bCaptured = ::PrintWindow(hwnd, hdcSrc, 0);
+
+        if (!bCaptured)
+        {
+            RECT rcFill = { 0, 0, w, h };
+            HBRUSH hbrFill = CreateSolidBrush(RGB(48, 48, 48));
+            FillRect(hdcSrc, &rcFill, hbrFill);
+            DeleteObject(hbrFill);
+            TfyPrintOne(hwnd, hdcSrc, &rcWnd, 0);
+            bCaptured = TRUE;
+        }
+
+        if (bCaptured)
+        {
+            if (w * maxH > h * maxW)
+            {
+                tw = maxW;
+                th = max(1, h * maxW / w);
+            }
+            else
+            {
+                th = maxH;
+                tw = max(1, w * maxH / h);
+            }
+
+            hbmDst = CreateCompatibleBitmap(hdcScreen, tw, th);
+            if (hbmDst)
+            {
+                hOldDst = SelectObject(hdcDst, hbmDst);
+                SetStretchBltMode(hdcDst, HALFTONE);
+                SetBrushOrgEx(hdcDst, 0, 0, NULL);
+                StretchBlt(hdcDst, 0, 0, tw, th, hdcSrc, 0, 0, w, h, SRCCOPY);
+                SelectObject(hdcDst, hOldDst);
+                pSize->cx = tw;
+                pSize->cy = th;
+            }
+        }
+
+        SelectObject(hdcSrc, hOldSrc);
+    }
+
+    if (hbmSrc) DeleteObject(hbmSrc);
+    if (hdcSrc) DeleteDC(hdcSrc);
+    if (hdcDst) DeleteDC(hdcDst);
+    ::ReleaseDC(NULL, hdcScreen);
+
+    return hbmDst;
+}
+
+static HICON
+TfyGetWindowIcon(HWND hwnd)
+{
+    HICON hIcon = NULL;
+    SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_NOTIMEOUTIFNOTHUNG, 100, (PDWORD_PTR)&hIcon);
+    if (!hIcon)
+        SendMessageTimeoutW(hwnd, WM_GETICON, ICON_SMALL, 0, SMTO_NOTIMEOUTIFNOTHUNG, 100, (PDWORD_PTR)&hIcon);
+    if (!hIcon)
+        hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    if (!hIcon)
+        hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    return hIcon;
+}
+
+typedef CWinTraits<WS_POPUP | WS_CLIPCHILDREN,
+                   WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED> CTrayFlyoutTraits;
+
+struct TFYCARD
+{
+    HWND hWnd;
+    HBITMAP hbmThumb;
+    SIZE thumbSize;
+    HICON hIcon;
+    WCHAR szTitle[128];
+    RECT rc;
+    RECT rcClose;
+};
+
+class CTaskPreviewWnd :
+    public CWindowImpl<CTaskPreviewWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayTaskPreview", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    CAtlArray<TFYCARD> m_Cards;
+    HFONT m_hFont;
+    INT_PTR m_nGroupId;
+    int m_iHot;
+    BOOL m_bCloseHot;
+    BOOL m_bTracking;
+    SIZE m_size;
+    BOOL m_bHover;
+    RECT m_rcAnchor;
+    ULONGLONG m_LeaveT0;
+
+    CTaskPreviewWnd() : m_hFont(NULL), m_nGroupId(0), m_iHot(-1),
+                        m_bCloseHot(FALSE), m_bTracking(FALSE),
+                        m_bHover(FALSE), m_LeaveT0(0)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_size, sizeof(m_size));
+        ZeroMemory(&m_rcAnchor, sizeof(m_rcAnchor));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+    int CardW() const { return Sc(200); }
+    int TitleH() const { return Sc(26); }
+    int ThumbW() const { return Sc(184); }
+    int ThumbH() const { return Sc(104); }
+    int CardH() const { return TitleH() + ThumbH() + Sc(12); }
+
+    VOID FreeCards()
+    {
+        for (SIZE_T i = 0; i < m_Cards.GetCount(); i++)
+        {
+            if (m_Cards[i].hbmThumb)
+                DeleteObject(m_Cards[i].hbmThumb);
+        }
+        m_Cards.SetCount(0);
+    }
+
+    VOID BuildCards(const HWND *pahWnd, UINT cWindows)
+    {
+        FreeCards();
+        for (UINT i = 0; i < cWindows && i < 16; i++)
+        {
+            TFYCARD card;
+            ZeroMemory(&card, sizeof(card));
+            card.hWnd = pahWnd[i];
+            card.hbmThumb = TfyCaptureThumb(card.hWnd, ThumbW(), ThumbH(), &card.thumbSize);
+            card.hIcon = TfyGetWindowIcon(card.hWnd);
+            ::GetWindowTextW(card.hWnd, card.szTitle, _countof(card.szTitle));
+            m_Cards.Add(card);
+        }
+    }
+
+    VOID LayoutCards()
+    {
+        int x = Sc(8);
+        for (SIZE_T i = 0; i < m_Cards.GetCount(); i++)
+        {
+            TFYCARD &card = m_Cards[i];
+            SetRect(&card.rc, x, Sc(8), x + CardW(), Sc(8) + CardH());
+            SetRect(&card.rcClose,
+                    card.rc.right - Sc(24), card.rc.top + Sc(4),
+                    card.rc.right - Sc(6), card.rc.top + TitleH() - Sc(4));
+            x += CardW() + Sc(8);
+        }
+        m_size.cx = x;
+        m_size.cy = CardH() + Sc(16);
+    }
+
+    VOID Popup(HWND hwndOwner, const RECT *prcAnchor, const HWND *pahWnd, UINT cWindows,
+               INT_PTR nGroupId, BOOL bHover)
+    {
+        MONITORINFO mi;
+        POINT ptRef;
+        int xPos, yPos;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        m_nGroupId = nGroupId;
+        m_bHover = bHover;
+        m_rcAnchor = *prcAnchor;
+        m_LeaveT0 = 0;
+        m_iHot = -1;
+        m_bCloseHot = FALSE;
+
+        if (!m_hFont)
+            m_hFont = TfyCreateFont(12, FW_NORMAL);
+
+        BuildCards(pahWnd, cWindows);
+        LayoutCards();
+
+        ptRef.x = (prcAnchor->left + prcAnchor->right) / 2;
+        ptRef.y = prcAnchor->top;
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint(ptRef, MONITOR_DEFAULTTONEAREST), &mi);
+
+        xPos = ptRef.x - m_size.cx / 2;
+        if (xPos + m_size.cx > mi.rcMonitor.right) xPos = mi.rcMonitor.right - m_size.cx;
+        if (xPos < mi.rcMonitor.left) xPos = mi.rcMonitor.left;
+        yPos = prcAnchor->top - m_size.cy - Sc(6);
+        if (yPos < mi.rcMonitor.top) yPos = prcAnchor->bottom + Sc(6);
+
+        BeginFlyoutOpen(m_hWnd, xPos, yPos, m_size.cx, m_size.cy, m_Pal.PanelBg, !bHover);
+        SetTimer(TFY_TIMER_ALIVE, 500, NULL);
+        if (bHover)
+            SetTimer(TFY_TIMER_HOVER, 100, NULL);
+    }
+
+    VOID FadeOut();
+
+    int HitTest(POINT pt, BOOL *pbClose)
+    {
+        *pbClose = FALSE;
+        for (SIZE_T i = 0; i < m_Cards.GetCount(); i++)
+        {
+            if (PtInRect(&m_Cards[i].rcClose, pt) && (int)i == m_iHot)
+            {
+                *pbClose = TRUE;
+                return (int)i;
+            }
+            if (PtInRect(&m_Cards[i].rc, pt))
+                return (int)i;
+        }
+        return -1;
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        GetClientRect(&rc);
+
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        TfyDrawFlyoutFrame(hdcMem, &rc, &m_Pal);
+
+        SetBkMode(hdcMem, TRANSPARENT);
+        HGDIOBJ hFontOld = SelectObject(hdcMem, m_hFont);
+
+        for (SIZE_T i = 0; i < m_Cards.GetCount(); i++)
+        {
+            TFYCARD &card = m_Cards[i];
+            BOOL bHot = ((int)i == m_iHot);
+
+            if (bHot)
+            {
+                HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+                FillRect(hdcMem, &card.rc, hbrHot);
+                DeleteObject(hbrHot);
+                HBRUSH hbrHotEdge = CreateSolidBrush(m_Pal.HotBorder);
+                FrameRect(hdcMem, &card.rc, hbrHotEdge);
+                DeleteObject(hbrHotEdge);
+            }
+
+            RECT rcTitle = { card.rc.left + Sc(6), card.rc.top,
+                             card.rcClose.left - Sc(4), card.rc.top + TitleH() };
+            if (card.hIcon)
+            {
+                DrawIconEx(hdcMem, rcTitle.left, card.rc.top + (TitleH() - Sc(16)) / 2,
+                           card.hIcon, Sc(16), Sc(16), 0, NULL, DI_NORMAL);
+            }
+            rcTitle.left += Sc(22);
+            SetTextColor(hdcMem, m_Pal.PanelText);
+            DrawTextW(hdcMem, card.szTitle, -1, &rcTitle,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+            if (bHot)
+            {
+                COLORREF crX = m_bCloseHot ? RGB(232, 17, 35) : m_Pal.DimText;
+                HPEN hpen = CreatePen(PS_SOLID, Sc(2), crX);
+                HGDIOBJ hpenOld = SelectObject(hdcMem, hpen);
+                int cxm = (card.rcClose.left + card.rcClose.right) / 2;
+                int cym = (card.rcClose.top + card.rcClose.bottom) / 2;
+                int r = Sc(4);
+                MoveToEx(hdcMem, cxm - r, cym - r, NULL);
+                LineTo(hdcMem, cxm + r, cym + r);
+                MoveToEx(hdcMem, cxm + r, cym - r, NULL);
+                LineTo(hdcMem, cxm - r, cym + r);
+                SelectObject(hdcMem, hpenOld);
+                DeleteObject(hpen);
+            }
+
+            RECT rcThumbBox = { card.rc.left + Sc(8), card.rc.top + TitleH(),
+                                card.rc.left + Sc(8) + ThumbW(),
+                                card.rc.top + TitleH() + ThumbH() };
+            HBRUSH hbrBox = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.Border, 60));
+            FillRect(hdcMem, &rcThumbBox, hbrBox);
+            DeleteObject(hbrBox);
+
+            if (card.hbmThumb)
+            {
+                HDC hdcThumb = CreateCompatibleDC(hdcMem);
+                HGDIOBJ hOldThumb = SelectObject(hdcThumb, card.hbmThumb);
+                int tx = rcThumbBox.left + (ThumbW() - card.thumbSize.cx) / 2;
+                int ty = rcThumbBox.top + (ThumbH() - card.thumbSize.cy) / 2;
+                BitBlt(hdcMem, tx, ty, card.thumbSize.cx, card.thumbSize.cy,
+                       hdcThumb, 0, 0, SRCCOPY);
+                SelectObject(hdcThumb, hOldThumb);
+                DeleteDC(hdcThumb);
+            }
+            else if (card.hIcon)
+            {
+                DrawIconEx(hdcMem,
+                           rcThumbBox.left + (ThumbW() - Sc(32)) / 2,
+                           rcThumbBox.top + (ThumbH() - Sc(32)) / 2,
+                           card.hIcon, Sc(32), Sc(32), 0, NULL, DI_NORMAL);
+            }
+
+            HBRUSH hbrThumbEdge = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 110));
+            FrameRect(hdcMem, &rcThumbBox, hbrThumbEdge);
+            DeleteObject(hbrThumbEdge);
+        }
+
+        SelectObject(hdcMem, hFontOld);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        else if (wParam == TFY_TIMER_HOVER)
+        {
+            POINT pt;
+            RECT rcSelf;
+            ULONGLONG now = GetTickCount64();
+
+            if (m_AnimPhase == TFY_CLOSE)
+                return 0;
+            GetCursorPos(&pt);
+            GetWindowRect(&rcSelf);
+            InflateRect(&rcSelf, Sc(4), Sc(4));
+            if (PtInRect(&rcSelf, pt) || PtInRect(&m_rcAnchor, pt))
+                m_LeaveT0 = 0;
+            else if (m_LeaveT0 == 0)
+                m_LeaveT0 = now;
+            else if (now - m_LeaveT0 > 300)
+                FadeOut();
+        }
+        else if (wParam == TFY_TIMER_ALIVE)
+        {
+            BOOL bChanged = FALSE;
+            SIZE_T nKept = 0;
+            for (SIZE_T i = 0; i < m_Cards.GetCount(); i++)
+            {
+                if (!::IsWindow(m_Cards[i].hWnd))
+                {
+                    if (m_Cards[i].hbmThumb)
+                        DeleteObject(m_Cards[i].hbmThumb);
+                    bChanged = TRUE;
+                    continue;
+                }
+                if (nKept != i)
+                    m_Cards[nKept] = m_Cards[i];
+                nKept++;
+            }
+            if (bChanged)
+                m_Cards.SetCount(nKept);
+            if (bChanged)
+            {
+                if (m_Cards.GetCount() == 0)
+                {
+                    FadeOut();
+                    return 0;
+                }
+                m_iHot = -1;
+                LayoutCards();
+                SetWindowPos(NULL, 0, 0, m_size.cx, m_size.cy,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                InvalidateRect(NULL, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        BOOL bClose;
+        int iHot = HitTest(pt, &bClose);
+        if (iHot != m_iHot || bClose != m_bCloseHot)
+        {
+            m_iHot = iHot;
+            m_bCloseHot = bClose;
+            InvalidateRect(NULL, FALSE);
+        }
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot != -1)
+        {
+            m_iHot = -1;
+            m_bCloseHot = FALSE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        BOOL bClose;
+        int i = HitTest(pt, &bClose);
+
+        if (i < 0)
+            return 0;
+
+        HWND hwndTarget = m_Cards[i].hWnd;
+        if (bClose)
+        {
+            ::PostMessageW(hwndTarget, WM_CLOSE, 0, 0);
+            return 0;
+        }
+
+        if (::IsWindow(hwndTarget))
+            ::SwitchToThisWindow(hwndTarget, TRUE);
+        FadeOut();
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_ALIVE);
+        KillTimer(TFY_TIMER_HOVER);
+        FreeCards();
+        if (m_hFont)
+        {
+            DeleteObject(m_hFont);
+            m_hFont = NULL;
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTaskPreviewWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTaskPreviewWnd *g_pTaskPreview = NULL;
+static ULONGLONG g_TpDismissTick = 0;
+static INT_PTR g_TpDismissGroup = 0;
+
+void CTaskPreviewWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTaskPreview == this)
+        g_pTaskPreview = NULL;
+    delete this;
+}
+
+VOID CTaskPreviewWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_TpDismissTick = m_AnimT0;
+    g_TpDismissGroup = m_nGroupId;
+}
+
+static VOID TaskPreview_ShowEx(IN HWND hwndOwner, IN const RECT *prcAnchor,
+                               IN const HWND *pahWnd, IN UINT cWindows,
+                               IN INT_PTR nGroupId, IN BOOL bHover)
+{
+    if (nGroupId == g_TpDismissGroup &&
+        GetTickCount64() - g_TpDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    TaskPreview_Hide();
+
+    if (cWindows == 0)
+        return;
+
+    CTaskPreviewWnd *pPreview = new CTaskPreviewWnd();
+    if (!pPreview)
+        return;
+
+    if (!pPreview->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pPreview;
+        return;
+    }
+
+    g_pTaskPreview = pPreview;
+    pPreview->Popup(hwndOwner, prcAnchor, pahWnd, cWindows, nGroupId, bHover);
+}
+
+VOID TaskPreview_Show(IN HWND hwndOwner, IN const RECT *prcAnchor,
+                      IN const HWND *pahWnd, IN UINT cWindows, IN INT_PTR nGroupId)
+{
+    TaskPreview_ShowEx(hwndOwner, prcAnchor, pahWnd, cWindows, nGroupId, FALSE);
+}
+
+VOID TaskPreview_ShowHover(IN HWND hwndOwner, IN const RECT *prcAnchor,
+                           IN const HWND *pahWnd, IN UINT cWindows, IN INT_PTR nGroupId)
+{
+    TaskPreview_ShowEx(hwndOwner, prcAnchor, pahWnd, cWindows, nGroupId, TRUE);
+}
+
+BOOL TaskPreview_IsHover(VOID)
+{
+    return g_pTaskPreview != NULL && g_pTaskPreview->IsWindow() &&
+           g_pTaskPreview->m_bHover && g_pTaskPreview->m_AnimPhase != TFY_CLOSE;
+}
+
+VOID TaskPreview_Hide(VOID)
+{
+    if (g_pTaskPreview && g_pTaskPreview->IsWindow())
+        ::DestroyWindow(g_pTaskPreview->m_hWnd);
+    g_pTaskPreview = NULL;
+}
+
+BOOL TaskPreview_IsVisibleFor(IN INT_PTR nGroupId)
+{
+    return g_pTaskPreview != NULL &&
+           g_pTaskPreview->IsWindow() &&
+           g_pTaskPreview->IsWindowVisible() &&
+           g_pTaskPreview->m_AnimPhase != TFY_CLOSE &&
+           g_pTaskPreview->m_nGroupId == nGroupId;
+}
+
+static LRESULT CALLBACK
+TfyFlyoutEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                          UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    if (uMsg == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_ESCAPE))
+    {
+        ::PostMessageW(::GetParent(hWnd), WM_KEYDOWN, wParam, lParam);
+        return 0;
+    }
+    if (uMsg == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE))
+        return 0;
+    if (uMsg == WM_NCDESTROY)
+        RemoveWindowSubclass(hWnd, TfyFlyoutEditSubclassProc, uIdSubclass);
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+#define TFY_CAL_KEY       L"Software\\ReactOS\\Explorer\\Calendar"
+#define TFY_CAL_MAXEVENTS 64
+#define TFY_CAL_DATA      6144
+#define TFY_CAL_EDIT_ID   111
+#define TFY_CAL_ALLDAY    (-1)
+#define TFY_CAL_STOREPFX  10
+#define TFY_CAL_HOURSVIS  7
+#define TFY_CAL_ALLDAYVIS 3
+#define TFY_CAL_AGENDAMAX 128
+#define TFY_CAL_AGENDAVIS 9
+#define TFY_CAL_MAXDATES  512
+
+struct TFYCALEVENT
+{
+    int nMinutes;
+    int nDuration;
+    WCHAR szTitle[64];
+};
+
+struct TFYCALDAY
+{
+    TFYCALEVENT ev[TFY_CAL_MAXEVENTS];
+    int count;
+};
+
+static VOID TfyCalDayName(int year, int month, int day, LPWSTR psz, size_t cch)
+{
+    StringCchPrintfW(psz, cch, L"%04d%02d%02d", year, month, day);
+}
+
+static int TfyCalDigits(LPCWSTR psz, int n)
+{
+    int v = 0, i;
+
+    for (i = 0; i < n; i++)
+    {
+        if (psz[i] < L'0' || psz[i] > L'9')
+            return -1;
+        v = v * 10 + (psz[i] - L'0');
+    }
+    return v;
+}
+
+static int TfyCalNameToDay(LPCWSTR psz, int year, int month)
+{
+    int v = TfyCalDigits(psz, 8);
+
+    if (v < 0 || psz[8] != 0)
+        return 0;
+    if (v / 10000 != year || (v / 100) % 100 != month)
+        return 0;
+    return v % 100;
+}
+
+static BOOL TfyCalParseStored(LPCWSTR psz, TFYCALEVENT *pev)
+{
+    if (lstrlenW(psz) <= TFY_CAL_STOREPFX)
+        return FALSE;
+    if (psz[0] == L'-')
+    {
+        pev->nMinutes = TFY_CAL_ALLDAY;
+        pev->nDuration = 0;
+    }
+    else
+    {
+        int hm = TfyCalDigits(psz, 4);
+        int dur = TfyCalDigits(psz + 5, 4);
+
+        if (hm < 0 || dur < 0 || hm / 100 > 23 || hm % 100 > 59)
+            return FALSE;
+        pev->nMinutes = (hm / 100) * 60 + hm % 100;
+        pev->nDuration = (dur > 0 && dur <= 1440) ? dur : 60;
+    }
+    StringCchCopyW(pev->szTitle, _countof(pev->szTitle), psz + TFY_CAL_STOREPFX);
+    return pev->szTitle[0] != 0;
+}
+
+static VOID TfyCalFormatStored(const TFYCALEVENT *pev, LPWSTR psz, size_t cch)
+{
+    if (pev->nMinutes == TFY_CAL_ALLDAY)
+    {
+        StringCchPrintfW(psz, cch, L"---- ---- %s", pev->szTitle);
+        return;
+    }
+    StringCchPrintfW(psz, cch, L"%02d%02d %04d %s", pev->nMinutes / 60,
+                     pev->nMinutes % 60, pev->nDuration, pev->szTitle);
+}
+
+static LPCWSTR TfyCalScanTime(LPCWSTR p, int *pMinutes)
+{
+    LPCWSTR q;
+    int h, m, n = 0;
+
+    while (n < 2 && p[n] >= L'0' && p[n] <= L'9')
+        n++;
+    if (n == 0 || p[n] != L':')
+        return NULL;
+    h = TfyCalDigits(p, n);
+    m = TfyCalDigits(p + n + 1, 2);
+    if (h < 0 || m < 0)
+        return NULL;
+    q = p + n + 3;
+    while (*q == L' ')
+        q++;
+    if ((*q == L'a' || *q == L'A' || *q == L'p' || *q == L'P') &&
+        (q[1] == L'm' || q[1] == L'M'))
+    {
+        if (h == 12)
+            h = 0;
+        if (*q == L'p' || *q == L'P')
+            h += 12;
+        q += 2;
+    }
+    if (h > 23 || m > 59)
+        return NULL;
+    *pMinutes = h * 60 + m;
+    return q;
+}
+
+static BOOL TfyCalParseInput(LPCWSTR psz, TFYCALEVENT *pev)
+{
+    LPCWSTR p = psz, pTitle, q;
+    int start = 0, end = 0, n;
+
+    while (*p == L' ' || *p == L'\t')
+        p++;
+    pTitle = p;
+    pev->nMinutes = TFY_CAL_ALLDAY;
+    pev->nDuration = 0;
+    q = TfyCalScanTime(p, &start);
+    if (q != NULL)
+    {
+        pev->nMinutes = start;
+        pev->nDuration = 60;
+        if (*q == L'-' || *q == L'\x2013')
+        {
+            LPCWSTR r = TfyCalScanTime(q + 1, &end);
+
+            if (r != NULL)
+            {
+                if (end > start)
+                    pev->nDuration = end - start;
+                q = r;
+            }
+        }
+        while (*q == L' ' || *q == L'\t')
+            q++;
+        pTitle = q;
+    }
+    StringCchCopyW(pev->szTitle, _countof(pev->szTitle), pTitle);
+    n = lstrlenW(pev->szTitle);
+    while (n > 0 && (pev->szTitle[n - 1] == L' ' || pev->szTitle[n - 1] == L'\t'))
+        pev->szTitle[--n] = 0;
+    if (pev->nMinutes != TFY_CAL_ALLDAY && pev->nMinutes + pev->nDuration > 1440)
+        pev->nDuration = 1440 - pev->nMinutes;
+    return pev->szTitle[0] != 0;
+}
+
+static VOID TfyCalLoadDay(int year, int month, int day, TFYCALDAY *pday)
+{
+    WCHAR szName[16];
+    WCHAR *pszData;
+    HKEY hKey = NULL;
+
+    pday->count = 0;
+    if (year <= 0)
+        return;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TFY_CAL_KEY, 0, KEY_QUERY_VALUE,
+                      &hKey) != ERROR_SUCCESS)
+        return;
+    pszData = (WCHAR *)LocalAlloc(LPTR, TFY_CAL_DATA * sizeof(WCHAR));
+    if (pszData)
+    {
+        DWORD cb = (DWORD)((TFY_CAL_DATA - 2) * sizeof(WCHAR)), type = 0;
+
+        TfyCalDayName(year, month, day, szName, _countof(szName));
+        if (RegQueryValueExW(hKey, szName, NULL, &type, (LPBYTE)pszData, &cb) ==
+                ERROR_SUCCESS && type == REG_MULTI_SZ)
+        {
+            LPCWSTR p;
+
+            for (p = pszData; *p != 0; p += lstrlenW(p) + 1)
+            {
+                if (pday->count >= TFY_CAL_MAXEVENTS)
+                    break;
+                if (TfyCalParseStored(p, &pday->ev[pday->count]))
+                    pday->count++;
+            }
+        }
+        LocalFree(pszData);
+    }
+    RegCloseKey(hKey);
+}
+
+static VOID TfyCalSaveDay(int year, int month, int day, const TFYCALDAY *pday)
+{
+    WCHAR szName[16], szLine[96];
+    WCHAR *pszData;
+    HKEY hKey = NULL;
+    int i, o = 0;
+
+    if (year <= 0)
+        return;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, TFY_CAL_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+    TfyCalDayName(year, month, day, szName, _countof(szName));
+    if (pday->count == 0)
+    {
+        RegDeleteValueW(hKey, szName);
+        RegCloseKey(hKey);
+        return;
+    }
+    pszData = (WCHAR *)LocalAlloc(LPTR, TFY_CAL_DATA * sizeof(WCHAR));
+    if (pszData)
+    {
+        for (i = 0; i < pday->count; i++)
+        {
+            int cch;
+
+            TfyCalFormatStored(&pday->ev[i], szLine, _countof(szLine));
+            cch = lstrlenW(szLine) + 1;
+            if (o + cch + 1 > TFY_CAL_DATA)
+                break;
+            CopyMemory(&pszData[o], szLine, cch * sizeof(WCHAR));
+            o += cch;
+        }
+        pszData[o++] = 0;
+        RegSetValueExW(hKey, szName, 0, REG_MULTI_SZ, (const BYTE *)pszData,
+                       (DWORD)(o * sizeof(WCHAR)));
+        LocalFree(pszData);
+    }
+    RegCloseKey(hKey);
+}
+
+static VOID TfyCalLoadMonthCounts(int year, int month, int *pCounts)
+{
+    HKEY hKey = NULL;
+    WCHAR *pszData;
+    DWORD i = 0;
+
+    ZeroMemory(pCounts, 32 * sizeof(int));
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TFY_CAL_KEY, 0, KEY_QUERY_VALUE,
+                      &hKey) != ERROR_SUCCESS)
+        return;
+    pszData = (WCHAR *)LocalAlloc(LPTR, TFY_CAL_DATA * sizeof(WCHAR));
+    if (!pszData)
+    {
+        RegCloseKey(hKey);
+        return;
+    }
+    for (;;)
+    {
+        WCHAR szName[32];
+        DWORD cch = _countof(szName);
+        DWORD cb = (DWORD)((TFY_CAL_DATA - 2) * sizeof(WCHAR));
+        DWORD type = 0;
+        LPCWSTR p;
+        int day, n = 0;
+
+        ZeroMemory(pszData, TFY_CAL_DATA * sizeof(WCHAR));
+        if (RegEnumValueW(hKey, i++, szName, &cch, NULL, &type,
+                          (LPBYTE)pszData, &cb) != ERROR_SUCCESS)
+            break;
+        if (type != REG_MULTI_SZ)
+            continue;
+        day = TfyCalNameToDay(szName, year, month);
+        if (day < 1 || day > 31)
+            continue;
+        for (p = pszData; *p != 0; p += lstrlenW(p) + 1)
+            n++;
+        pCounts[day] = n;
+    }
+    LocalFree(pszData);
+    RegCloseKey(hKey);
+}
+
+struct TFYCALROW
+{
+    int date;
+    int bHeader;
+    TFYCALEVENT ev;
+};
+
+static VOID TfyCalSortDates(int *pDates, int count)
+{
+    int i, j, v;
+
+    for (i = 1; i < count; i++)
+    {
+        v = pDates[i];
+        for (j = i; j > 0 && pDates[j - 1] > v; j--)
+            pDates[j] = pDates[j - 1];
+        pDates[j] = v;
+    }
+}
+
+static int TfyCalCollectDates(int fromDate, int *pDates, int maxDates)
+{
+    HKEY hKey = NULL;
+    DWORD i = 0;
+    int count = 0;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, TFY_CAL_KEY, 0, KEY_QUERY_VALUE,
+                      &hKey) != ERROR_SUCCESS)
+        return 0;
+    for (;;)
+    {
+        WCHAR szName[32];
+        DWORD cch = _countof(szName);
+        int v;
+
+        if (count >= maxDates)
+            break;
+        if (RegEnumValueW(hKey, i++, szName, &cch, NULL, NULL, NULL,
+                          NULL) != ERROR_SUCCESS)
+            break;
+        v = TfyCalDigits(szName, 8);
+        if (v <= 0 || szName[8] != 0 || v < fromDate)
+            continue;
+        pDates[count++] = v;
+    }
+    RegCloseKey(hKey);
+    TfyCalSortDates(pDates, count);
+    return count;
+}
+
+static int TfyCalLoadAgenda(int fromDate, TFYCALROW *pRows, int maxRows)
+{
+    int *pDates;
+    int nDates, i, j, count = 0;
+
+    pDates = (int *)LocalAlloc(LPTR, TFY_CAL_MAXDATES * sizeof(int));
+    if (!pDates)
+        return 0;
+    nDates = TfyCalCollectDates(fromDate, pDates, TFY_CAL_MAXDATES);
+    for (i = 0; i < nDates && count < maxRows; i++)
+    {
+        TFYCALDAY day;
+        int date = pDates[i];
+
+        TfyCalLoadDay(date / 10000, (date / 100) % 100, date % 100, &day);
+        if (day.count == 0)
+            continue;
+        pRows[count].date = date;
+        pRows[count].bHeader = TRUE;
+        ZeroMemory(&pRows[count].ev, sizeof(TFYCALEVENT));
+        count++;
+        for (j = 0; j < day.count && count < maxRows; j++)
+        {
+            pRows[count].date = date;
+            pRows[count].bHeader = FALSE;
+            pRows[count].ev = day.ev[j];
+            count++;
+        }
+    }
+    LocalFree(pDates);
+    return count;
+}
+
+class CTrayCalendarWnd :
+    public CWindowImpl<CTrayCalendarWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayCalendar", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HFONT m_hFontTime;
+    HFONT m_hFontHeader;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    int m_Mode;
+    int m_ViewYear;
+    int m_ViewMonth;
+    int m_Level;
+    int m_SelYear;
+    int m_SelMonth;
+    int m_SelDay;
+    int m_iHotCell;
+    int m_iHotNav;
+    BOOL m_bTracking;
+    SIZE m_size;
+    RECT m_rcTime, m_rcDate, m_rcPrev, m_rcNext, m_rcHeader, m_rcGrid, m_rcLink;
+    RECT m_rcAnchor, m_rcBack, m_rcAllDay, m_rcTimeline, m_rcAdd;
+    RECT m_rcList, m_rcAgenda;
+    int m_FirstDayOfWeek;
+    WORD m_TodayYear, m_TodayMonth, m_TodayDay;
+    TFYCALDAY m_Day;
+    int m_Counts[32];
+    int m_CountsYear, m_CountsMonth;
+    int m_HourTop;
+    int m_iHotEvent;
+    BOOL m_bHotDel;
+    HWND m_hwndEdit;
+    HBRUSH m_hbrEdit;
+    BOOL m_bAddMode;
+    TFYCALROW m_Rows[TFY_CAL_AGENDAMAX];
+    int m_cRows;
+    int m_RowTop;
+    int m_iHotRow;
+
+    enum { MODE_MONTH = 0, MODE_DAY = 1, MODE_AGENDA = 2 };
+    enum { NAV_NONE = 0, NAV_PREV, NAV_NEXT, NAV_HEADER, NAV_LINK, NAV_DATE,
+           NAV_ADD, NAV_BACK, NAV_LIST };
+
+    CTrayCalendarWnd() : m_hFontTime(NULL), m_hFontHeader(NULL), m_hFont(NULL),
+                         m_hFontSmall(NULL), m_Mode(MODE_MONTH),
+                         m_ViewYear(0), m_ViewMonth(0), m_Level(0),
+                         m_SelYear(0), m_SelMonth(0), m_SelDay(0),
+                         m_iHotCell(-1), m_iHotNav(NAV_NONE),
+                         m_bTracking(FALSE), m_FirstDayOfWeek(0),
+                         m_TodayYear(0), m_TodayMonth(0), m_TodayDay(0),
+                         m_CountsYear(0), m_CountsMonth(0), m_HourTop(8),
+                         m_iHotEvent(-1), m_bHotDel(FALSE), m_hwndEdit(NULL),
+                         m_hbrEdit(NULL), m_bAddMode(FALSE), m_cRows(0),
+                         m_RowTop(0), m_iHotRow(-1)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_size, sizeof(m_size));
+        ZeroMemory(&m_rcAnchor, sizeof(m_rcAnchor));
+        ZeroMemory(&m_Day, sizeof(m_Day));
+        ZeroMemory(m_Counts, sizeof(m_Counts));
+        ZeroMemory(m_Rows, sizeof(m_Rows));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+    int CellW() const { return Sc(40); }
+    int CellH() const { return Sc(38); }
+    int BigCellW() const { return CellW() * 7 / 4; }
+    int BigCellH() const { return CellH() * 6 / 4; }
+    int HourH() const { return Sc(30); }
+    int TimeColW() const { return Sc(52); }
+    int AllDayH() const { return Sc(22); }
+    int RowH() const { return Sc(26); }
+    int SelDate() const { return m_SelYear * 10000 + m_SelMonth * 100 + m_SelDay; }
+    int TodayDate() const
+    {
+        return (int)m_TodayYear * 10000 + (int)m_TodayMonth * 100 + (int)m_TodayDay;
+    }
+
+    static int DayOfWeek(int year, int month, int day)
+    {
+        SYSTEMTIME st;
+        FILETIME ft;
+        ZeroMemory(&st, sizeof(st));
+        st.wYear = (WORD)year;
+        st.wMonth = (WORD)month;
+        st.wDay = (WORD)day;
+        if (!SystemTimeToFileTime(&st, &ft))
+            return 0;
+        FileTimeToSystemTime(&ft, &st);
+        return st.wDayOfWeek;
+    }
+
+    static int DaysInMonth(int year, int month)
+    {
+        static const int days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+            return 29;
+        return days[month - 1];
+    }
+
+    static VOID AddMonths(int &year, int &month, int delta)
+    {
+        int idx = year * 12 + (month - 1) + delta;
+        if (idx < 1601 * 12)
+            idx = 1601 * 12;
+        if (idx > 9999 * 12 + 11)
+            idx = 9999 * 12 + 11;
+        year = idx / 12;
+        month = idx % 12 + 1;
+    }
+
+    int DecadeStart() const
+    {
+        return (m_ViewYear / 10) * 10;
+    }
+
+    VOID ReadFirstDayOfWeek()
+    {
+        WCHAR szFirst[4];
+
+        m_FirstDayOfWeek = 0;
+        if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_IFIRSTDAYOFWEEK,
+                           szFirst, _countof(szFirst)))
+            m_FirstDayOfWeek = (szFirst[0] - L'0' + 1) % 7;
+    }
+
+    BOOL LatchToday()
+    {
+        SYSTEMTIME st;
+
+        GetLocalTime(&st);
+        if (st.wYear == m_TodayYear && st.wMonth == m_TodayMonth &&
+            st.wDay == m_TodayDay)
+            return FALSE;
+        m_TodayYear = st.wYear;
+        m_TodayMonth = st.wMonth;
+        m_TodayDay = st.wDay;
+        return TRUE;
+    }
+
+    BOOL SelIsToday() const
+    {
+        return m_SelYear == m_TodayYear && m_SelMonth == m_TodayMonth &&
+               m_SelDay == m_TodayDay;
+    }
+
+    VOID InvalidateCounts()
+    {
+        m_CountsYear = 0;
+        m_CountsMonth = 0;
+    }
+
+    VOID EnsureCounts()
+    {
+        if (m_CountsYear == m_ViewYear && m_CountsMonth == m_ViewMonth)
+            return;
+        TfyCalLoadMonthCounts(m_ViewYear, m_ViewMonth, m_Counts);
+        m_CountsYear = m_ViewYear;
+        m_CountsMonth = m_ViewMonth;
+    }
+
+    VOID ReloadDay()
+    {
+        TfyCalLoadDay(m_SelYear, m_SelMonth, m_SelDay, &m_Day);
+        m_iHotEvent = -1;
+        m_bHotDel = FALSE;
+    }
+
+    VOID StoreDay()
+    {
+        TfyCalSaveDay(m_SelYear, m_SelMonth, m_SelDay, &m_Day);
+        InvalidateCounts();
+        EnsureCounts();
+    }
+
+    VOID InsertEvent(const TFYCALEVENT &ev)
+    {
+        int i, j;
+
+        if (m_Day.count >= TFY_CAL_MAXEVENTS)
+            return;
+        for (i = 0; i < m_Day.count; i++)
+        {
+            if (m_Day.ev[i].nMinutes > ev.nMinutes)
+                break;
+        }
+        for (j = m_Day.count; j > i; j--)
+            m_Day.ev[j] = m_Day.ev[j - 1];
+        m_Day.ev[i] = ev;
+        m_Day.count++;
+    }
+
+    VOID DeleteEvent(int index)
+    {
+        int i;
+
+        if (index < 0 || index >= m_Day.count)
+            return;
+        for (i = index; i < m_Day.count - 1; i++)
+            m_Day.ev[i] = m_Day.ev[i + 1];
+        m_Day.count--;
+        StoreDay();
+    }
+
+    int AllDayCount() const
+    {
+        int i, n = 0;
+
+        for (i = 0; i < m_Day.count; i++)
+        {
+            if (m_Day.ev[i].nMinutes == TFY_CAL_ALLDAY)
+                n++;
+        }
+        return n;
+    }
+
+    int FirstTimedMinute() const
+    {
+        int i;
+
+        for (i = 0; i < m_Day.count; i++)
+        {
+            if (m_Day.ev[i].nMinutes != TFY_CAL_ALLDAY)
+                return m_Day.ev[i].nMinutes;
+        }
+        return -1;
+    }
+
+    VOID ResetHourTop()
+    {
+        int first = FirstTimedMinute();
+        int hour;
+
+        if (first >= 0)
+            hour = first / 60 - 1;
+        else if (SelIsToday())
+        {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            hour = st.wHour - 1;
+        }
+        else
+            hour = 8;
+        if (hour > 24 - TFY_CAL_HOURSVIS)
+            hour = 24 - TFY_CAL_HOURSVIS;
+        if (hour < 0)
+            hour = 0;
+        m_HourTop = hour;
+    }
+
+    VOID LayoutCommon(int &y)
+    {
+        int pad = Sc(16);
+
+        m_size.cx = pad * 2 + CellW() * 7;
+        y = pad;
+        SetRect(&m_rcTime, pad, y, m_size.cx - pad, y + Sc(44));
+        y += Sc(44);
+        SetRect(&m_rcDate, pad, y, m_size.cx - pad, y + Sc(24));
+        y += Sc(24) + Sc(14);
+    }
+
+    VOID LayoutTail(int &y)
+    {
+        int pad = Sc(16);
+
+        y += Sc(20);
+        SetRect(&m_rcLink, pad, y, m_size.cx - pad, y + Sc(22));
+        y += Sc(22) + Sc(12);
+        m_size.cy = y;
+    }
+
+    VOID LayoutAgenda()
+    {
+        int pad = Sc(16), y, headerY;
+
+        LayoutCommon(y);
+        headerY = y;
+        SetRect(&m_rcBack, pad, headerY, pad + Sc(28), headerY + Sc(28));
+        SetRect(&m_rcHeader, m_rcBack.right + Sc(6), headerY, m_size.cx - pad,
+                headerY + Sc(28));
+        SetRectEmpty(&m_rcPrev);
+        SetRectEmpty(&m_rcNext);
+        SetRectEmpty(&m_rcList);
+        SetRectEmpty(&m_rcGrid);
+        SetRectEmpty(&m_rcAllDay);
+        SetRectEmpty(&m_rcTimeline);
+        SetRectEmpty(&m_rcAdd);
+        y += Sc(28) + Sc(8);
+        SetRect(&m_rcAgenda, pad, y, m_size.cx - pad, y + TFY_CAL_AGENDAVIS * RowH());
+        y += TFY_CAL_AGENDAVIS * RowH() + Sc(10);
+        LayoutTail(y);
+    }
+
+    VOID LayoutMonth()
+    {
+        int pad = Sc(16), y, headerY;
+
+        LayoutCommon(y);
+        headerY = y;
+        SetRect(&m_rcNext, m_size.cx - pad - Sc(28), headerY, m_size.cx - pad, headerY + Sc(28));
+        SetRect(&m_rcPrev, m_rcNext.left - Sc(32), headerY, m_rcNext.left - Sc(4), headerY + Sc(28));
+        SetRect(&m_rcList, m_rcPrev.left - Sc(32), headerY, m_rcPrev.left - Sc(4), headerY + Sc(28));
+        SetRect(&m_rcHeader, pad, headerY, m_rcList.left - Sc(8), headerY + Sc(28));
+        SetRectEmpty(&m_rcAgenda);
+        SetRectEmpty(&m_rcBack);
+        SetRectEmpty(&m_rcAllDay);
+        SetRectEmpty(&m_rcTimeline);
+        SetRectEmpty(&m_rcAdd);
+        y += Sc(28) + Sc(24);
+        SetRect(&m_rcGrid, pad, y, pad + CellW() * 7, y + CellH() * 6);
+        y += CellH() * 6 + Sc(10);
+        LayoutTail(y);
+    }
+
+    VOID LayoutDay()
+    {
+        int pad = Sc(16), y, headerY, nAllDay;
+
+        LayoutCommon(y);
+        headerY = y;
+        SetRect(&m_rcNext, m_size.cx - pad - Sc(28), headerY, m_size.cx - pad, headerY + Sc(28));
+        SetRect(&m_rcPrev, m_rcNext.left - Sc(32), headerY, m_rcNext.left - Sc(4), headerY + Sc(28));
+        SetRect(&m_rcBack, pad, headerY, pad + Sc(28), headerY + Sc(28));
+        SetRect(&m_rcHeader, m_rcBack.right + Sc(6), headerY, m_rcPrev.left - Sc(8), headerY + Sc(28));
+        SetRectEmpty(&m_rcGrid);
+        SetRectEmpty(&m_rcList);
+        SetRectEmpty(&m_rcAgenda);
+        y += Sc(28) + Sc(10);
+        nAllDay = AllDayCount();
+        if (nAllDay > TFY_CAL_ALLDAYVIS)
+            nAllDay = TFY_CAL_ALLDAYVIS;
+        SetRect(&m_rcAllDay, pad, y, m_size.cx - pad, y + nAllDay * AllDayH());
+        y += nAllDay * AllDayH();
+        if (nAllDay != 0)
+            y += Sc(8);
+        SetRect(&m_rcTimeline, pad, y, m_size.cx - pad, y + TFY_CAL_HOURSVIS * HourH());
+        y += TFY_CAL_HOURSVIS * HourH() + Sc(10);
+        SetRect(&m_rcAdd, pad, y, m_size.cx - pad, y + Sc(26));
+        y += Sc(26) + Sc(10);
+        LayoutTail(y);
+    }
+
+    VOID Layout()
+    {
+        if (m_Mode == MODE_DAY)
+            LayoutDay();
+        else if (m_Mode == MODE_AGENDA)
+            LayoutAgenda();
+        else
+            LayoutMonth();
+    }
+
+    VOID ComputePosition()
+    {
+        TfyW11Position(::GetWindow(m_hWnd, GW_OWNER), &m_rcAnchor, m_size, FALSE, &m_ptFinal);
+    }
+
+    VOID Relayout()
+    {
+        Layout();
+        ComputePosition();
+        if (m_AnimPhase == TFY_NONE)
+        {
+            SetWindowPos(NULL, m_ptFinal.x, m_ptFinal.y, m_size.cx, m_size.cy,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        else
+        {
+            SetWindowPos(NULL, 0, 0, m_size.cx, m_size.cy,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (m_bAddMode && m_hwndEdit)
+        {
+            ::SetWindowPos(m_hwndEdit, NULL, m_rcAdd.left, m_rcAdd.top,
+                           m_rcAdd.right - m_rcAdd.left,
+                           m_rcAdd.bottom - m_rcAdd.top,
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        TrayNotifCenter_Refresh();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID GoToday()
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        m_ViewYear = st.wYear;
+        m_ViewMonth = st.wMonth;
+        m_SelYear = st.wYear;
+        m_SelMonth = st.wMonth;
+        m_SelDay = st.wDay;
+        m_Level = 0;
+        LatchToday();
+    }
+
+    VOID OpenDay()
+    {
+        m_Mode = MODE_DAY;
+        m_Level = 0;
+        m_iHotCell = -1;
+        m_iHotNav = NAV_NONE;
+        ReloadDay();
+        ResetHourTop();
+        Relayout();
+    }
+
+    VOID GoMonth()
+    {
+        if (m_bAddMode)
+            HideEdit();
+        m_Mode = MODE_MONTH;
+        m_ViewYear = m_SelYear;
+        m_ViewMonth = m_SelMonth;
+        m_iHotNav = NAV_NONE;
+        m_iHotEvent = -1;
+        m_iHotRow = -1;
+        EnsureCounts();
+        Relayout();
+    }
+
+    VOID ShiftDay(int delta)
+    {
+        SYSTEMTIME st;
+        FILETIME ft;
+        ULARGE_INTEGER ul;
+
+        ZeroMemory(&st, sizeof(st));
+        st.wYear = (WORD)m_SelYear;
+        st.wMonth = (WORD)m_SelMonth;
+        st.wDay = (WORD)m_SelDay;
+        if (!SystemTimeToFileTime(&st, &ft))
+            return;
+        ul.LowPart = ft.dwLowDateTime;
+        ul.HighPart = ft.dwHighDateTime;
+        ul.QuadPart += (LONGLONG)delta * 864000000000LL;
+        ft.dwLowDateTime = ul.LowPart;
+        ft.dwHighDateTime = ul.HighPart;
+        if (!FileTimeToSystemTime(&ft, &st))
+            return;
+        m_SelYear = st.wYear;
+        m_SelMonth = st.wMonth;
+        m_SelDay = st.wDay;
+        m_ViewYear = st.wYear;
+        m_ViewMonth = st.wMonth;
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+
+        if (!m_hFontTime) m_hFontTime = TfyCreateFont(32, FW_LIGHT);
+        if (!m_hFontHeader) m_hFontHeader = TfyCreateFont(14, FW_SEMIBOLD);
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+
+        m_Mode = MODE_MONTH;
+        GoToday();
+        m_iHotCell = -1;
+        m_iHotNav = NAV_NONE;
+        ReadFirstDayOfWeek();
+        m_rcAnchor = *prcAnchor;
+        InvalidateCounts();
+        EnsureCounts();
+        ReloadDay();
+
+        Layout();
+        ComputePosition();
+
+        BeginFlyoutOpen(m_hWnd, m_ptFinal.x, m_ptFinal.y, m_size.cx, m_size.cy,
+                        m_Pal.PanelBg);
+        SetTimer(TFY_TIMER_TICK, 1000, NULL);
+    }
+
+    VOID FadeOut();
+
+    RECT CellRect(int cell) const
+    {
+        RECT rc;
+        if (m_Level == 0)
+        {
+            int col = cell % 7, row = cell / 7;
+            SetRect(&rc, m_rcGrid.left + col * CellW(), m_rcGrid.top + row * CellH(),
+                    m_rcGrid.left + (col + 1) * CellW(), m_rcGrid.top + (row + 1) * CellH());
+        }
+        else
+        {
+            int col = cell % 4, row = cell / 4;
+            SetRect(&rc, m_rcGrid.left + col * BigCellW(), m_rcGrid.top + row * BigCellH(),
+                    m_rcGrid.left + (col + 1) * BigCellW(), m_rcGrid.top + (row + 1) * BigCellH());
+        }
+        return rc;
+    }
+
+    int CellCount() const { return m_Level == 0 ? 42 : 16; }
+
+    VOID CellDate(int cell, int &year, int &month, int &day, BOOL &bDim) const
+    {
+        bDim = FALSE;
+        if (m_Level == 0)
+        {
+            int firstDow = DayOfWeek(m_ViewYear, m_ViewMonth, 1);
+            int lead = (firstDow - m_FirstDayOfWeek + 7) % 7;
+            if (lead == 0)
+                lead = 7;
+            int d = cell - lead + 1;
+            year = m_ViewYear;
+            month = m_ViewMonth;
+            if (d < 1)
+            {
+                AddMonths(year, month, -1);
+                d += DaysInMonth(year, month);
+                bDim = TRUE;
+            }
+            else if (d > DaysInMonth(year, month))
+            {
+                d -= DaysInMonth(year, month);
+                AddMonths(year, month, 1);
+                bDim = TRUE;
+            }
+            day = d;
+        }
+        else if (m_Level == 1)
+        {
+            year = m_ViewYear;
+            month = cell + 1;
+            day = 1;
+            if (month > 12)
+            {
+                month -= 12;
+                year++;
+                bDim = TRUE;
+            }
+        }
+        else
+        {
+            year = DecadeStart() - 1 + cell;
+            month = 1;
+            day = 1;
+            bDim = (year < DecadeStart() || year > DecadeStart() + 9);
+        }
+    }
+
+    VOID DrawCell(HDC hdc, const RECT *prc, LPCWSTR pszText, BOOL bToday,
+                  BOOL bSel, BOOL bHot, BOOL bDim, int nCount)
+    {
+        RECT rcFill = *prc, rcNum = *prc;
+
+        InflateRect(&rcFill, -Sc(2), -Sc(2));
+        if (bToday)
+        {
+            HBRUSH hbr = CreateSolidBrush(m_Pal.AccentBg);
+            FillRect(hdc, &rcFill, hbr);
+            DeleteObject(hbr);
+        }
+        else if (bHot)
+        {
+            HBRUSH hbr = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+            FillRect(hdc, &rcFill, hbr);
+            DeleteObject(hbr);
+        }
+        if (bSel)
+        {
+            HBRUSH hbr = CreateSolidBrush(bToday ? m_Pal.AccentText : m_Pal.AccentBg);
+            RECT rcInner = rcFill;
+            FrameRect(hdc, &rcFill, hbr);
+            InflateRect(&rcInner, -1, -1);
+            FrameRect(hdc, &rcInner, hbr);
+            DeleteObject(hbr);
+        }
+        SetTextColor(hdc, bToday ? m_Pal.AccentText : (bDim ? m_Pal.DimText : m_Pal.PanelText));
+        if (nCount > 0)
+            rcNum.bottom -= Sc(11);
+        DrawTextW(hdc, pszText, -1, &rcNum,
+                  DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        if (nCount > 0)
+        {
+            WCHAR szCount[8];
+            RECT rcCount = *prc;
+            HGDIOBJ hOld = SelectObject(hdc, m_hFontSmall);
+
+            rcCount.top = rcCount.bottom - Sc(14);
+            StringCchPrintfW(szCount, _countof(szCount), L"%d", nCount);
+            SetTextColor(hdc, bToday ? m_Pal.AccentText : m_Pal.AccentBg);
+            DrawTextW(hdc, szCount, -1, &rcCount,
+                      DT_SINGLELINE | DT_TOP | DT_CENTER | DT_NOPREFIX);
+            SelectObject(hdc, hOld);
+        }
+    }
+
+    VOID FormatMinutes(int minutes, BOOL bHourOnly, LPWSTR psz, size_t cch)
+    {
+        SYSTEMTIME st;
+
+        ZeroMemory(&st, sizeof(st));
+        st.wYear = (WORD)m_SelYear;
+        st.wMonth = (WORD)m_SelMonth;
+        st.wDay = (WORD)m_SelDay;
+        st.wHour = (WORD)(minutes / 60);
+        st.wMinute = (WORD)(minutes % 60);
+        if (!GetTimeFormatW(LOCALE_USER_DEFAULT,
+                            bHourOnly ? TIME_NOMINUTESORSECONDS : TIME_NOSECONDS,
+                            &st, NULL, psz, (int)cch))
+            StringCchPrintfW(psz, cch, L"%02d:%02d", st.wHour, st.wMinute);
+    }
+
+    VOID FormatRowMinutes(int date, int minutes, LPWSTR psz, size_t cch)
+    {
+        SYSTEMTIME st;
+
+        ZeroMemory(&st, sizeof(st));
+        st.wYear = (WORD)(date / 10000);
+        st.wMonth = (WORD)((date / 100) % 100);
+        st.wDay = (WORD)(date % 100);
+        st.wHour = (WORD)(minutes / 60);
+        st.wMinute = (WORD)(minutes % 60);
+        if (!GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &st, NULL,
+                            psz, (int)cch))
+            StringCchPrintfW(psz, cch, L"%02d:%02d", st.wHour, st.wMinute);
+    }
+
+    int AllDayIndex(int slot) const
+    {
+        int i, n = 0;
+
+        for (i = 0; i < m_Day.count; i++)
+        {
+            if (m_Day.ev[i].nMinutes != TFY_CAL_ALLDAY)
+                continue;
+            if (n == slot)
+                return i;
+            n++;
+        }
+        return -1;
+    }
+
+    RECT EventBlockRect(int index) const
+    {
+        RECT rc = { 0, 0, 0, 0 };
+        int top, height;
+
+        if (index < 0 || index >= m_Day.count ||
+            m_Day.ev[index].nMinutes == TFY_CAL_ALLDAY)
+            return rc;
+        top = m_rcTimeline.top +
+              (m_Day.ev[index].nMinutes - m_HourTop * 60) * HourH() / 60;
+        height = m_Day.ev[index].nDuration * HourH() / 60;
+        if (height < Sc(18))
+            height = Sc(18);
+        SetRect(&rc, m_rcTimeline.left + TimeColW(), top,
+                m_rcTimeline.right, top + height);
+        return rc;
+    }
+
+    VOID DrawTimeline(HDC hdc)
+    {
+        WCHAR szBuf[64];
+        HBRUSH hbrLine = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 70));
+        HRGN hrgn = CreateRectRgn(m_rcTimeline.left, m_rcTimeline.top,
+                                  m_rcTimeline.right, m_rcTimeline.bottom);
+        int i;
+
+        SelectClipRgn(hdc, hrgn);
+        SelectObject(hdc, m_hFontSmall);
+        for (i = 0; i < TFY_CAL_HOURSVIS; i++)
+        {
+            int hour = m_HourTop + i;
+            int rowY = m_rcTimeline.top + i * HourH();
+            RECT rcLine = { m_rcTimeline.left + TimeColW(), rowY,
+                            m_rcTimeline.right, rowY + 1 };
+            RECT rcLabel = { m_rcTimeline.left, rowY - Sc(7),
+                             m_rcTimeline.left + TimeColW() - Sc(6), rowY + Sc(9) };
+
+            if (hour > 23)
+                break;
+            FillRect(hdc, &rcLine, hbrLine);
+            if (i == 0 && m_HourTop == 0)
+                continue;
+            FormatMinutes(hour * 60, TRUE, szBuf, _countof(szBuf));
+            SetTextColor(hdc, m_Pal.DimText);
+            DrawTextW(hdc, szBuf, -1, &rcLabel,
+                      DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        }
+        for (i = 0; i < m_Day.count; i++)
+        {
+            RECT rcBlock = EventBlockRect(i), rcBar, rcText;
+            HBRUSH hbrBlock;
+
+            if (m_Day.ev[i].nMinutes == TFY_CAL_ALLDAY)
+                continue;
+            if (rcBlock.bottom <= m_rcTimeline.top || rcBlock.top >= m_rcTimeline.bottom)
+                continue;
+            hbrBlock = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.AccentBg,
+                                               i == m_iHotEvent ? 150 : 110));
+            InflateRect(&rcBlock, -Sc(1), 0);
+            FillRect(hdc, &rcBlock, hbrBlock);
+            DeleteObject(hbrBlock);
+            hbrBlock = CreateSolidBrush(m_Pal.AccentBg);
+            SetRect(&rcBar, rcBlock.left, rcBlock.top, rcBlock.left + Sc(3), rcBlock.bottom);
+            FillRect(hdc, &rcBar, hbrBlock);
+            DeleteObject(hbrBlock);
+            rcText = rcBlock;
+            rcText.left += Sc(8);
+            rcText.right -= (i == m_iHotEvent) ? Sc(24) : Sc(6);
+            SetTextColor(hdc, m_Pal.PanelText);
+            SelectObject(hdc, m_hFont);
+            DrawTextW(hdc, m_Day.ev[i].szTitle, -1, &rcText,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            if (i == m_iHotEvent)
+            {
+                RECT rcDel = { rcBlock.right - Sc(22), rcBlock.top + Sc(3),
+                               rcBlock.right - Sc(6), rcBlock.top + Sc(19) };
+                TfyDrawFluent(hdc, &rcDel, IDI_FLU_DELETEICO);
+            }
+        }
+        if (SelIsToday())
+        {
+            SYSTEMTIME st;
+            int nowY;
+
+            GetLocalTime(&st);
+            nowY = m_rcTimeline.top +
+                   (st.wHour * 60 + st.wMinute - m_HourTop * 60) * HourH() / 60;
+            if (nowY >= m_rcTimeline.top && nowY < m_rcTimeline.bottom)
+            {
+                HBRUSH hbrNow = CreateSolidBrush(m_Pal.AccentBg);
+                RECT rcNow = { m_rcTimeline.left + TimeColW() - Sc(4), nowY,
+                               m_rcTimeline.right, nowY + Sc(2) };
+                RECT rcDot = { m_rcTimeline.left + TimeColW() - Sc(4), nowY - Sc(3),
+                               m_rcTimeline.left + TimeColW() + Sc(2), nowY + Sc(5) };
+
+                FillRect(hdc, &rcNow, hbrNow);
+                FillRect(hdc, &rcDot, hbrNow);
+                DeleteObject(hbrNow);
+            }
+        }
+        SelectClipRgn(hdc, NULL);
+        DeleteObject(hrgn);
+        DeleteObject(hbrLine);
+    }
+
+    VOID DrawAllDay(HDC hdc)
+    {
+        int slots = (m_rcAllDay.bottom - m_rcAllDay.top) / AllDayH();
+        int i;
+
+        SelectObject(hdc, m_hFont);
+        for (i = 0; i < slots; i++)
+        {
+            int idx = AllDayIndex(i);
+            RECT rcRow, rcBar, rcText;
+            HBRUSH hbr;
+
+            if (idx < 0)
+                break;
+            SetRect(&rcRow, m_rcAllDay.left, m_rcAllDay.top + i * AllDayH(),
+                    m_rcAllDay.right, m_rcAllDay.top + (i + 1) * AllDayH() - Sc(2));
+            hbr = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.AccentBg,
+                                          idx == m_iHotEvent ? 150 : 110));
+            FillRect(hdc, &rcRow, hbr);
+            DeleteObject(hbr);
+            hbr = CreateSolidBrush(m_Pal.AccentBg);
+            SetRect(&rcBar, rcRow.left, rcRow.top, rcRow.left + Sc(3), rcRow.bottom);
+            FillRect(hdc, &rcBar, hbr);
+            DeleteObject(hbr);
+            rcText = rcRow;
+            rcText.left += Sc(8);
+            rcText.right -= (idx == m_iHotEvent) ? Sc(24) : Sc(6);
+            SetTextColor(hdc, m_Pal.PanelText);
+            DrawTextW(hdc, m_Day.ev[idx].szTitle, -1, &rcText,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            if (idx == m_iHotEvent)
+            {
+                RECT rcDel = { rcRow.right - Sc(22), rcRow.top + Sc(2),
+                               rcRow.right - Sc(6), rcRow.top + Sc(18) };
+                TfyDrawFluent(hdc, &rcDel, IDI_FLU_DELETEICO);
+            }
+        }
+    }
+
+    VOID ReloadAgenda()
+    {
+        m_cRows = TfyCalLoadAgenda(SelDate(), m_Rows, TFY_CAL_AGENDAMAX);
+        m_RowTop = 0;
+        m_iHotRow = -1;
+    }
+
+    VOID OpenAgenda()
+    {
+        if (m_bAddMode)
+            HideEdit();
+        m_Mode = MODE_AGENDA;
+        m_iHotCell = -1;
+        m_iHotNav = NAV_NONE;
+        m_iHotEvent = -1;
+        ReloadAgenda();
+        Relayout();
+    }
+
+    VOID OpenAgendaDay(int idx)
+    {
+        int date;
+
+        if (idx < 0 || idx >= m_cRows)
+            return;
+        date = m_Rows[idx].date;
+        m_SelYear = date / 10000;
+        m_SelMonth = (date / 100) % 100;
+        m_SelDay = date % 100;
+        m_ViewYear = m_SelYear;
+        m_ViewMonth = m_SelMonth;
+        EnsureCounts();
+        OpenDay();
+    }
+
+    VOID DeleteAgendaRow(int idx)
+    {
+        TFYCALDAY day;
+        int date, year, month, dayNo, i;
+
+        if (idx < 0 || idx >= m_cRows || m_Rows[idx].bHeader)
+            return;
+        date = m_Rows[idx].date;
+        year = date / 10000;
+        month = (date / 100) % 100;
+        dayNo = date % 100;
+        TfyCalLoadDay(year, month, dayNo, &day);
+        for (i = 0; i < day.count; i++)
+        {
+            int j;
+
+            if (day.ev[i].nMinutes != m_Rows[idx].ev.nMinutes ||
+                lstrcmpW(day.ev[i].szTitle, m_Rows[idx].ev.szTitle) != 0)
+                continue;
+            for (j = i; j < day.count - 1; j++)
+                day.ev[j] = day.ev[j + 1];
+            day.count--;
+            TfyCalSaveDay(year, month, dayNo, &day);
+            InvalidateCounts();
+            EnsureCounts();
+            break;
+        }
+        ReloadAgenda();
+    }
+
+    VOID ScrollRows(int delta)
+    {
+        int maxTop = m_cRows - TFY_CAL_AGENDAVIS;
+        int top = m_RowTop + delta;
+
+        if (maxTop < 0)
+            maxTop = 0;
+        if (top > maxTop)
+            top = maxTop;
+        if (top < 0)
+            top = 0;
+        if (top != m_RowTop)
+        {
+            m_RowTop = top;
+            InvalidateRect(NULL, FALSE);
+        }
+    }
+
+    int NowRowIndex() const
+    {
+        SYSTEMTIME st;
+        int i, nowDate = TodayDate(), nowMin, last = -1;
+
+        GetLocalTime(&st);
+        nowMin = st.wHour * 60 + st.wMinute;
+        for (i = 0; i < m_cRows; i++)
+        {
+            if (m_Rows[i].date != nowDate || m_Rows[i].bHeader)
+                continue;
+            last = i;
+            if (m_Rows[i].ev.nMinutes != TFY_CAL_ALLDAY &&
+                m_Rows[i].ev.nMinutes >= nowMin)
+                return i;
+        }
+        return last >= 0 ? last + 1 : -1;
+    }
+
+    VOID DrawAgendaList(HDC hdc)
+    {
+        WCHAR szBuf[128];
+        int nowDate = TodayDate();
+        int nowRow = NowRowIndex();
+        int i;
+
+        if (m_cRows == 0)
+        {
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            DrawTextW(hdc, L"No upcoming events", -1, &m_rcAgenda,
+                      DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            return;
+        }
+        for (i = 0; i < TFY_CAL_AGENDAVIS; i++)
+        {
+            int idx = m_RowTop + i;
+            RECT rcRow, rcText;
+
+            if (idx >= m_cRows)
+                break;
+            SetRect(&rcRow, m_rcAgenda.left, m_rcAgenda.top + i * RowH(),
+                    m_rcAgenda.right, m_rcAgenda.top + (i + 1) * RowH());
+            if (m_Rows[idx].bHeader)
+            {
+                SYSTEMTIME stRow;
+                HBRUSH hbrRule;
+                RECT rcRule;
+                BOOL bToday = (m_Rows[idx].date == nowDate);
+
+                ZeroMemory(&stRow, sizeof(stRow));
+                stRow.wYear = (WORD)(m_Rows[idx].date / 10000);
+                stRow.wMonth = (WORD)((m_Rows[idx].date / 100) % 100);
+                stRow.wDay = (WORD)(m_Rows[idx].date % 100);
+                if (!GetDateFormatW(LOCALE_USER_DEFAULT, 0, &stRow, L"ddd, d MMMM",
+                                    szBuf, _countof(szBuf)))
+                    StringCchPrintfW(szBuf, _countof(szBuf), L"%d", stRow.wDay);
+                hbrRule = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 70));
+                SetRect(&rcRule, rcRow.left, rcRow.bottom - Sc(3), rcRow.right,
+                        rcRow.bottom - Sc(2));
+                FillRect(hdc, &rcRule, hbrRule);
+                DeleteObject(hbrRule);
+                SelectObject(hdc, m_hFontHeader);
+                SetTextColor(hdc, bToday ? m_Pal.AccentBg : m_Pal.PanelText);
+                rcText = rcRow;
+                rcText.bottom -= Sc(4);
+                DrawTextW(hdc, szBuf, -1, &rcText,
+                          DT_SINGLELINE | DT_BOTTOM | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+                continue;
+            }
+            if (idx == m_iHotRow)
+            {
+                HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+                FillRect(hdc, &rcRow, hbrHot);
+                DeleteObject(hbrHot);
+            }
+            {
+                RECT rcDot = { rcRow.left + Sc(2), (rcRow.top + rcRow.bottom) / 2 - Sc(3),
+                               rcRow.left + Sc(8), (rcRow.top + rcRow.bottom) / 2 + Sc(3) };
+                HBRUSH hbrDot = CreateSolidBrush(m_Pal.AccentBg);
+
+                FillRect(hdc, &rcDot, hbrDot);
+                DeleteObject(hbrDot);
+            }
+            rcText = rcRow;
+            rcText.left += Sc(14);
+            rcText.right = rcText.left + Sc(56);
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            if (m_Rows[idx].ev.nMinutes == TFY_CAL_ALLDAY)
+                StringCchCopyW(szBuf, _countof(szBuf), L"All day");
+            else
+                FormatRowMinutes(m_Rows[idx].date, m_Rows[idx].ev.nMinutes, szBuf,
+                                 _countof(szBuf));
+            DrawTextW(hdc, szBuf, -1, &rcText,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            rcText.left = rcText.right + Sc(6);
+            rcText.right = rcRow.right - (idx == m_iHotRow ? Sc(26) : Sc(4));
+            SelectObject(hdc, m_hFont);
+            SetTextColor(hdc, m_Pal.PanelText);
+            DrawTextW(hdc, m_Rows[idx].ev.szTitle, -1, &rcText,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+            if (idx == m_iHotRow)
+            {
+                RECT rcDel = { rcRow.right - Sc(22), rcRow.top + Sc(5),
+                               rcRow.right - Sc(6), rcRow.top + Sc(21) };
+                TfyDrawFluent(hdc, &rcDel, IDI_FLU_DELETEICO);
+            }
+        }
+        if (nowRow >= m_RowTop && nowRow < m_RowTop + TFY_CAL_AGENDAVIS && nowRow <= m_cRows)
+        {
+            int lineY = m_rcAgenda.top + (nowRow - m_RowTop) * RowH();
+            HBRUSH hbrNow = CreateSolidBrush(m_Pal.AccentBg);
+            RECT rcNow = { m_rcAgenda.left + Sc(2), lineY, m_rcAgenda.right, lineY + Sc(2) };
+            RECT rcDot = { m_rcAgenda.left, lineY - Sc(2), m_rcAgenda.left + Sc(6), lineY + Sc(4) };
+
+            FillRect(hdc, &rcNow, hbrNow);
+            FillRect(hdc, &rcDot, hbrNow);
+            DeleteObject(hbrNow);
+        }
+    }
+
+    VOID DrawAgendaView(HDC hdc)
+    {
+        DrawNavButton(hdc, &m_rcBack, NAV_BACK, IDI_FLU_ARROWLEFT);
+        SelectObject(hdc, m_hFontHeader);
+        SetTextColor(hdc, m_Pal.PanelText);
+        {
+            RECT rcHeaderText = m_rcHeader;
+
+            rcHeaderText.left += Sc(4);
+            DrawTextW(hdc, L"Schedule", -1, &rcHeaderText,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        DrawAgendaList(hdc);
+    }
+
+    VOID DrawAddRow(HDC hdc)
+    {
+        int cym = (m_rcAdd.top + m_rcAdd.bottom) / 2;
+        RECT rcIcon = { m_rcAdd.left, cym - Sc(7), m_rcAdd.left + Sc(14), cym + Sc(7) };
+        RECT rcText = m_rcAdd;
+
+        if (m_bAddMode)
+            return;
+        rcText.left += Sc(20);
+        TfyDrawFluent(hdc, &rcIcon, IDI_FLU_ADD);
+        SelectObject(hdc, m_hFont);
+        SetTextColor(hdc, m_iHotNav == NAV_ADD ? m_Pal.HotBorder : m_Pal.AccentBg);
+        DrawTextW(hdc, L"Add an event or reminder", -1, &rcText,
+                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+
+    VOID DrawNavButton(HDC hdc, const RECT *prc, int nav, int idIcon)
+    {
+        int cxm = (prc->left + prc->right) / 2;
+        int cym = (prc->top + prc->bottom) / 2;
+        RECT rcIcon = { cxm - Sc(8), cym - Sc(8), cxm + Sc(8), cym + Sc(8) };
+
+        if (m_iHotNav == nav)
+        {
+            HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+            FillRect(hdc, prc, hbrHot);
+            DeleteObject(hbrHot);
+        }
+        TfyDrawFluent(hdc, &rcIcon, idIcon);
+    }
+
+    VOID DrawMonth(HDC hdc, const SYSTEMTIME *pNow)
+    {
+        WCHAR szBuf[128];
+        RECT rcHeaderText;
+        int i, cell;
+
+        if (m_Level == 0)
+        {
+            SYSTEMTIME stView;
+            ZeroMemory(&stView, sizeof(stView));
+            stView.wYear = (WORD)m_ViewYear;
+            stView.wMonth = (WORD)m_ViewMonth;
+            stView.wDay = 1;
+            GetDateFormatW(LOCALE_USER_DEFAULT, 0, &stView, L"MMMM yyyy", szBuf, _countof(szBuf));
+        }
+        else if (m_Level == 1)
+            StringCchPrintfW(szBuf, _countof(szBuf), L"%d", m_ViewYear);
+        else
+            StringCchPrintfW(szBuf, _countof(szBuf), L"%d - %d", DecadeStart(), DecadeStart() + 9);
+
+        if (m_iHotNav == NAV_HEADER && m_Level < 2)
+        {
+            HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+            FillRect(hdc, &m_rcHeader, hbrHot);
+            DeleteObject(hbrHot);
+        }
+        rcHeaderText = m_rcHeader;
+        rcHeaderText.left += Sc(4);
+        SelectObject(hdc, m_hFontHeader);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, szBuf, -1, &rcHeaderText,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        DrawNavButton(hdc, &m_rcList, NAV_LIST, IDI_FLU_LIST);
+        DrawNavButton(hdc, &m_rcPrev, NAV_PREV, IDI_FLU_CHEVUP);
+        DrawNavButton(hdc, &m_rcNext, NAV_NEXT, IDI_FLU_CHEVDOWN);
+
+        if (m_Level == 0)
+        {
+            static const int shortestIds[7] =
+            {
+                LOCALE_SSHORTESTDAYNAME7, LOCALE_SSHORTESTDAYNAME1, LOCALE_SSHORTESTDAYNAME2,
+                LOCALE_SSHORTESTDAYNAME3, LOCALE_SSHORTESTDAYNAME4, LOCALE_SSHORTESTDAYNAME5,
+                LOCALE_SSHORTESTDAYNAME6
+            };
+            static const int abbrevIds[7] =
+            {
+                LOCALE_SABBREVDAYNAME7, LOCALE_SABBREVDAYNAME1, LOCALE_SABBREVDAYNAME2,
+                LOCALE_SABBREVDAYNAME3, LOCALE_SABBREVDAYNAME4, LOCALE_SABBREVDAYNAME5,
+                LOCALE_SABBREVDAYNAME6
+            };
+
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            for (i = 0; i < 7; i++)
+            {
+                int dow = (m_FirstDayOfWeek + i) % 7;
+                RECT rcDay = { m_rcGrid.left + i * CellW(), m_rcGrid.top - Sc(24),
+                               m_rcGrid.left + (i + 1) * CellW(), m_rcGrid.top };
+
+                if (!GetLocaleInfoW(LOCALE_USER_DEFAULT, shortestIds[dow], szBuf, _countof(szBuf)) &&
+                    !GetLocaleInfoW(LOCALE_USER_DEFAULT, abbrevIds[dow], szBuf, _countof(szBuf)))
+                    szBuf[0] = 0;
+                DrawTextW(hdc, szBuf, -1, &rcDay,
+                          DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            }
+        }
+
+        SelectObject(hdc, m_hFont);
+        for (cell = 0; cell < CellCount(); cell++)
+        {
+            int year, month, day, nCount = 0;
+            BOOL bDim, bToday, bSel;
+            RECT rcCell = CellRect(cell);
+
+            CellDate(cell, year, month, day, bDim);
+            if (m_Level == 0)
+            {
+                bToday = (year == pNow->wYear && month == pNow->wMonth && day == pNow->wDay);
+                bSel = (year == m_SelYear && month == m_SelMonth && day == m_SelDay);
+                if (!bDim && day >= 1 && day <= 31)
+                    nCount = m_Counts[day];
+                StringCchPrintfW(szBuf, _countof(szBuf), L"%d", day);
+            }
+            else if (m_Level == 1)
+            {
+                SYSTEMTIME stCell;
+                ZeroMemory(&stCell, sizeof(stCell));
+                stCell.wYear = (WORD)year;
+                stCell.wMonth = (WORD)month;
+                stCell.wDay = 1;
+                bToday = (year == pNow->wYear && month == pNow->wMonth);
+                bSel = (year == m_SelYear && month == m_SelMonth);
+                if (!GetDateFormatW(LOCALE_USER_DEFAULT, 0, &stCell, L"MMM", szBuf, _countof(szBuf)))
+                    StringCchPrintfW(szBuf, _countof(szBuf), L"%d", month);
+            }
+            else
+            {
+                bToday = (year == pNow->wYear);
+                bSel = (year == m_SelYear);
+                StringCchPrintfW(szBuf, _countof(szBuf), L"%d", year);
+            }
+            DrawCell(hdc, &rcCell, szBuf, bToday, bSel, cell == m_iHotCell, bDim, nCount);
+            SelectObject(hdc, m_hFont);
+        }
+    }
+
+    VOID DrawDay(HDC hdc)
+    {
+        WCHAR szBuf[128];
+        SYSTEMTIME stSel;
+        RECT rcHeaderText;
+
+        ZeroMemory(&stSel, sizeof(stSel));
+        stSel.wYear = (WORD)m_SelYear;
+        stSel.wMonth = (WORD)m_SelMonth;
+        stSel.wDay = (WORD)m_SelDay;
+        if (!GetDateFormatW(LOCALE_USER_DEFAULT, 0, &stSel, L"ddd d MMMM", szBuf, _countof(szBuf)))
+            StringCchPrintfW(szBuf, _countof(szBuf), L"%d", m_SelDay);
+
+        DrawNavButton(hdc, &m_rcBack, NAV_BACK, IDI_FLU_ARROWLEFT);
+        rcHeaderText = m_rcHeader;
+        rcHeaderText.left += Sc(4);
+        SelectObject(hdc, m_hFontHeader);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, szBuf, -1, &rcHeaderText,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        DrawNavButton(hdc, &m_rcPrev, NAV_PREV, IDI_FLU_CHEVUP);
+        DrawNavButton(hdc, &m_rcNext, NAV_NEXT, IDI_FLU_CHEVDOWN);
+
+        DrawAllDay(hdc);
+        DrawTimeline(hdc);
+        if (m_Day.count == 0)
+        {
+            RECT rcEmpty = m_rcTimeline;
+
+            rcEmpty.left += TimeColW();
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            DrawTextW(hdc, L"No events", -1, &rcEmpty,
+                      DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+        DrawAddRow(hdc);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        SYSTEMTIME stNow;
+        WCHAR szBuf[128];
+        RECT rc, rcSep, rcSep2;
+        HDC hdcMem;
+        HBITMAP hbm;
+        HGDIOBJ hbmOld, hFontOld;
+        HBRUSH hbr, hbrSep;
+        int pad = Sc(16);
+
+        GetClientRect(&rc);
+        hdcMem = CreateCompatibleDC(hdc);
+        hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        hbmOld = SelectObject(hdcMem, hbm);
+
+        hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        TfyDrawFlyoutFrame(hdcMem, &rc, &m_Pal);
+
+        SetBkMode(hdcMem, TRANSPARENT);
+        GetLocalTime(&stNow);
+
+        GetTimeFormatW(LOCALE_USER_DEFAULT, 0, &stNow, NULL, szBuf, _countof(szBuf));
+        hFontOld = SelectObject(hdcMem, m_hFontTime);
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        DrawTextW(hdcMem, szBuf, -1, &m_rcTime, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+        GetDateFormatW(LOCALE_USER_DEFAULT, DATE_LONGDATE, &stNow, NULL, szBuf, _countof(szBuf));
+        SelectObject(hdcMem, m_hFont);
+        SetTextColor(hdcMem, m_iHotNav == NAV_DATE ? m_Pal.HotBorder : m_Pal.AccentBg);
+        DrawTextW(hdcMem, szBuf, -1, &m_rcDate,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 90));
+        SetRect(&rcSep, pad, m_rcDate.bottom + Sc(6), rc.right - pad, m_rcDate.bottom + Sc(7));
+        FillRect(hdcMem, &rcSep, hbrSep);
+
+        if (m_Mode == MODE_DAY)
+            DrawDay(hdcMem);
+        else if (m_Mode == MODE_AGENDA)
+            DrawAgendaView(hdcMem);
+        else
+            DrawMonth(hdcMem, &stNow);
+
+        SetRect(&rcSep2, pad, m_rcLink.top - Sc(10), rc.right - pad, m_rcLink.top - Sc(9));
+        FillRect(hdcMem, &rcSep2, hbrSep);
+        DeleteObject(hbrSep);
+
+        SelectObject(hdcMem, m_hFont);
+        SetTextColor(hdcMem, m_iHotNav == NAV_LINK ? m_Pal.HotBorder : m_Pal.AccentBg);
+        DrawTextW(hdcMem, L"Date and time settings", -1, &m_rcLink,
+                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+
+        SelectObject(hdcMem, hFontOld);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        else if (wParam == TFY_TIMER_TICK)
+        {
+            if (LatchToday())
+            {
+                InvalidateCounts();
+                EnsureCounts();
+                InvalidateRect(NULL, FALSE);
+            }
+            else if (m_Mode == MODE_DAY && SelIsToday())
+                InvalidateRect(NULL, FALSE);
+            else
+                InvalidateRect(&m_rcTime, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnTimeChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        LatchToday();
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnSettingChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        ReadFirstDayOfWeek();
+        LatchToday();
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    int CellHitTest(POINT pt) const
+    {
+        int cw, ch, cols, rows, col, row;
+
+        if (m_Mode != MODE_MONTH || !PtInRect(&m_rcGrid, pt))
+            return -1;
+        cw = m_Level == 0 ? CellW() : BigCellW();
+        ch = m_Level == 0 ? CellH() : BigCellH();
+        cols = m_Level == 0 ? 7 : 4;
+        rows = m_Level == 0 ? 6 : 4;
+        col = (pt.x - m_rcGrid.left) / cw;
+        row = (pt.y - m_rcGrid.top) / ch;
+        if (col < 0 || col >= cols || row < 0 || row >= rows)
+            return -1;
+        return row * cols + col;
+    }
+
+    int NavHitTest(POINT pt) const
+    {
+        if (PtInRect(&m_rcPrev, pt)) return NAV_PREV;
+        if (PtInRect(&m_rcNext, pt)) return NAV_NEXT;
+        if (m_Mode != MODE_MONTH && PtInRect(&m_rcBack, pt)) return NAV_BACK;
+        if (m_Mode == MODE_MONTH && PtInRect(&m_rcList, pt)) return NAV_LIST;
+        if (m_Mode == MODE_MONTH && PtInRect(&m_rcHeader, pt) && m_Level < 2)
+            return NAV_HEADER;
+        if (PtInRect(&m_rcLink, pt)) return NAV_LINK;
+        if (PtInRect(&m_rcDate, pt)) return NAV_DATE;
+        if (m_Mode == MODE_DAY && !m_bAddMode && PtInRect(&m_rcAdd, pt)) return NAV_ADD;
+        return NAV_NONE;
+    }
+
+    int EventHitTest(POINT pt) const
+    {
+        int i;
+
+        if (m_Mode != MODE_DAY)
+            return -1;
+        if (PtInRect(&m_rcAllDay, pt))
+            return AllDayIndex((pt.y - m_rcAllDay.top) / AllDayH());
+        if (!PtInRect(&m_rcTimeline, pt))
+            return -1;
+        for (i = m_Day.count - 1; i >= 0; i--)
+        {
+            RECT rcBlock = EventBlockRect(i);
+
+            if (m_Day.ev[i].nMinutes == TFY_CAL_ALLDAY)
+                continue;
+            if (PtInRect(&rcBlock, pt))
+                return i;
+        }
+        return -1;
+    }
+
+    int AgendaHitTest(POINT pt) const
+    {
+        int i;
+
+        if (m_Mode != MODE_AGENDA || m_cRows == 0 || !PtInRect(&m_rcAgenda, pt))
+            return -1;
+        i = m_RowTop + (pt.y - m_rcAgenda.top) / RowH();
+        return (i >= 0 && i < m_cRows) ? i : -1;
+    }
+
+    BOOL AgendaDelHitTest(POINT pt) const
+    {
+        return pt.x >= m_rcAgenda.right - Sc(26);
+    }
+
+    BOOL DelHitTest(POINT pt, int index) const
+    {
+        if (index < 0)
+            return FALSE;
+        if (m_Day.ev[index].nMinutes == TFY_CAL_ALLDAY)
+            return pt.x >= m_rcAllDay.right - Sc(26);
+        return pt.x >= m_rcTimeline.right - Sc(26);
+    }
+
+    int HourHitTest(POINT pt) const
+    {
+        int hour;
+
+        if (m_Mode != MODE_DAY || !PtInRect(&m_rcTimeline, pt))
+            return -1;
+        if (pt.x < m_rcTimeline.left + TimeColW())
+            return -1;
+        hour = m_HourTop + (pt.y - m_rcTimeline.top) / HourH();
+        return (hour >= 0 && hour <= 23) ? hour : -1;
+    }
+
+    VOID ShowEdit(int hour)
+    {
+        WCHAR szSeed[32];
+
+        if (m_Mode != MODE_DAY)
+            return;
+        if (!m_hwndEdit)
+        {
+            m_hwndEdit = CreateWindowExW(0, L"EDIT", NULL,
+                                         WS_CHILD | ES_AUTOHSCROLL | ES_LEFT,
+                                         0, 0, Sc(200), Sc(22), m_hWnd,
+                                         (HMENU)(INT_PTR)TFY_CAL_EDIT_ID,
+                                         hExplorerInstance, NULL);
+            if (!m_hwndEdit)
+                return;
+            ::SendMessageW(m_hwndEdit, WM_SETFONT, (WPARAM)m_hFont, FALSE);
+            ::SendMessageW(m_hwndEdit, EM_SETLIMITTEXT, 100, 0);
+            SetWindowSubclass(m_hwndEdit, TfyFlyoutEditSubclassProc, 1, 0);
+        }
+        m_bAddMode = TRUE;
+        szSeed[0] = 0;
+        if (hour >= 0)
+            StringCchPrintfW(szSeed, _countof(szSeed), L"%02d:00 ", hour);
+        ::SetWindowTextW(m_hwndEdit, szSeed);
+        ::SendMessageW(m_hwndEdit, EM_SETSEL, (WPARAM)lstrlenW(szSeed), -1);
+        ::SetWindowPos(m_hwndEdit, NULL, m_rcAdd.left, m_rcAdd.top,
+                       m_rcAdd.right - m_rcAdd.left, m_rcAdd.bottom - m_rcAdd.top,
+                       SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ::SetFocus(m_hwndEdit);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID HideEdit()
+    {
+        m_bAddMode = FALSE;
+        if (m_hwndEdit)
+            ::ShowWindow(m_hwndEdit, SW_HIDE);
+        ::SetFocus(m_hWnd);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID CommitEdit()
+    {
+        WCHAR szText[128];
+        TFYCALEVENT ev;
+
+        if (!m_hwndEdit)
+            return;
+        ::GetWindowTextW(m_hwndEdit, szText, _countof(szText));
+        if (TfyCalParseInput(szText, &ev))
+        {
+            InsertEvent(ev);
+            StoreDay();
+        }
+        HideEdit();
+        Relayout();
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iCell = CellHitTest(pt);
+        int iNav = NavHitTest(pt);
+        int iEvent = EventHitTest(pt);
+        int iRow = AgendaHitTest(pt);
+        BOOL bDel = DelHitTest(pt, iEvent);
+
+        if (iRow >= 0 && m_Rows[iRow].bHeader)
+            iRow = -1;
+        if (iCell != m_iHotCell || iNav != m_iHotNav ||
+            iEvent != m_iHotEvent || iRow != m_iHotRow || bDel != m_bHotDel)
+        {
+            m_iHotCell = iCell;
+            m_iHotNav = iNav;
+            m_iHotEvent = iEvent;
+            m_iHotRow = iRow;
+            m_bHotDel = bDel;
+            InvalidateRect(NULL, FALSE);
+        }
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHotCell != -1 || m_iHotNav != NAV_NONE || m_iHotEvent != -1 ||
+            m_iHotRow != -1)
+        {
+            m_iHotCell = -1;
+            m_iHotNav = NAV_NONE;
+            m_iHotEvent = -1;
+            m_iHotRow = -1;
+            m_bHotDel = FALSE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    VOID Navigate(int dir)
+    {
+        if (m_Mode == MODE_AGENDA)
+        {
+            ScrollRows(dir * TFY_CAL_AGENDAVIS);
+            return;
+        }
+        if (m_Mode == MODE_DAY)
+        {
+            ShiftDay(dir);
+            ReloadDay();
+            ResetHourTop();
+            Relayout();
+            return;
+        }
+        if (m_Level == 0)
+            AddMonths(m_ViewYear, m_ViewMonth, dir);
+        else if (m_Level == 1)
+            m_ViewYear += dir;
+        else
+            m_ViewYear += dir * 10;
+        if (m_ViewYear < 1601) m_ViewYear = 1601;
+        if (m_ViewYear > 9999) m_ViewYear = 9999;
+        EnsureCounts();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID SelectCell(int cell)
+    {
+        int year, month, day;
+        BOOL bDim;
+
+        if (cell < 0 || cell >= CellCount())
+            return;
+        CellDate(cell, year, month, day, bDim);
+        if (m_Level == 0)
+        {
+            m_SelYear = year;
+            m_SelMonth = month;
+            m_SelDay = day;
+            m_ViewYear = year;
+            m_ViewMonth = month;
+            EnsureCounts();
+            OpenDay();
+            return;
+        }
+        m_ViewYear = year;
+        if (m_Level == 1)
+        {
+            m_ViewMonth = month;
+            m_Level = 0;
+            EnsureCounts();
+        }
+        else
+        {
+            m_Level = 1;
+        }
+        m_iHotCell = -1;
+        InvalidateRect(NULL, FALSE);
+    }
+
+    int FocusCellForView() const
+    {
+        if (m_Level == 1)
+            return m_ViewMonth - 1;
+        return m_ViewYear - (DecadeStart() - 1);
+    }
+
+    VOID MoveFocus(int delta)
+    {
+        int count = CellCount();
+        int cell;
+
+        if (m_iHotCell < 0)
+            cell = FocusCellForView();
+        else
+            cell = m_iHotCell + delta;
+        if (cell < 0)
+        {
+            Navigate(-1);
+            cell += count;
+        }
+        else if (cell >= count)
+        {
+            Navigate(1);
+            cell -= count;
+        }
+        if (cell < 0)
+            cell = 0;
+        else if (cell >= count)
+            cell = count - 1;
+        m_iHotCell = cell;
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID MoveSelection(int deltaDays)
+    {
+        ShiftDay(deltaDays);
+        m_Level = 0;
+        EnsureCounts();
+        if (m_Mode == MODE_DAY)
+        {
+            ReloadDay();
+            ResetHourTop();
+            Relayout();
+            return;
+        }
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID ScrollHours(int delta)
+    {
+        int top = m_HourTop + delta;
+
+        if (top > 24 - TFY_CAL_HOURSVIS)
+            top = 24 - TFY_CAL_HOURSVIS;
+        if (top < 0)
+            top = 0;
+        if (top != m_HourTop)
+        {
+            m_HourTop = top;
+            InvalidateRect(NULL, FALSE);
+        }
+    }
+
+    VOID OpenSettings()
+    {
+        ShellExecuteW(NULL, L"open", L"ms-settings:dateandtime", NULL, NULL, SW_SHOWNORMAL);
+        FadeOut();
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int nav = NavHitTest(pt);
+        int iEvent, hour;
+
+        if (nav == NAV_PREV)
+        {
+            Navigate(-1);
+            return 0;
+        }
+        if (nav == NAV_NEXT)
+        {
+            Navigate(1);
+            return 0;
+        }
+        if (nav == NAV_BACK)
+        {
+            GoMonth();
+            return 0;
+        }
+        if (nav == NAV_HEADER)
+        {
+            m_Level++;
+            m_iHotCell = -1;
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+        if (nav == NAV_LINK)
+        {
+            OpenSettings();
+            return 0;
+        }
+        if (nav == NAV_ADD)
+        {
+            ShowEdit(-1);
+            return 0;
+        }
+        if (nav == NAV_LIST)
+        {
+            OpenAgenda();
+            return 0;
+        }
+        if (m_Mode == MODE_AGENDA)
+        {
+            int iRow = AgendaHitTest(pt);
+
+            if (iRow < 0)
+                return 0;
+            if (!m_Rows[iRow].bHeader && AgendaDelHitTest(pt))
+            {
+                DeleteAgendaRow(iRow);
+                InvalidateRect(NULL, FALSE);
+                return 0;
+            }
+            OpenAgendaDay(iRow);
+            return 0;
+        }
+        if (nav == NAV_DATE)
+        {
+            GoToday();
+            if (m_Mode == MODE_DAY)
+            {
+                ReloadDay();
+                ResetHourTop();
+            }
+            EnsureCounts();
+            Relayout();
+            return 0;
+        }
+        if (m_Mode == MODE_DAY)
+        {
+            iEvent = EventHitTest(pt);
+            if (iEvent >= 0)
+            {
+                if (DelHitTest(pt, iEvent))
+                {
+                    DeleteEvent(iEvent);
+                    Relayout();
+                }
+                return 0;
+            }
+            hour = HourHitTest(pt);
+            if (hour >= 0)
+                ShowEdit(hour);
+            return 0;
+        }
+        SelectCell(CellHitTest(pt));
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int dir = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1;
+
+        ScreenToClient(&pt);
+        if (m_Mode == MODE_DAY && PtInRect(&m_rcTimeline, pt))
+        {
+            ScrollHours(dir);
+            return 0;
+        }
+        if (m_Mode == MODE_AGENDA)
+        {
+            ScrollRows(dir);
+            return 0;
+        }
+        Navigate(dir);
+        return 0;
+    }
+
+    LRESULT OnCtlColorEdit(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        HDC hdc = (HDC)wParam;
+        COLORREF crBg = TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 20);
+
+        SetBkColor(hdc, crBg);
+        SetTextColor(hdc, m_Pal.PanelText);
+        if (m_hbrEdit)
+            DeleteObject(m_hbrEdit);
+        m_hbrEdit = CreateSolidBrush(crBg);
+        return (LRESULT)m_hbrEdit;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        switch (wParam)
+        {
+            case VK_ESCAPE:
+                if (m_bAddMode)
+                    HideEdit();
+                else if (m_Mode != MODE_MONTH)
+                    GoMonth();
+                else if (m_Level > 0)
+                {
+                    m_Level--;
+                    InvalidateRect(NULL, FALSE);
+                }
+                else
+                    FadeOut();
+                break;
+            case VK_RETURN:
+                if (m_bAddMode)
+                    CommitEdit();
+                else if (m_Mode == MODE_AGENDA)
+                    OpenAgendaDay(m_iHotRow);
+                else if (m_Mode == MODE_DAY)
+                    ShowEdit(-1);
+                else if (m_Level > 0)
+                {
+                    if (m_iHotCell >= 0)
+                        SelectCell(m_iHotCell);
+                    else
+                        m_Level--;
+                    InvalidateRect(NULL, FALSE);
+                }
+                else
+                    OpenDay();
+                break;
+            case VK_BACK:
+                if (m_Mode != MODE_MONTH)
+                    GoMonth();
+                else if (m_Level < 2)
+                {
+                    m_Level++;
+                    InvalidateRect(NULL, FALSE);
+                }
+                break;
+            case VK_PRIOR:
+                if (m_Mode == MODE_DAY)
+                    ScrollHours(-TFY_CAL_HOURSVIS);
+                else
+                    Navigate(-1);
+                break;
+            case VK_NEXT:
+                if (m_Mode == MODE_DAY)
+                    ScrollHours(TFY_CAL_HOURSVIS);
+                else
+                    Navigate(1);
+                break;
+            case VK_HOME:
+                GoToday();
+                if (m_Mode == MODE_DAY)
+                {
+                    ReloadDay();
+                    ResetHourTop();
+                }
+                EnsureCounts();
+                Relayout();
+                break;
+            case VK_LEFT:
+                if (m_Mode == MODE_AGENDA) break;
+                if (m_Mode == MODE_DAY || m_Level == 0) MoveSelection(-1); else MoveFocus(-1);
+                break;
+            case VK_RIGHT:
+                if (m_Mode == MODE_AGENDA) break;
+                if (m_Mode == MODE_DAY || m_Level == 0) MoveSelection(1); else MoveFocus(1);
+                break;
+            case VK_UP:
+                if (m_Mode == MODE_AGENDA) ScrollRows(-1);
+                else if (m_Mode == MODE_DAY) ScrollHours(-1);
+                else if (m_Level == 0) MoveSelection(-7);
+                else MoveFocus(-4);
+                break;
+            case VK_DOWN:
+                if (m_Mode == MODE_AGENDA) ScrollRows(1);
+                else if (m_Mode == MODE_DAY) ScrollHours(1);
+                else if (m_Level == 0) MoveSelection(7);
+                else MoveFocus(4);
+                break;
+            case 'A':
+                if (m_bAddMode)
+                    break;
+                if (m_Mode == MODE_AGENDA)
+                    GoMonth();
+                else
+                    OpenAgenda();
+                break;
+        }
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_TICK);
+        if (m_hwndEdit) { ::DestroyWindow(m_hwndEdit); m_hwndEdit = NULL; }
+        if (m_hbrEdit) { DeleteObject(m_hbrEdit); m_hbrEdit = NULL; }
+        if (m_hFontTime) { DeleteObject(m_hFontTime); m_hFontTime = NULL; }
+        if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = NULL; }
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayCalendarWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_CTLCOLOREDIT, OnCtlColorEdit)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_TIMECHANGE, OnTimeChange)
+        MESSAGE_HANDLER(WM_SETTINGCHANGE, OnSettingChange)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayCalendarWnd *g_pTrayCalendar = NULL;
+static ULONGLONG g_CalDismissTick = 0;
+
+void CTrayCalendarWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayCalendar == this)
+        g_pTrayCalendar = NULL;
+    delete this;
+}
+
+VOID CTrayCalendarWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_CalDismissTick = m_AnimT0;
+    TrayNotifCenter_Close();
+    ::InvalidateRect(::GetWindow(m_hWnd, GW_OWNER), NULL, FALSE);
+}
+
+BOOL TrayCalendar_IsOpen(VOID)
+{
+    return g_pTrayCalendar && g_pTrayCalendar->IsWindow() &&
+           g_pTrayCalendar->IsWindowVisible() && g_pTrayCalendar->m_AnimPhase != TFY_CLOSE;
+}
+
+VOID TrayCalendar_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_CalDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pTrayCalendar && g_pTrayCalendar->IsWindow())
+    {
+        if (g_pTrayCalendar->IsWindowVisible() &&
+            g_pTrayCalendar->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayCalendar->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayCalendar->m_hWnd);
+        g_pTrayCalendar = NULL;
+    }
+
+    CTrayCalendarWnd *pCalendar = new CTrayCalendarWnd();
+    if (!pCalendar)
+        return;
+
+    if (!pCalendar->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pCalendar;
+        return;
+    }
+
+    g_pTrayCalendar = pCalendar;
+    pCalendar->Toggle(hwndOwner, prcAnchor);
+    {
+        COLORREF crMaterial;
+        if (ShellGetTaskbarMaterial(&crMaterial))
+            TrayNotifCenter_Open(pCalendar->m_hWnd);
+    }
+    ::InvalidateRect(hwndOwner, NULL, FALSE);
+}
+
+#define TFY_NOTIF_MAX 20
+
+struct TFYNOTIF
+{
+    HWND hWndOwner;
+    UINT uID;
+    HICON hIcon;
+    SYSTEMTIME stTime;
+    WCHAR szApp[128];
+    WCHAR szTitle[64];
+    WCHAR szText[256];
+};
+
+static TFYNOTIF g_TfyNotifs[TFY_NOTIF_MAX];
+static UINT g_cTfyNotifs = 0;
+static UINT g_cTfyUnread = 0;
+static HWND g_hwndTfyNotifSink = NULL;
+
+static VOID
+TfyNotifySink(VOID)
+{
+    if (g_hwndTfyNotifSink && ::IsWindow(g_hwndTfyNotifSink))
+        ::PostMessageW(g_hwndTfyNotifSink, TCWM_NOTIFICATIONSCHANGED, 0, 0);
+}
+
+VOID TrayNotifications_Add(IN HWND hWndOwner, IN UINT uID, IN LPCWSTR pszApp,
+                           IN LPCWSTR pszTitle, IN LPCWSTR pszText, IN HICON hIcon)
+{
+    TFYNOTIF *pNotif;
+
+    if (g_cTfyNotifs == TFY_NOTIF_MAX)
+    {
+        if (g_TfyNotifs[TFY_NOTIF_MAX - 1].hIcon)
+            DestroyIcon(g_TfyNotifs[TFY_NOTIF_MAX - 1].hIcon);
+        g_cTfyNotifs--;
+    }
+    MoveMemory(&g_TfyNotifs[1], &g_TfyNotifs[0], g_cTfyNotifs * sizeof(g_TfyNotifs[0]));
+
+    pNotif = &g_TfyNotifs[0];
+    ZeroMemory(pNotif, sizeof(*pNotif));
+    pNotif->hWndOwner = hWndOwner;
+    pNotif->uID = uID;
+    pNotif->hIcon = hIcon ? CopyIcon(hIcon) : NULL;
+    GetLocalTime(&pNotif->stTime);
+    StringCchCopyW(pNotif->szApp, _countof(pNotif->szApp), pszApp ? pszApp : L"");
+    StringCchCopyW(pNotif->szTitle, _countof(pNotif->szTitle), pszTitle ? pszTitle : L"");
+    StringCchCopyW(pNotif->szText, _countof(pNotif->szText), pszText ? pszText : L"");
+    g_cTfyNotifs++;
+    if (g_cTfyUnread < g_cTfyNotifs)
+        g_cTfyUnread++;
+    TfyNotifySink();
+    TrayNotifCenter_Refresh();
+}
+
+UINT TrayNotifications_GetUnread(VOID)
+{
+    return g_cTfyUnread;
+}
+
+
+VOID TrayNotifications_SetSink(IN HWND hwndSink)
+{
+    g_hwndTfyNotifSink = hwndSink;
+}
+
+static ULONGLONG g_TfyNotifHideUntil = 0;
+
+BOOL TrayNotifications_IsHidden(VOID)
+{
+    return g_TfyNotifHideUntil && GetTickCount64() < g_TfyNotifHideUntil;
+}
+
+VOID TrayFlyouts_Destroy(VOID)
+{
+    TaskPreview_Hide();
+    if (g_pTrayCalendar && g_pTrayCalendar->IsWindow())
+        ::DestroyWindow(g_pTrayCalendar->m_hWnd);
+    g_pTrayCalendar = NULL;
+    TrayFlyoutsAux_Destroy();
+}
+
+#include <mmsystem.h>
+#include <initguid.h>
+#include <bluetoothapis.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#include <endpointvolume.h>
+
+struct TFYVOLUME
+{
+    HMIXER hMixer;
+    DWORD dwVolumeId;
+    DWORD dwMuteId;
+    DWORD cChannels;
+    DWORD dwMin, dwMax;
+    BOOL bValid;
+
+    TFYVOLUME() : hMixer(NULL), dwVolumeId(0), dwMuteId(0), cChannels(1),
+                  dwMin(0), dwMax(65535), bValid(FALSE) {}
+
+    BOOL Open()
+    {
+        MIXERLINEW line;
+        MIXERLINECONTROLSW ctrls;
+        MIXERCONTROLW ctrl;
+
+        Close();
+
+        if (mixerOpen(&hMixer, 0, 0, 0, 0) != MMSYSERR_NOERROR)
+            return FALSE;
+
+        ZeroMemory(&line, sizeof(line));
+        line.cbStruct = sizeof(line);
+        line.dwComponentType = MIXERLINE_COMPONENTTYPE_DST_SPEAKERS;
+        if (mixerGetLineInfoW((HMIXEROBJ)hMixer, &line,
+                              MIXER_GETLINEINFOF_COMPONENTTYPE) != MMSYSERR_NOERROR)
+        {
+            ZeroMemory(&line, sizeof(line));
+            line.cbStruct = sizeof(line);
+            line.dwComponentType = MIXERLINE_COMPONENTTYPE_DST_HEADPHONES;
+            if (mixerGetLineInfoW((HMIXEROBJ)hMixer, &line,
+                                  MIXER_GETLINEINFOF_COMPONENTTYPE) != MMSYSERR_NOERROR)
+            {
+                Close();
+                return FALSE;
+            }
+        }
+
+        cChannels = line.cChannels;
+        if (cChannels < 1) cChannels = 1;
+        if (cChannels > 2) cChannels = 2;
+
+        ZeroMemory(&ctrls, sizeof(ctrls));
+        ZeroMemory(&ctrl, sizeof(ctrl));
+        ctrls.cbStruct = sizeof(ctrls);
+        ctrls.dwLineID = line.dwLineID;
+        ctrls.dwControlType = MIXERCONTROL_CONTROLTYPE_VOLUME;
+        ctrls.cControls = 1;
+        ctrls.cbmxctrl = sizeof(ctrl);
+        ctrls.pamxctrl = &ctrl;
+        if (mixerGetLineControlsW((HMIXEROBJ)hMixer, &ctrls,
+                                  MIXER_GETLINECONTROLSF_ONEBYTYPE) != MMSYSERR_NOERROR)
+        {
+            Close();
+            return FALSE;
+        }
+        dwVolumeId = ctrl.dwControlID;
+        dwMin = ctrl.Bounds.dwMinimum;
+        dwMax = ctrl.Bounds.dwMaximum;
+        if (dwMax <= dwMin)
+        {
+            dwMin = 0;
+            dwMax = 65535;
+        }
+
+        dwMuteId = (DWORD)-1;
+        ZeroMemory(&ctrl, sizeof(ctrl));
+        ctrls.dwControlType = MIXERCONTROL_CONTROLTYPE_MUTE;
+        ctrls.cbmxctrl = sizeof(ctrl);
+        ctrls.pamxctrl = &ctrl;
+        if (mixerGetLineControlsW((HMIXEROBJ)hMixer, &ctrls,
+                                  MIXER_GETLINECONTROLSF_ONEBYTYPE) == MMSYSERR_NOERROR)
+        {
+            dwMuteId = ctrl.dwControlID;
+        }
+
+        bValid = TRUE;
+        return TRUE;
+    }
+
+    VOID Close()
+    {
+        if (hMixer)
+            mixerClose(hMixer);
+        hMixer = NULL;
+        bValid = FALSE;
+    }
+
+    int GetVolume()
+    {
+        MIXERCONTROLDETAILS details;
+        MIXERCONTROLDETAILS_UNSIGNED values[2];
+
+        if (!bValid)
+            return 0;
+
+        ZeroMemory(&details, sizeof(details));
+        ZeroMemory(values, sizeof(values));
+        details.cbStruct = sizeof(details);
+        details.dwControlID = dwVolumeId;
+        details.cChannels = cChannels;
+        details.cbDetails = sizeof(values[0]);
+        details.paDetails = values;
+        if (mixerGetControlDetailsW((HMIXEROBJ)hMixer, &details,
+                                    MIXER_GETCONTROLDETAILSF_VALUE) != MMSYSERR_NOERROR)
+            return 0;
+
+        return MulDiv(values[0].dwValue - dwMin, 100, dwMax - dwMin);
+    }
+
+    VOID SetVolume(int nPercent)
+    {
+        MIXERCONTROLDETAILS details;
+        MIXERCONTROLDETAILS_UNSIGNED values[2];
+        DWORD i;
+
+        if (!bValid)
+            return;
+        if (nPercent < 0) nPercent = 0;
+        if (nPercent > 100) nPercent = 100;
+
+        for (i = 0; i < cChannels; i++)
+            values[i].dwValue = dwMin + MulDiv(nPercent, dwMax - dwMin, 100);
+
+        ZeroMemory(&details, sizeof(details));
+        details.cbStruct = sizeof(details);
+        details.dwControlID = dwVolumeId;
+        details.cChannels = cChannels;
+        details.cbDetails = sizeof(values[0]);
+        details.paDetails = values;
+        mixerSetControlDetails((HMIXEROBJ)hMixer, &details,
+                               MIXER_SETCONTROLDETAILSF_VALUE);
+    }
+
+    BOOL GetMute()
+    {
+        MIXERCONTROLDETAILS details;
+        MIXERCONTROLDETAILS_BOOLEAN value;
+
+        if (!bValid || dwMuteId == (DWORD)-1)
+            return FALSE;
+
+        ZeroMemory(&details, sizeof(details));
+        ZeroMemory(&value, sizeof(value));
+        details.cbStruct = sizeof(details);
+        details.dwControlID = dwMuteId;
+        details.cChannels = 1;
+        details.cbDetails = sizeof(value);
+        details.paDetails = &value;
+        if (mixerGetControlDetailsW((HMIXEROBJ)hMixer, &details,
+                                    MIXER_GETCONTROLDETAILSF_VALUE) != MMSYSERR_NOERROR)
+            return FALSE;
+
+        return value.fValue != 0;
+    }
+
+    VOID SetMute(BOOL bMute)
+    {
+        MIXERCONTROLDETAILS details;
+        MIXERCONTROLDETAILS_BOOLEAN value;
+
+        if (!bValid || dwMuteId == (DWORD)-1)
+            return;
+
+        value.fValue = bMute ? 1 : 0;
+        ZeroMemory(&details, sizeof(details));
+        details.cbStruct = sizeof(details);
+        details.dwControlID = dwMuteId;
+        details.cChannels = 1;
+        details.cbDetails = sizeof(value);
+        details.paDetails = &value;
+        mixerSetControlDetails((HMIXEROBJ)hMixer, &details,
+                               MIXER_SETCONTROLDETAILSF_VALUE);
+    }
+};
+
+struct TFYMIXROW
+{
+    ISimpleAudioVolume *pVolume;
+    IAudioSessionControl2 *pControl;
+    WCHAR szName[96];
+    DWORD dwPid;
+    int nPercent;
+    BOOL bMute;
+    RECT rcRow;
+    RECT rcSlider;
+    RECT rcMute;
+};
+
+static const PROPERTYKEY TFY_PKEY_Device_FriendlyName =
+    { { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
+
+#define TFY_TIMER_AUDIOLOAD 6
+
+static volatile LONG g_TfyAudioPercent = 50;
+static volatile LONG g_TfyAudioMute = FALSE;
+
+VOID TrayVolume_SetCachedState(int nPercent, BOOL bMute)
+{
+    if (nPercent < 0) nPercent = 0;
+    if (nPercent > 100) nPercent = 100;
+    InterlockedExchange(&g_TfyAudioPercent, nPercent);
+    InterlockedExchange(&g_TfyAudioMute, bMute);
+}
+
+#define TFY_WM_VOLUMECHANGED (WM_APP + 43)
+
+static VOID
+TfyBroadcastVolume(VOID)
+{
+    static const LPCWSTR s_Classes[] = { L"TrayVolumeFlyout", L"TrayQuickSettingsFlyout", L"ROSVolumeMixer" };
+
+    for (UINT i = 0; i < _countof(s_Classes); i++)
+    {
+        HWND hwnd = NULL;
+        while ((hwnd = FindWindowExW(NULL, hwnd, s_Classes[i], NULL)) != NULL)
+            PostMessageW(hwnd, TFY_WM_VOLUMECHANGED, 0, 0);
+    }
+}
+
+class CTfyVolumeWatch :
+    public IAudioEndpointVolumeCallback,
+    public IMMNotificationClient
+{
+public:
+    HANDLE m_hDeviceChanged;
+
+    STDMETHODIMP QueryInterface(REFIID riid, void **ppv)
+    {
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IAudioEndpointVolumeCallback))
+            *ppv = static_cast<IAudioEndpointVolumeCallback *>(this);
+        else if (IsEqualIID(riid, IID_IMMNotificationClient))
+            *ppv = static_cast<IMMNotificationClient *>(this);
+        else
+        {
+            *ppv = NULL;
+            return E_NOINTERFACE;
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() { return 2; }
+    STDMETHODIMP_(ULONG) Release() { return 1; }
+
+    STDMETHODIMP OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA pNotify)
+    {
+        if (pNotify)
+        {
+            TrayVolume_SetCachedState((int)(pNotify->fMasterVolume * 100.0f + 0.5f), pNotify->bMuted);
+            TfyBroadcastVolume();
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState)
+    {
+        SetEvent(m_hDeviceChanged);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDeviceAdded(LPCWSTR pwstrDeviceId) { return S_OK; }
+
+    STDMETHODIMP OnDeviceRemoved(LPCWSTR pwstrDeviceId)
+    {
+        SetEvent(m_hDeviceChanged);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId)
+    {
+        if (flow == eRender && role == eMultimedia)
+            SetEvent(m_hDeviceChanged);
+        return S_OK;
+    }
+
+    STDMETHODIMP OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) { return S_OK; }
+};
+
+static CTfyVolumeWatch g_TfyVolumeWatch;
+
+static DWORD WINAPI
+TfyVolumeWatchThread(LPVOID lpParameter)
+{
+    CComPtr<IMMDeviceEnumerator> pEnum;
+
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARG(IMMDeviceEnumerator, &pEnum))))
+    {
+        return 0;
+    }
+    pEnum->RegisterEndpointNotificationCallback(&g_TfyVolumeWatch);
+
+    for (;;)
+    {
+        CComPtr<IMMDevice> pDevice;
+        CComPtr<IAudioEndpointVolume> pVolume;
+        float fLevel = 0.0f;
+        BOOL bMute = FALSE;
+
+        if (SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDevice)) &&
+            SUCCEEDED(pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, NULL, (void **)&pVolume)))
+        {
+            pVolume->RegisterControlChangeNotify(&g_TfyVolumeWatch);
+            if (SUCCEEDED(pVolume->GetMasterVolumeLevelScalar(&fLevel)) && SUCCEEDED(pVolume->GetMute(&bMute)))
+            {
+                TrayVolume_SetCachedState((int)(fLevel * 100.0f + 0.5f), bMute);
+                TfyBroadcastVolume();
+            }
+        }
+
+        WaitForSingleObject(g_TfyVolumeWatch.m_hDeviceChanged, INFINITE);
+        if (pVolume)
+            pVolume->UnregisterControlChangeNotify(&g_TfyVolumeWatch);
+    }
+}
+
+VOID TrayVolume_StartWatch(VOID)
+{
+    static LONG s_bStarted = FALSE;
+    HANDLE hThread;
+
+    if (InterlockedExchange(&s_bStarted, TRUE))
+        return;
+    g_TfyVolumeWatch.m_hDeviceChanged = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_TfyVolumeWatch.m_hDeviceChanged)
+        return;
+    hThread = CreateThread(NULL, 0, TfyVolumeWatchThread, NULL, 0, NULL);
+    if (hThread)
+        CloseHandle(hThread);
+}
+
+struct TFYAUDIODEV
+{
+    WCHAR szId[256];
+    WCHAR szName[128];
+    BOOL bDefault;
+};
+
+static VOID
+TfyGetDeviceFriendlyName(IMMDevice *pDevice, LPWSTR pszName, SIZE_T cchName)
+{
+    CComPtr<IPropertyStore> pProps;
+    StringCchCopyW(pszName, cchName, L"Speakers");
+    if (!pDevice || FAILED(pDevice->OpenPropertyStore(STGM_READ, &pProps)))
+        return;
+    PROPVARIANT var;
+    PropVariantInit(&var);
+    if (SUCCEEDED(pProps->GetValue(TFY_PKEY_Device_FriendlyName, &var)) &&
+        var.vt == VT_LPWSTR && var.pwszVal && var.pwszVal[0])
+    {
+        StringCchCopyW(pszName, cchName, var.pwszVal);
+    }
+    PropVariantClear(&var);
+}
+
+static VOID
+TfyEnumRenderDevices(IMMDeviceEnumerator *pEnum, CAtlArray<TFYAUDIODEV> &Devices)
+{
+    CComPtr<IMMDeviceCollection> pCollection;
+    CComPtr<IMMDevice> pDefault;
+    LPWSTR pszDefaultId = NULL;
+    UINT nCount = 0;
+    Devices.SetCount(0);
+    if (!pEnum)
+        return;
+    if (SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDefault)))
+        pDefault->GetId(&pszDefaultId);
+    if (SUCCEEDED(pEnum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &pCollection)) &&
+        SUCCEEDED(pCollection->GetCount(&nCount)))
+    {
+        for (UINT i = 0; i < nCount && Devices.GetCount() < 16; i++)
+        {
+            CComPtr<IMMDevice> pDevice;
+            LPWSTR pszId = NULL;
+            TFYAUDIODEV dev;
+            ZeroMemory(&dev, sizeof(dev));
+            if (FAILED(pCollection->Item(i, &pDevice)) || FAILED(pDevice->GetId(&pszId)) || !pszId)
+                continue;
+            StringCchCopyW(dev.szId, _countof(dev.szId), pszId);
+            dev.bDefault = (pszDefaultId && !wcscmp(pszDefaultId, pszId));
+            CoTaskMemFree(pszId);
+            TfyGetDeviceFriendlyName(pDevice, dev.szName, _countof(dev.szName));
+            Devices.Add(dev);
+        }
+    }
+    if (pszDefaultId)
+        CoTaskMemFree(pszDefaultId);
+}
+
+static BOOL
+TfySetDefaultRenderDevice(LPCWSTR pszId)
+{
+    HKEY hKey;
+    BOOL bRet = FALSE;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Wine\\Drivers\\wdmaud.drv", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        bRet = RegSetValueExW(hKey, L"DefaultOutput", 0, REG_SZ, (const BYTE *)pszId,
+                              (DWORD)((wcslen(pszId) + 1) * sizeof(WCHAR))) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+    }
+    return bRet;
+}
+
+static INIT_ONCE g_TfyMasterInit = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_TfyMasterLock;
+static HANDLE g_hTfyMasterEvent;
+static WCHAR g_szTfyMasterDevice[256];
+static int g_nTfyMasterPercent = -1;
+static int g_nTfyMasterMute = -1;
+static volatile BOOL g_bTfyMasterBusy;
+
+static DWORD WINAPI
+TfyMasterVolumeThread(LPVOID lpParameter)
+{
+    CComPtr<IMMDeviceEnumerator> pEnum;
+    CComPtr<IAudioEndpointVolume> pVolume;
+    WCHAR szDevice[256] = L"";
+
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    for (;;)
+    {
+        WCHAR szWant[256];
+        int nPercent, nMute;
+
+        WaitForSingleObject(g_hTfyMasterEvent, INFINITE);
+        EnterCriticalSection(&g_TfyMasterLock);
+        nPercent = g_nTfyMasterPercent;
+        nMute = g_nTfyMasterMute;
+        g_nTfyMasterPercent = -1;
+        g_nTfyMasterMute = -1;
+        StringCchCopyW(szWant, _countof(szWant), g_szTfyMasterDevice);
+        LeaveCriticalSection(&g_TfyMasterLock);
+
+        if (nPercent >= 0 || nMute >= 0)
+        {
+            if (pVolume && wcscmp(szWant, szDevice))
+                pVolume.Release();
+            if (!pVolume)
+            {
+                CComPtr<IMMDevice> pDevice;
+
+                szDevice[0] = UNICODE_NULL;
+                if ((pEnum || SUCCEEDED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                                         IID_PPV_ARG(IMMDeviceEnumerator, &pEnum)))) &&
+                    SUCCEEDED(pEnum->GetDevice(szWant, &pDevice)) &&
+                    SUCCEEDED(pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, NULL,
+                                                (void **)&pVolume)))
+                {
+                    StringCchCopyW(szDevice, _countof(szDevice), szWant);
+                }
+            }
+            if (pVolume && nPercent >= 0 &&
+                FAILED(pVolume->SetMasterVolumeLevelScalar((float)nPercent / 100.0f, NULL)))
+            {
+                pVolume.Release();
+            }
+            if (pVolume && nMute >= 0)
+                pVolume->SetMute(nMute, NULL);
+        }
+
+        EnterCriticalSection(&g_TfyMasterLock);
+        if (g_nTfyMasterPercent < 0 && g_nTfyMasterMute < 0)
+            g_bTfyMasterBusy = FALSE;
+        LeaveCriticalSection(&g_TfyMasterLock);
+    }
+}
+
+static BOOL CALLBACK
+TfyMasterVolumeInit(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context)
+{
+    HANDLE hThread;
+
+    InitializeCriticalSection(&g_TfyMasterLock);
+    g_hTfyMasterEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_hTfyMasterEvent)
+        return FALSE;
+    hThread = CreateThread(NULL, 0, TfyMasterVolumeThread, NULL, 0, NULL);
+    if (!hThread)
+    {
+        CloseHandle(g_hTfyMasterEvent);
+        g_hTfyMasterEvent = NULL;
+        return FALSE;
+    }
+    CloseHandle(hThread);
+    return TRUE;
+}
+
+static BOOL
+TfyRequestMaster(IMMDevice *pDevice, int nPercent, int nMute)
+{
+    LPWSTR pszId = NULL;
+
+    if (!pDevice || !InitOnceExecuteOnce(&g_TfyMasterInit, TfyMasterVolumeInit, NULL, NULL) ||
+        FAILED(pDevice->GetId(&pszId)) || !pszId)
+    {
+        return FALSE;
+    }
+
+    EnterCriticalSection(&g_TfyMasterLock);
+    StringCchCopyW(g_szTfyMasterDevice, _countof(g_szTfyMasterDevice), pszId);
+    if (nPercent >= 0)
+        g_nTfyMasterPercent = nPercent;
+    if (nMute >= 0)
+        g_nTfyMasterMute = nMute;
+    g_bTfyMasterBusy = TRUE;
+    LeaveCriticalSection(&g_TfyMasterLock);
+    CoTaskMemFree(pszId);
+    SetEvent(g_hTfyMasterEvent);
+    return TRUE;
+}
+
+#define TFY_TIMER_OSDHIDE  0x53
+#define TFY_OSD_VISIBLE_MS 2000
+
+struct TFYMEDIA
+{
+    HWND hwndSession;
+    BOOL bPlaying;
+    WCHAR szTitle[160];
+    WCHAR szArtist[160];
+    WCHAR szApp[96];
+    HICON hIcon;
+};
+
+HWND TrayMedia_FindSession(BOOL *pbPlaying)
+{
+    HWND hwnd = NULL, hwndBest = NULL;
+    BOOL bBestPlaying = FALSE;
+    DWORD dwBestTick = 0;
+
+    while ((hwnd = FindWindowExW(HWND_MESSAGE, hwnd, L"LiberNTMediaSession", NULL)) != NULL)
+    {
+        ULONG_PTR Status = (ULONG_PTR)GetPropW(hwnd, L"LiberNTMediaStatus");
+        DWORD dwTick = (DWORD)(ULONG_PTR)GetPropW(hwnd, L"LiberNTMediaTick");
+        BOOL bPlaying = (Status == 4);
+
+        if (!Status)
+            continue;
+        if (!hwndBest || (bPlaying && !bBestPlaying) ||
+            (bPlaying == bBestPlaying && (LONG)(dwTick - dwBestTick) > 0))
+        {
+            hwndBest = hwnd;
+            bBestPlaying = bPlaying;
+            dwBestTick = dwTick;
+        }
+    }
+    if (pbPlaying)
+        *pbPlaying = bBestPlaying;
+    return hwndBest;
+}
+
+static VOID
+TfyMediaFree(TFYMEDIA *pMedia)
+{
+    if (pMedia->hIcon)
+        DestroyIcon(pMedia->hIcon);
+    ZeroMemory(pMedia, sizeof(*pMedia));
+}
+
+static BOOL
+TfyMediaQuery(TFYMEDIA *pMedia)
+{
+    WCHAR szText[340], szPath[MAX_PATH];
+    DWORD dwPid = 0, cchPath = _countof(szPath);
+    HANDLE hProcess;
+    LPWSTR pszSep;
+
+    TfyMediaFree(pMedia);
+    pMedia->hwndSession = TrayMedia_FindSession(&pMedia->bPlaying);
+    if (!pMedia->hwndSession)
+        return FALSE;
+
+    szText[0] = UNICODE_NULL;
+    InternalGetWindowText(pMedia->hwndSession, szText, _countof(szText));
+    pszSep = wcschr(szText, L'\n');
+    if (pszSep)
+    {
+        *pszSep = UNICODE_NULL;
+        StringCchCopyW(pMedia->szArtist, _countof(pMedia->szArtist), pszSep + 1);
+    }
+    StringCchCopyW(pMedia->szTitle, _countof(pMedia->szTitle), szText);
+
+    GetWindowThreadProcessId(pMedia->hwndSession, &dwPid);
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwPid);
+    if (hProcess)
+    {
+        if (QueryFullProcessImageNameW(hProcess, 0, szPath, &cchPath))
+        {
+            if (!GetVersionInfoString(szPath, L"FileDescription", pMedia->szApp, sizeof(pMedia->szApp) - sizeof(WCHAR)) ||
+                !pMedia->szApp[0])
+            {
+                StringCchCopyW(pMedia->szApp, _countof(pMedia->szApp), PathFindFileNameW(szPath));
+                PathRemoveExtensionW(pMedia->szApp);
+            }
+            ExtractIconExW(szPath, 0, NULL, &pMedia->hIcon, 1);
+        }
+        CloseHandle(hProcess);
+    }
+    if (!pMedia->szTitle[0])
+        StringCchCopyW(pMedia->szTitle, _countof(pMedia->szTitle), pMedia->szApp);
+    return TRUE;
+}
+
+typedef CWinTraits<WS_POPUP,
+                   WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE> CTrayOsdTraits;
+
+class CTrayOsdWnd :
+    public CWindowImpl<CTrayOsdWnd, CWindow, CTrayOsdTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayOsdFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HFONT m_hFont;
+    UINT m_uIcon;
+    LPCWSTR m_pszGlyph;
+    BOOL m_bFrameStarted;
+    int m_nPercent;
+    BOOL m_bHover;
+    SIZE m_size;
+    RECT m_rcIcon, m_rcBar, m_rcValue;
+
+    CTrayOsdWnd() : m_hFont(NULL), m_uIcon(0), m_pszGlyph(NULL), m_bFrameStarted(FALSE),
+                    m_nPercent(0), m_bHover(FALSE)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_size, sizeof(m_size));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID Layout()
+    {
+        m_size.cx = Sc(192);
+        m_size.cy = Sc(47);
+        SetRect(&m_rcIcon, Sc(13), (m_size.cy - Sc(16)) / 2, Sc(29), (m_size.cy - Sc(16)) / 2 + Sc(16));
+        SetRect(&m_rcBar, Sc(42), (m_size.cy - Sc(4)) / 2, Sc(152), (m_size.cy - Sc(4)) / 2 + Sc(4));
+        SetRect(&m_rcValue, Sc(152), 0, Sc(180), m_size.cy);
+    }
+
+    VOID Show(UINT uIcon, LPCWSTR pszGlyph, int nPercent)
+    {
+        HWND hwndTray = FindWindowW(L"Shell_TrayWnd", NULL);
+        MONITORINFO mi = { sizeof(mi) };
+        RECT rcBar;
+        POINT pt;
+
+        m_uIcon = uIcon;
+        m_pszGlyph = pszGlyph;
+        if (!m_bFrameStarted)
+            m_bFrameStarted = ShellFrame::Startup();
+        m_nPercent = max(0, min(nPercent, 100));
+        SetTimer(TFY_TIMER_OSDHIDE, TFY_OSD_VISIBLE_MS, NULL);
+
+        if (IsWindowVisible() && m_AnimPhase != TFY_CLOSE)
+        {
+            InvalidateRect(NULL, FALSE);
+            UpdateWindow();
+            return;
+        }
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFont)
+            m_hFont = TfyCreateFont(14, FW_NORMAL);
+        Layout();
+        if (!hwndTray || !::GetWindowRect(hwndTray, &rcBar))
+            SetRectEmpty(&rcBar);
+        GetMonitorInfoW(MonitorFromRect(&rcBar, MONITOR_DEFAULTTOPRIMARY), &mi);
+        pt.x = (mi.rcMonitor.left + mi.rcMonitor.right - m_size.cx) / 2;
+        if (hwndTray && rcBar.top > (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2)
+            pt.y = rcBar.top - Sc(15) - m_size.cy;
+        else
+            pt.y = mi.rcWork.bottom - Sc(15) - m_size.cy;
+        BeginFlyoutOpen(m_hWnd, pt.x, pt.y, m_size.cx, m_size.cy, m_Pal.PanelBg, FALSE);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        WCHAR szValue[8];
+
+        GetClientRect(&rc);
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+
+        if (m_pszGlyph)
+        {
+            int cx = m_rcIcon.right - m_rcIcon.left;
+            HICON hGlyph = m_bFrameStarted ? ShellFrame::CreateGlyphIcon(m_pszGlyph, cx, m_Pal.PanelText) : NULL;
+
+            if (hGlyph)
+            {
+                DrawIconEx(hdcMem, m_rcIcon.left, m_rcIcon.top, hGlyph, cx, cx, 0, NULL, DI_NORMAL);
+                DestroyIcon(hGlyph);
+            }
+        }
+        else
+        {
+            TfyDrawFluent(hdcMem, &m_rcIcon, m_uIcon);
+        }
+
+        RECT rcFill = m_rcBar;
+        rcFill.right = m_rcBar.left + MulDiv(m_nPercent, m_rcBar.right - m_rcBar.left, 100);
+        if (m_bFrameStarted)
+        {
+            ShellFrame::FillRoundSmooth(hdcMem, m_rcBar, (float)Sc(2), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 128));
+            if (rcFill.right > rcFill.left)
+                ShellFrame::FillRoundSmooth(hdcMem, rcFill, (float)Sc(2), m_Pal.AccentBg);
+        }
+        else
+        {
+            hbr = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 128));
+            FillRect(hdcMem, &m_rcBar, hbr);
+            DeleteObject(hbr);
+            hbr = CreateSolidBrush(m_Pal.AccentBg);
+            FillRect(hdcMem, &rcFill, hbr);
+            DeleteObject(hbr);
+        }
+
+        SetBkMode(hdcMem, TRANSPARENT);
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        HGDIOBJ hFontOld = SelectObject(hdcMem, m_hFont);
+        StringCchPrintfW(szValue, _countof(szValue), L"%d", m_nPercent);
+        DrawTextW(hdcMem, szValue, -1, &m_rcValue, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        SelectObject(hdcMem, hFontOld);
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        if (wParam == TFY_TIMER_OSDHIDE && !m_bHover)
+        {
+            KillTimer(TFY_TIMER_OSDHIDE);
+            BeginFlyoutClose(m_hWnd);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (!m_bHover)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            m_bHover = TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bHover = FALSE;
+        SetTimer(TFY_TIMER_OSDHIDE, TFY_OSD_VISIBLE_MS, NULL);
+        return 0;
+    }
+
+    LRESULT OnMouseActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return MA_NOACTIVATE;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_OSDHIDE);
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_bFrameStarted)
+        {
+            ShellFrame::Shutdown();
+            m_bFrameStarted = FALSE;
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayOsdWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayOsdWnd *g_pTrayOsd = NULL;
+
+void CTrayOsdWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayOsd == this)
+        g_pTrayOsd = NULL;
+    delete this;
+}
+
+static VOID
+TrayOsd_Show(UINT uIcon, LPCWSTR pszGlyph, int nPercent)
+{
+    if (g_pTrayOsd && g_pTrayOsd->IsWindow() && g_pTrayOsd->m_AnimPhase == TFY_CLOSE)
+    {
+        ::DestroyWindow(g_pTrayOsd->m_hWnd);
+        g_pTrayOsd = NULL;
+    }
+
+    if (!g_pTrayOsd)
+    {
+        CTrayOsdWnd *pOsd = new CTrayOsdWnd();
+        if (!pOsd)
+            return;
+        if (!pOsd->Create(NULL, CWindow::rcDefault, NULL))
+        {
+            delete pOsd;
+            return;
+        }
+        g_pTrayOsd = pOsd;
+    }
+
+    g_pTrayOsd->Show(uIcon, pszGlyph, nPercent);
+}
+
+#define TFY_WM_BRIGHTNESSCHANGED (WM_APP + 44)
+
+static volatile LONG g_TfyBrightness = -1;
+static volatile LONG g_TfyBrightnessSelfTick;
+static HWND g_hwndTfyBrightnessSink;
+
+static HANDLE
+TfyOpenLcd(VOID)
+{
+    return CreateFileW(L"\\\\.\\LCD", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+}
+
+static BOOL
+TfyBrightnessQuery(int *pnPercent)
+{
+    DISPLAY_BRIGHTNESS Display;
+    HANDLE hLcd = TfyOpenLcd();
+    DWORD cb = 0;
+    BOOL bRet;
+
+    if (hLcd == INVALID_HANDLE_VALUE)
+        return FALSE;
+    bRet = DeviceIoControl(hLcd, IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS, NULL, 0, &Display, sizeof(Display), &cb, NULL) &&
+           cb >= sizeof(Display);
+    CloseHandle(hLcd);
+    if (bRet)
+        *pnPercent = (Display.ucDisplayPolicy & DISPLAYPOLICY_DC) ? Display.ucDCBrightness : Display.ucACBrightness;
+    return bRet;
+}
+
+static BOOL
+TfyBrightnessSet(int nPercent)
+{
+    DISPLAY_BRIGHTNESS Display;
+    HANDLE hLcd = TfyOpenLcd();
+    DWORD cb = 0;
+    BOOL bRet = FALSE;
+
+    if (hLcd == INVALID_HANDLE_VALUE)
+        return FALSE;
+    if (DeviceIoControl(hLcd, IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS, NULL, 0, &Display, sizeof(Display), &cb, NULL) &&
+        cb >= sizeof(Display))
+    {
+        nPercent = max(0, min(nPercent, 100));
+        if (Display.ucDisplayPolicy & DISPLAYPOLICY_DC)
+        {
+            Display.ucDisplayPolicy = DISPLAYPOLICY_DC;
+            Display.ucDCBrightness = (UCHAR)nPercent;
+        }
+        else
+        {
+            Display.ucDisplayPolicy = DISPLAYPOLICY_AC;
+            Display.ucACBrightness = (UCHAR)nPercent;
+        }
+        InterlockedExchange(&g_TfyBrightnessSelfTick, (LONG)GetTickCount());
+        bRet = DeviceIoControl(hLcd, IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS, &Display, sizeof(Display), NULL, 0, &cb, NULL);
+    }
+    CloseHandle(hLcd);
+    return bRet;
+}
+
+static LRESULT CALLBACK
+TfyBrightnessSinkProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    if (uMsg == TFY_WM_BRIGHTNESSCHANGED)
+    {
+        HWND hwndQs = NULL;
+
+        while ((hwndQs = FindWindowExW(NULL, hwndQs, L"TrayQuickSettingsFlyout", NULL)) != NULL)
+            PostMessageW(hwndQs, TFY_WM_BRIGHTNESSCHANGED, 0, 0);
+        if (wParam)
+            TrayOsd_Show(0, L"brightness_high_20_regular", (int)lParam);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+static DWORD WINAPI
+TfyBrightnessWatchThread(LPVOID lpParameter)
+{
+    HANDLE hEvent = (HANDLE)lpParameter;
+    int nKnown = (int)InterlockedCompareExchange(&g_TfyBrightness, 0, 0);
+
+    for (;;)
+    {
+        int nPercent;
+        BOOL bShow;
+
+        WaitForSingleObject(hEvent, INFINITE);
+        if (!TfyBrightnessQuery(&nPercent))
+            continue;
+        InterlockedExchange(&g_TfyBrightness, nPercent);
+        bShow = (nPercent != nKnown) &&
+                (GetTickCount() - (DWORD)InterlockedCompareExchange(&g_TfyBrightnessSelfTick, 0, 0)) > 1000;
+        nKnown = nPercent;
+        PostMessageW(g_hwndTfyBrightnessSink, TFY_WM_BRIGHTNESSCHANGED, bShow, nPercent);
+    }
+}
+
+VOID TrayBrightness_StartWatch(VOID)
+{
+    WNDCLASSEXW wc = { sizeof(wc) };
+    HANDLE hEvent, hThread;
+    int nPercent;
+
+    if (g_hwndTfyBrightnessSink || !TfyBrightnessQuery(&nPercent))
+        return;
+    InterlockedExchange(&g_TfyBrightness, nPercent);
+
+    hEvent = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\" RXGK_MONITOR_BRIGHTNESS_EVENT);
+    if (!hEvent)
+        return;
+
+    wc.lpfnWndProc = TfyBrightnessSinkProc;
+    wc.hInstance = hExplorerInstance;
+    wc.lpszClassName = L"TrayBrightnessSink";
+    RegisterClassExW(&wc);
+    g_hwndTfyBrightnessSink = CreateWindowExW(0, wc.lpszClassName, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+                                              hExplorerInstance, NULL);
+    if (!g_hwndTfyBrightnessSink)
+    {
+        CloseHandle(hEvent);
+        return;
+    }
+
+    hThread = CreateThread(NULL, 0, TfyBrightnessWatchThread, hEvent, 0, NULL);
+    if (hThread)
+        CloseHandle(hThread);
+}
+
+static UINT
+TfyVolumeIcon(int nPercent, BOOL bMute)
+{
+    if (bMute)
+        return IDI_FLU_SPKMUTE;
+    if (nPercent == 0)
+        return IDI_FLU_SPK0;
+    if (nPercent < 34)
+        return IDI_FLU_SPK1;
+    if (nPercent < 67)
+        return IDI_FLU_SPK2;
+    return IDI_FLU_SPK3;
+}
+
+BOOL TrayVolume_HandleAppCommand(UINT uAppCmd)
+{
+    CComPtr<IMMDeviceEnumerator> pEnum;
+    CComPtr<IMMDevice> pDevice;
+    CComPtr<IAudioEndpointVolume> pVolume;
+    BOOL bMute = FALSE;
+    float fLevel = 0.0f;
+    int nPercent;
+    HRESULT hr;
+
+    if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARG(IMMDeviceEnumerator, &pEnum))) ||
+        FAILED(pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &pDevice)) ||
+        FAILED(pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, NULL, (void **)&pVolume)))
+    {
+        return FALSE;
+    }
+
+    switch (uAppCmd)
+    {
+        case APPCOMMAND_VOLUME_MUTE:
+            hr = pVolume->GetMute(&bMute);
+            if (SUCCEEDED(hr))
+                hr = pVolume->SetMute(!bMute, NULL);
+            break;
+        case APPCOMMAND_VOLUME_UP:
+        case APPCOMMAND_VOLUME_DOWN:
+            hr = pVolume->GetMasterVolumeLevelScalar(&fLevel);
+            if (FAILED(hr))
+                break;
+            nPercent = (int)(fLevel * 100.0f + 0.5f) + (uAppCmd == APPCOMMAND_VOLUME_UP ? 2 : -2);
+            nPercent = max(0, min(nPercent, 100));
+            hr = pVolume->SetMasterVolumeLevelScalar((float)nPercent / 100.0f, NULL);
+            if (SUCCEEDED(hr) && SUCCEEDED(pVolume->GetMute(&bMute)) && bMute)
+                hr = pVolume->SetMute(FALSE, NULL);
+            break;
+        default:
+            return FALSE;
+    }
+
+    if (SUCCEEDED(pVolume->GetMasterVolumeLevelScalar(&fLevel)) && SUCCEEDED(pVolume->GetMute(&bMute)))
+    {
+        nPercent = (int)(fLevel * 100.0f + 0.5f);
+        TrayVolume_SetCachedState(nPercent, bMute);
+        TrayOsd_Show(TfyVolumeIcon(nPercent, bMute), NULL, nPercent);
+    }
+    return SUCCEEDED(hr);
+}
+
+VOID TrayMixer_Open(const RECT *prcAnchor);
+
+class CTrayVolumeWnd :
+    public CWindowImpl<CTrayVolumeWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayVolumeFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    TFYVOLUME m_Fallback;
+    CComPtr<IMMDeviceEnumerator> m_pEnum;
+    CComPtr<IMMDevice> m_pDevice;
+    CComPtr<IAudioEndpointVolume> m_pEndpointVolume;
+    CComPtr<IAudioSessionManager2> m_pSessionMgr;
+    CAtlArray<TFYMIXROW> m_Rows;
+    BOOL m_bComVolume;
+    BOOL m_bAudioLoaded;
+    BOOL m_bOpenBelow;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    WCHAR m_szDevice[96];
+    int m_nMaster;
+    BOOL m_bMasterMute;
+    int m_iDragRow;
+    int m_iHotRow;
+    BOOL m_bHotMute;
+    BOOL m_bHotMixer;
+    BOOL m_bTracking;
+    SIZE m_size;
+    RECT m_rcMasterRow, m_rcMasterSlider, m_rcMasterMute, m_rcMixerLink;
+
+    CTrayVolumeWnd() : m_bComVolume(FALSE), m_bAudioLoaded(FALSE), m_bOpenBelow(FALSE),
+                       m_hFont(NULL), m_hFontSmall(NULL),
+                       m_nMaster(0), m_bMasterMute(FALSE),
+                       m_iDragRow(-2), m_iHotRow(-2), m_bHotMute(FALSE), m_bHotMixer(FALSE),
+                       m_bTracking(FALSE)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_size, sizeof(m_size));
+        m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+        m_bMasterMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+        StringCchCopyW(m_szDevice, _countof(m_szDevice), L"Speakers");
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID FreeRows()
+    {
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            if (m_Rows[i].pVolume)
+                m_Rows[i].pVolume->Release();
+            if (m_Rows[i].pControl)
+                m_Rows[i].pControl->Release();
+        }
+        m_Rows.SetCount(0);
+    }
+
+    VOID ResolveSessionName(TFYMIXROW *pRow)
+    {
+        if (pRow->szName[0])
+            return;
+
+        if (pRow->dwPid)
+        {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pRow->dwPid);
+            if (!hProcess)
+                hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pRow->dwPid);
+            if (hProcess)
+            {
+                WCHAR szPath[MAX_PATH];
+                DWORD cch = _countof(szPath);
+                if (QueryFullProcessImageNameW(hProcess, 0, szPath, &cch))
+                {
+                    LPCWSTR pszFile = PathFindFileNameW(szPath);
+                    StringCchCopyW(pRow->szName, _countof(pRow->szName), pszFile);
+                    PathRemoveExtensionW(pRow->szName);
+                }
+                CloseHandle(hProcess);
+            }
+        }
+
+        if (!pRow->szName[0])
+            StringCchCopyW(pRow->szName, _countof(pRow->szName), L"System Sounds");
+    }
+
+    VOID BuildAudio()
+    {
+        CComPtr<IAudioSessionEnumerator> pSessions;
+        int nCount = 0;
+        FreeRows();
+        m_pSessionMgr.Release();
+        m_pEndpointVolume.Release();
+        m_pDevice.Release();
+        m_pEnum.Release();
+        m_bComVolume = FALSE;
+        StringCchCopyW(m_szDevice, _countof(m_szDevice), L"Speakers");
+
+        if (SUCCEEDED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARG(IMMDeviceEnumerator, &m_pEnum))) &&
+            SUCCEEDED(m_pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &m_pDevice)))
+        {
+            TfyGetDeviceFriendlyName(m_pDevice, m_szDevice, _countof(m_szDevice));
+            if (SUCCEEDED(m_pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER,
+                                              NULL, (void **)&m_pEndpointVolume)))
+            {
+                float fLevel = 0.0f;
+                BOOL bMute = FALSE;
+                if (SUCCEEDED(m_pEndpointVolume->GetMasterVolumeLevelScalar(&fLevel)))
+                {
+                    m_nMaster = (int)(fLevel * 100.0f + 0.5f);
+                    m_pEndpointVolume->GetMute(&bMute);
+                    m_bMasterMute = bMute;
+                    m_bComVolume = TRUE;
+                }
+            }
+
+            if (SUCCEEDED(m_pDevice->Activate(IID_IAudioSessionManager2, CLSCTX_INPROC_SERVER,
+                                              NULL, (void **)&m_pSessionMgr)) &&
+                SUCCEEDED(m_pSessionMgr->GetSessionEnumerator(&pSessions)) &&
+                SUCCEEDED(pSessions->GetCount(&nCount)))
+            {
+                for (int i = 0; i < nCount && m_Rows.GetCount() < 8; i++)
+                {
+                    CComPtr<IAudioSessionControl> pControl;
+                    TFYMIXROW row;
+                    AudioSessionState state;
+                    LPWSTR pszName = NULL;
+
+                    ZeroMemory(&row, sizeof(row));
+
+                    if (FAILED(pSessions->GetSession(i, &pControl)))
+                        continue;
+                    if (FAILED(pControl->QueryInterface(IID_PPV_ARG(IAudioSessionControl2, &row.pControl))))
+                        continue;
+                    if (SUCCEEDED(row.pControl->GetState(&state)) &&
+                        state == AudioSessionStateExpired)
+                    {
+                        row.pControl->Release();
+                        continue;
+                    }
+                    if (FAILED(pControl->QueryInterface(IID_PPV_ARG(ISimpleAudioVolume, &row.pVolume))))
+                    {
+                        row.pControl->Release();
+                        continue;
+                    }
+
+                    row.pControl->GetProcessId(&row.dwPid);
+                    if (SUCCEEDED(row.pControl->GetDisplayName(&pszName)) && pszName)
+                    {
+                        StringCchCopyW(row.szName, _countof(row.szName), pszName);
+                        CoTaskMemFree(pszName);
+                    }
+                    ResolveSessionName(&row);
+
+                    float fLevel = 1.0f;
+                    BOOL bMute = FALSE;
+                    row.pVolume->GetMasterVolume(&fLevel);
+                    row.pVolume->GetMute(&bMute);
+                    row.nPercent = (int)(fLevel * 100.0f + 0.5f);
+                    row.bMute = bMute;
+
+                    m_Rows.Add(row);
+                }
+            }
+        }
+
+        if (!m_bComVolume && m_Fallback.Open())
+        {
+            m_nMaster = m_Fallback.GetVolume();
+            m_bMasterMute = m_Fallback.GetMute();
+        }
+        m_bAudioLoaded = TRUE;
+        InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InterlockedExchange(&g_TfyAudioMute, m_bMasterMute);
+    }
+
+    VOID LayoutSliderRow(const RECT *prcRow, RECT *prcMute, RECT *prcSlider)
+    {
+        SetRect(prcMute, prcRow->left + Sc(4), (prcRow->top + prcRow->bottom) / 2 - Sc(13),
+                prcRow->left + Sc(30), (prcRow->top + prcRow->bottom) / 2 + Sc(13));
+        SetRect(prcSlider, prcMute->right + Sc(8),
+                (prcRow->top + prcRow->bottom) / 2 - Sc(2),
+                prcRow->right - Sc(40), (prcRow->top + prcRow->bottom) / 2 + Sc(2));
+    }
+
+    VOID Layout()
+    {
+        m_size.cx = Sc(320);
+        int y = Sc(10);
+
+        y += Sc(20);
+        SetRect(&m_rcMasterRow, Sc(8), y, m_size.cx - Sc(8), y + Sc(40));
+        LayoutSliderRow(&m_rcMasterRow, &m_rcMasterMute, &m_rcMasterSlider);
+        y += Sc(40) + Sc(6);
+
+        if (m_Rows.GetCount() > 0)
+        {
+            y += Sc(9);
+            for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+            {
+                TFYMIXROW &row = m_Rows[i];
+                SetRect(&row.rcRow, Sc(8), y + Sc(16), m_size.cx - Sc(8), y + Sc(16) + Sc(36));
+                LayoutSliderRow(&row.rcRow, &row.rcMute, &row.rcSlider);
+                y += Sc(54);
+            }
+        }
+
+        y += Sc(6);
+        SetRect(&m_rcMixerLink, Sc(12), y, m_size.cx - Sc(12), y + Sc(22));
+        y += Sc(22) + Sc(10);
+        m_size.cy = y;
+    }
+
+    VOID Reposition()
+    {
+        RECT rcWin;
+        GetWindowRect(&rcWin);
+        m_ptFinal.x = rcWin.right - m_size.cx;
+        m_ptFinal.y = m_bOpenBelow ? rcWin.top : rcWin.bottom - m_size.cy;
+        SetWindowPos(NULL, m_ptFinal.x, m_ptFinal.y, m_size.cx, m_size.cy,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    VOID EnsureAudioLoaded()
+    {
+        if (m_bAudioLoaded)
+            return;
+        KillTimer(TFY_TIMER_AUDIOLOAD);
+        BuildAudio();
+        Layout();
+        Reposition();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        POINT ptRef;
+        int xPos, yPos;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+
+        Layout();
+
+        TfyW11Position(hwndOwner, prcAnchor, m_size, FALSE, &ptRef);
+        xPos = ptRef.x;
+        yPos = ptRef.y;
+        m_bOpenBelow = (yPos >= prcAnchor->bottom);
+
+        BeginFlyoutOpen(m_hWnd, xPos, yPos, m_size.cx, m_size.cy, m_Pal.PanelBg);
+        SetTimer(TFY_TIMER_AUDIOLOAD, TFY_ANIM_OPEN_MS + TFY_ANIM_INTERVAL, NULL);
+    }
+
+    VOID FadeOut();
+
+    int SliderPercentFromX(const RECT *prcSlider, int x)
+    {
+        int w = prcSlider->right - prcSlider->left;
+        if (w <= 0)
+            return 0;
+        int pct = MulDiv(x - prcSlider->left, 100, w);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        return pct;
+    }
+
+    VOID ApplyMaster(int nPercent)
+    {
+        EnsureAudioLoaded();
+        m_nMaster = nPercent;
+        if (m_bComVolume && m_pEndpointVolume)
+        {
+            BOOL bUnmute = (m_bMasterMute && nPercent > 0);
+
+            if (!TfyRequestMaster(m_pDevice, nPercent, bUnmute ? FALSE : -1))
+            {
+                m_pEndpointVolume->SetMasterVolumeLevelScalar((float)nPercent / 100.0f, NULL);
+                if (bUnmute)
+                    m_pEndpointVolume->SetMute(FALSE, NULL);
+            }
+            if (bUnmute)
+                m_bMasterMute = FALSE;
+        }
+        else
+        {
+            m_Fallback.SetVolume(nPercent);
+            if (m_bMasterMute && nPercent > 0)
+            {
+                m_bMasterMute = FALSE;
+                m_Fallback.SetMute(FALSE);
+            }
+        }
+        InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InterlockedExchange(&g_TfyAudioMute, m_bMasterMute);
+        InvalidateRect(NULL, FALSE);
+        UpdateWindow();
+    }
+
+    VOID ApplySession(int iRow, int nPercent)
+    {
+        if (iRow < 0 || iRow >= (int)m_Rows.GetCount())
+            return;
+        TFYMIXROW &row = m_Rows[iRow];
+        row.nPercent = nPercent;
+        if (row.pVolume)
+        {
+            row.pVolume->SetMasterVolume((float)nPercent / 100.0f, NULL);
+            if (row.bMute && nPercent > 0)
+            {
+                row.bMute = FALSE;
+                row.pVolume->SetMute(FALSE, NULL);
+            }
+        }
+        InvalidateRect(NULL, FALSE);
+        UpdateWindow();
+    }
+
+    VOID DrawSpeakerGlyph(HDC hdc, const RECT *prc, BOOL bMute, BOOL bHot)
+    {
+        if (bHot)
+        {
+            HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+            FillRect(hdc, prc, hbrHot);
+            DeleteObject(hbrHot);
+        }
+
+        int cxm = (prc->left + prc->right) / 2;
+        int cym = (prc->top + prc->bottom) / 2;
+        RECT rcIcon = { cxm - Sc(10), cym - Sc(10), cxm + Sc(10), cym + Sc(10) };
+        TfyDrawFluent(hdc, &rcIcon, bMute ? IDI_FLU_SPKMUTE : IDI_FLU_SPK2);
+    }
+
+    VOID DrawSlider(HDC hdc, const RECT *prcSlider, int nPercent, BOOL bDragging)
+    {
+        HBRUSH hbrTrack = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 110));
+        FillRect(hdc, prcSlider, hbrTrack);
+        DeleteObject(hbrTrack);
+
+        int xFill = prcSlider->left + MulDiv(nPercent, prcSlider->right - prcSlider->left, 100);
+        RECT rcFill = { prcSlider->left, prcSlider->top, xFill, prcSlider->bottom };
+        HBRUSH hbrFill = CreateSolidBrush(m_Pal.AccentBg);
+        FillRect(hdc, &rcFill, hbrFill);
+        DeleteObject(hbrFill);
+
+        RECT rcThumb = { xFill - Sc(4), (prcSlider->top + prcSlider->bottom) / 2 - Sc(9),
+                         xFill + Sc(4), (prcSlider->top + prcSlider->bottom) / 2 + Sc(9) };
+        HBRUSH hbrThumb = CreateSolidBrush(bDragging ? m_Pal.AccentBg : m_Pal.PanelText);
+        FillRect(hdc, &rcThumb, hbrThumb);
+        DeleteObject(hbrThumb);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        GetClientRect(&rc);
+
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        TfyDrawFlyoutFrame(hdcMem, &rc, &m_Pal);
+
+        SetBkMode(hdcMem, TRANSPARENT);
+        HGDIOBJ hFontOld = SelectObject(hdcMem, m_hFontSmall);
+
+        WCHAR szBuf[128];
+        RECT rcDevice = { Sc(12), Sc(8), rc.right - Sc(12), Sc(8) + Sc(18) };
+        SetTextColor(hdcMem, m_Pal.DimText);
+        StringCchPrintfW(szBuf, _countof(szBuf), L"%s \x2014 %d", m_szDevice, m_nMaster);
+        DrawTextW(hdcMem, szBuf, -1, &rcDevice,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        DrawSpeakerGlyph(hdcMem, &m_rcMasterMute, m_bMasterMute,
+                         m_iHotRow == -1 && m_bHotMute);
+        DrawSlider(hdcMem, &m_rcMasterSlider, m_nMaster, m_iDragRow == -1);
+
+        SelectObject(hdcMem, m_hFont);
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        RECT rcMasterVal = { m_rcMasterSlider.right + Sc(6), m_rcMasterRow.top,
+                             m_rcMasterRow.right, m_rcMasterRow.bottom };
+        StringCchPrintfW(szBuf, _countof(szBuf), L"%d", m_nMaster);
+        DrawTextW(hdcMem, szBuf, -1, &rcMasterVal,
+                  DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+
+        if (m_Rows.GetCount() > 0)
+        {
+            RECT rcSep = { Sc(12), m_rcMasterRow.bottom + Sc(8),
+                           rc.right - Sc(12), m_rcMasterRow.bottom + Sc(9) };
+            HBRUSH hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 90));
+            FillRect(hdcMem, &rcSep, hbrSep);
+            DeleteObject(hbrSep);
+        }
+
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYMIXROW &row = m_Rows[i];
+
+            RECT rcName = { row.rcRow.left + Sc(4), row.rcRow.top - Sc(16),
+                            row.rcRow.right - Sc(4), row.rcRow.top };
+            SelectObject(hdcMem, m_hFontSmall);
+            SetTextColor(hdcMem, m_Pal.PanelText);
+            DrawTextW(hdcMem, row.szName, -1, &rcName,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+            DrawSpeakerGlyph(hdcMem, &row.rcMute, row.bMute,
+                             m_iHotRow == (int)i && m_bHotMute);
+            DrawSlider(hdcMem, &row.rcSlider, row.nPercent, m_iDragRow == (int)i);
+
+            SelectObject(hdcMem, m_hFont);
+            SetTextColor(hdcMem, m_Pal.PanelText);
+            RECT rcVal = { row.rcSlider.right + Sc(6), row.rcRow.top,
+                           row.rcRow.right, row.rcRow.bottom };
+            StringCchPrintfW(szBuf, _countof(szBuf), L"%d", row.nPercent);
+            DrawTextW(hdcMem, szBuf, -1, &rcVal,
+                      DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+
+        SelectObject(hdcMem, m_hFontSmall);
+        SetTextColor(hdcMem, m_bHotMixer ? m_Pal.HotBorder : m_Pal.DimText);
+        DrawTextW(hdcMem, L"Open volume mixer", -1, &m_rcMixerLink,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+        SelectObject(hdcMem, hFontOld);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        if (wParam == TFY_TIMER_AUDIOLOAD)
+        {
+            if (m_AnimPhase == TFY_OPEN)
+            {
+                SetTimer(TFY_TIMER_AUDIOLOAD, TFY_ANIM_INTERVAL, NULL);
+                return 0;
+            }
+            KillTimer(TFY_TIMER_AUDIOLOAD);
+            if (m_AnimPhase != TFY_CLOSE)
+                EnsureAudioLoaded();
+        }
+        return 0;
+    }
+
+    int RowHitTest(POINT pt, BOOL *pbMute, const RECT **pprcSlider)
+    {
+        RECT rcMasterHit = m_rcMasterRow;
+        InflateRect(&rcMasterHit, 0, Sc(4));
+        *pbMute = FALSE;
+        *pprcSlider = NULL;
+
+        if (PtInRect(&m_rcMasterMute, pt))
+        {
+            *pbMute = TRUE;
+            return -1;
+        }
+        if (PtInRect(&rcMasterHit, pt))
+        {
+            *pprcSlider = &m_rcMasterSlider;
+            return -1;
+        }
+
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            RECT rcRowHit = m_Rows[i].rcRow;
+            InflateRect(&rcRowHit, 0, Sc(4));
+            if (PtInRect(&m_Rows[i].rcMute, pt))
+            {
+                *pbMute = TRUE;
+                return (int)i;
+            }
+            if (PtInRect(&rcRowHit, pt))
+            {
+                *pprcSlider = &m_Rows[i].rcSlider;
+                return (int)i;
+            }
+        }
+        return -2;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        if (m_iDragRow != -2)
+        {
+            const RECT *prcSlider = (m_iDragRow == -1) ? &m_rcMasterSlider
+                                    : &m_Rows[m_iDragRow].rcSlider;
+            int pct = SliderPercentFromX(prcSlider, pt.x);
+            if (m_iDragRow == -1)
+                ApplyMaster(pct);
+            else
+                ApplySession(m_iDragRow, pct);
+            return 0;
+        }
+
+        BOOL bMute;
+        const RECT *prcSlider;
+        int iRow = RowHitTest(pt, &bMute, &prcSlider);
+        BOOL bMixer = PtInRect(&m_rcMixerLink, pt);
+
+        if (iRow != m_iHotRow || bMute != m_bHotMute || bMixer != m_bHotMixer)
+        {
+            m_iHotRow = iRow;
+            m_bHotMute = bMute;
+            m_bHotMixer = bMixer;
+            InvalidateRect(NULL, FALSE);
+        }
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHotRow != -2 || m_bHotMixer)
+        {
+            m_iHotRow = -2;
+            m_bHotMute = FALSE;
+            m_bHotMixer = FALSE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        BOOL bMute;
+        const RECT *prcSlider;
+        int iRow = RowHitTest(pt, &bMute, &prcSlider);
+
+        if (iRow != -2 && !bMute && prcSlider)
+        {
+            m_iDragRow = iRow;
+            SetCapture();
+            int pct = SliderPercentFromX(prcSlider, pt.x);
+            if (iRow == -1)
+                ApplyMaster(pct);
+            else
+                ApplySession(iRow, pct);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        if (m_iDragRow != -2)
+        {
+            m_iDragRow = -2;
+            ReleaseCapture();
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+
+        BOOL bMute;
+        const RECT *prcSlider;
+        int iRow = RowHitTest(pt, &bMute, &prcSlider);
+
+        if (bMute)
+        {
+            if (iRow == -1)
+            {
+                EnsureAudioLoaded();
+                m_bMasterMute = !m_bMasterMute;
+                if (m_bComVolume && m_pEndpointVolume)
+                {
+                    if (!TfyRequestMaster(m_pDevice, -1, m_bMasterMute))
+                        m_pEndpointVolume->SetMute(m_bMasterMute, NULL);
+                }
+                else
+                    m_Fallback.SetMute(m_bMasterMute);
+                InterlockedExchange(&g_TfyAudioMute, m_bMasterMute);
+            }
+            else if (iRow >= 0 && iRow < (int)m_Rows.GetCount())
+            {
+                TFYMIXROW &row = m_Rows[iRow];
+                row.bMute = !row.bMute;
+                if (row.pVolume)
+                    row.pVolume->SetMute(row.bMute, NULL);
+            }
+            InvalidateRect(NULL, FALSE);
+        }
+        else if (PtInRect(&m_rcMixerLink, pt))
+        {
+            RECT rcSelf;
+            GetWindowRect(&rcSelf);
+            HandOffFlyout(m_hWnd);
+            FadeOut();
+            TrayMixer_Open(&rcSelf);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int pct = m_nMaster + (delta > 0 ? 5 : -5);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        ApplyMaster(pct);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        else if (wParam == VK_UP)
+            ApplyMaster(min(m_nMaster + 5, 100));
+        else if (wParam == VK_DOWN)
+            ApplyMaster(max(m_nMaster - 5, 0));
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_AUDIOLOAD);
+        FreeRows();
+        m_pSessionMgr.Release();
+        m_pEndpointVolume.Release();
+        m_pDevice.Release();
+        m_pEnum.Release();
+        m_Fallback.Close();
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    LRESULT OnVolumeChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (m_iDragRow != -1)
+        {
+            m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+            m_bMasterMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayVolumeWnd)
+        MESSAGE_HANDLER(TFY_WM_VOLUMECHANGED, OnVolumeChanged)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnLButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayVolumeWnd *g_pTrayVolume = NULL;
+static ULONGLONG g_VolDismissTick = 0;
+
+void CTrayVolumeWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayVolume == this)
+        g_pTrayVolume = NULL;
+    delete this;
+}
+
+VOID CTrayVolumeWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_VolDismissTick = m_AnimT0;
+}
+
+VOID TrayVolume_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_VolDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pTrayVolume && g_pTrayVolume->IsWindow())
+    {
+        if (g_pTrayVolume->IsWindowVisible() &&
+            g_pTrayVolume->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayVolume->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayVolume->m_hWnd);
+        g_pTrayVolume = NULL;
+    }
+
+    CTrayVolumeWnd *pVolume = new CTrayVolumeWnd();
+    if (!pVolume)
+        return;
+
+    if (!pVolume->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pVolume;
+        return;
+    }
+
+    g_pTrayVolume = pVolume;
+    pVolume->Toggle(hwndOwner, prcAnchor);
+}
+
+struct TFYMIXCOL
+{
+    ISimpleAudioVolume *pVolume;
+    IAudioSessionControl2 *pControl;
+    IAudioMeterInformation *pMeter;
+    WCHAR szName[96];
+    DWORD dwPid;
+    int nPercent;
+    BOOL bMute;
+    BOOL bActive;
+    BOOL bSystem;
+    HICON hIcon;
+    float fPeak;
+    RECT rcCol;
+    RECT rcSlider;
+    RECT rcMeter;
+    RECT rcMute;
+};
+
+
+
+static HICON
+TfyExtractAppIcon(LPCWSTR pszPath)
+{
+    HICON hIcon = NULL;
+
+    if (!pszPath || !pszPath[0])
+        return NULL;
+    if (ExtractIconExW(pszPath, 0, &hIcon, NULL, 1) < 1)
+        return NULL;
+    return hIcon;
+}
+
+#define TFY_TIMER_MIXSTATE 7
+#define TFY_TIMER_MIXMETER 8
+
+class CVolumeMixerWnd :
+    public CWindowImpl<CVolumeMixerWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"ROSVolumeMixer", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    CComPtr<IMMDeviceEnumerator> m_pEnum;
+    CComPtr<IMMDevice> m_pDevice;
+    CComPtr<IAudioEndpointVolume> m_pEndpointVolume;
+    CComPtr<IAudioMeterInformation> m_pMasterMeter;
+    CComPtr<IAudioSessionManager2> m_pSessionMgr;
+    CAtlArray<TFYMIXCOL> m_Cols;
+    CAtlArray<TFYAUDIODEV> m_Devices;
+    BOOL m_bAudioLoaded;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    WCHAR m_szDevice[128];
+    int m_nMaster;
+    BOOL m_bMasterMute;
+    BOOL m_bMasterActive;
+    float m_fMasterPeak;
+    BOOL m_bDevHot;
+    BOOL m_bMenu;
+    BOOL m_bTracking;
+    int m_iDragCol;
+    RECT m_rcMasterCol, m_rcMasterSlider, m_rcMasterMeter, m_rcMasterMute;
+    RECT m_rcDeviceGroup, m_rcAppsGroup, m_rcDevLabel;
+    SIZE m_size;
+    int m_nTick;
+
+    CVolumeMixerWnd() : m_bAudioLoaded(FALSE), m_hFont(NULL), m_hFontSmall(NULL),
+                        m_nMaster(0), m_bMasterMute(FALSE), m_bMasterActive(TRUE),
+                        m_fMasterPeak(0.0f), m_bDevHot(FALSE), m_bMenu(FALSE), m_bTracking(FALSE),
+                        m_iDragCol(-2), m_nTick(0)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_size, sizeof(m_size));
+        ZeroMemory(&m_rcDevLabel, sizeof(m_rcDevLabel));
+        ZeroMemory(&m_rcMasterMeter, sizeof(m_rcMasterMeter));
+        m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+        m_bMasterMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+        StringCchCopyW(m_szDevice, _countof(m_szDevice), L"Speakers");
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID FreeCols()
+    {
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            if (m_Cols[i].pVolume)
+                m_Cols[i].pVolume->Release();
+            if (m_Cols[i].pControl)
+                m_Cols[i].pControl->Release();
+            if (m_Cols[i].pMeter)
+                m_Cols[i].pMeter->Release();
+            if (m_Cols[i].hIcon)
+                DestroyIcon(m_Cols[i].hIcon);
+        }
+        m_Cols.SetCount(0);
+    }
+
+    VOID ResolveColumn(TFYMIXCOL *pCol)
+    {
+        WCHAR szPath[MAX_PATH];
+
+        szPath[0] = 0;
+        if (pCol->dwPid)
+        {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pCol->dwPid);
+            if (!hProcess)
+                hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pCol->dwPid);
+            if (hProcess)
+            {
+                DWORD cch = _countof(szPath);
+                if (!QueryFullProcessImageNameW(hProcess, 0, szPath, &cch))
+                    szPath[0] = 0;
+                CloseHandle(hProcess);
+            }
+        }
+
+        if (!pCol->szName[0] && szPath[0])
+        {
+            StringCchCopyW(pCol->szName, _countof(pCol->szName), PathFindFileNameW(szPath));
+            PathRemoveExtensionW(pCol->szName);
+        }
+        if (!pCol->szName[0])
+            StringCchCopyW(pCol->szName, _countof(pCol->szName), L"System Sounds");
+
+        pCol->hIcon = pCol->bSystem ? NULL : TfyExtractAppIcon(szPath);
+    }
+
+    VOID BuildAudio()
+    {
+        CComPtr<IAudioSessionEnumerator> pSessions;
+        int nCount = 0;
+        BOOL bHaveSystem = FALSE;
+        TFYMIXCOL sysCol;
+
+        ZeroMemory(&sysCol, sizeof(sysCol));
+        FreeCols();
+        m_pSessionMgr.Release();
+        m_pMasterMeter.Release();
+        m_pEndpointVolume.Release();
+        m_pDevice.Release();
+        m_pEnum.Release();
+        m_fMasterPeak = 0.0f;
+        StringCchCopyW(m_szDevice, _countof(m_szDevice), L"Speakers");
+        m_Devices.SetCount(0);
+        if (SUCCEEDED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARG(IMMDeviceEnumerator, &m_pEnum))))
+        {
+            TfyEnumRenderDevices(m_pEnum, m_Devices);
+            if (SUCCEEDED(m_pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &m_pDevice)))
+                TfyGetDeviceFriendlyName(m_pDevice, m_szDevice, _countof(m_szDevice));
+        }
+
+        if (m_pDevice &&
+            SUCCEEDED(m_pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER,
+                                          NULL, (void **)&m_pEndpointVolume)))
+        {
+            float fLevel = 0.0f;
+            BOOL bMute = FALSE;
+            if (SUCCEEDED(m_pEndpointVolume->GetMasterVolumeLevelScalar(&fLevel)))
+                m_nMaster = (int)(fLevel * 100.0f + 0.5f);
+            m_pEndpointVolume->GetMute(&bMute);
+            m_bMasterMute = bMute;
+        }
+        if (m_pDevice)
+            m_pDevice->Activate(IID_IAudioMeterInformation, CLSCTX_INPROC_SERVER,
+                                NULL, (void **)&m_pMasterMeter);
+
+        if (m_pDevice &&
+            SUCCEEDED(m_pDevice->Activate(IID_IAudioSessionManager2, CLSCTX_INPROC_SERVER,
+                                          NULL, (void **)&m_pSessionMgr)) &&
+            SUCCEEDED(m_pSessionMgr->GetSessionEnumerator(&pSessions)) &&
+            SUCCEEDED(pSessions->GetCount(&nCount)))
+        {
+            for (int i = 0; i < nCount && m_Cols.GetCount() < 8; i++)
+            {
+                CComPtr<IAudioSessionControl> pControl;
+                TFYMIXCOL col;
+                AudioSessionState state = AudioSessionStateInactive;
+                LPWSTR pszName = NULL;
+
+                ZeroMemory(&col, sizeof(col));
+
+                if (FAILED(pSessions->GetSession(i, &pControl)))
+                    continue;
+                if (FAILED(pControl->QueryInterface(IID_PPV_ARG(IAudioSessionControl2, &col.pControl))))
+                    continue;
+                if (SUCCEEDED(col.pControl->GetState(&state)) &&
+                    state == AudioSessionStateExpired)
+                {
+                    col.pControl->Release();
+                    continue;
+                }
+                col.bActive = (state == AudioSessionStateActive);
+                col.bSystem = (col.pControl->IsSystemSoundsSession() == S_OK);
+                if (FAILED(pControl->QueryInterface(IID_PPV_ARG(ISimpleAudioVolume, &col.pVolume))))
+                {
+                    col.pControl->Release();
+                    continue;
+                }
+                pControl->QueryInterface(IID_PPV_ARG(IAudioMeterInformation, &col.pMeter));
+
+                col.pControl->GetProcessId(&col.dwPid);
+                if (!col.bSystem &&
+                    SUCCEEDED(col.pControl->GetDisplayName(&pszName)) && pszName)
+                {
+                    StringCchCopyW(col.szName, _countof(col.szName), pszName);
+                    CoTaskMemFree(pszName);
+                }
+                if (col.bSystem)
+                    StringCchCopyW(col.szName, _countof(col.szName), L"System Sounds");
+                ResolveColumn(&col);
+
+                float fLevel = 1.0f;
+                BOOL bMute = FALSE;
+                col.pVolume->GetMasterVolume(&fLevel);
+                col.pVolume->GetMute(&bMute);
+                col.nPercent = (int)(fLevel * 100.0f + 0.5f);
+                col.bMute = bMute;
+
+                if (col.bSystem && !bHaveSystem)
+                {
+                    bHaveSystem = TRUE;
+                    sysCol = col;
+                }
+                else if (col.bSystem)
+                {
+                    col.pVolume->Release();
+                    col.pControl->Release();
+                    if (col.pMeter)
+                        col.pMeter->Release();
+                }
+                else
+                {
+                    m_Cols.Add(col);
+                }
+            }
+        }
+
+        if (!bHaveSystem)
+        {
+            sysCol.bSystem = TRUE;
+            sysCol.bActive = TRUE;
+            sysCol.nPercent = 100;
+            StringCchCopyW(sysCol.szName, _countof(sysCol.szName), L"System Sounds");
+        }
+        CAtlArray<TFYMIXCOL> apps;
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+            apps.Add(m_Cols[i]);
+        m_Cols.SetCount(0);
+        m_Cols.Add(sysCol);
+        for (SIZE_T i = 0; i < apps.GetCount(); i++)
+            m_Cols.Add(apps[i]);
+        m_bAudioLoaded = TRUE;
+        InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InterlockedExchange(&g_TfyAudioMute, m_bMasterMute);
+    }
+
+    VOID LayoutColumn(RECT *prcCol, RECT *prcSlider, RECT *prcMeter, RECT *prcMute, int x, int cx)
+    {
+        SetRect(prcCol, x, Sc(46), x + cx, m_size.cy - Sc(12));
+        int cxm = x + cx / 2;
+        SetRect(prcSlider, cxm - Sc(24), Sc(140), cxm + Sc(2), m_size.cy - Sc(66));
+        SetRect(prcMeter, cxm + Sc(6), Sc(140), cxm + Sc(15), m_size.cy - Sc(66));
+        SetRect(prcMute, cxm - Sc(14), m_size.cy - Sc(58), cxm + Sc(14), m_size.cy - Sc(30));
+    }
+
+    VOID Layout()
+    {
+        int devW = Sc(118);
+        int colW = Sc(100);
+        int nCols = (int)m_Cols.GetCount();
+        int nApps = max(nCols, 1);
+
+        m_size.cy = Sc(400);
+        m_size.cx = Sc(14) + devW + Sc(14) + nApps * colW + Sc(14);
+        int x = Sc(14);
+        SetRect(&m_rcDeviceGroup, x, Sc(44), x + devW, m_size.cy - Sc(12));
+        LayoutColumn(&m_rcMasterCol, &m_rcMasterSlider, &m_rcMasterMeter, &m_rcMasterMute, x, devW);
+        SetRect(&m_rcDevLabel, x + Sc(6), Sc(102), x + devW - Sc(6), Sc(124));
+
+        x += devW + Sc(14);
+        SetRect(&m_rcAppsGroup, x, Sc(44), x + nApps * colW, m_size.cy - Sc(12));
+        for (int i = 0; i < nCols; i++)
+        {
+            TFYMIXCOL &col = m_Cols[i];
+            LayoutColumn(&col.rcCol, &col.rcSlider, &col.rcMeter, &col.rcMute, x + i * colW, colW);
+        }
+    }
+
+    VOID DrawMuteGlyph(HDC hdc, const RECT *prc, BOOL bMute)
+    {
+        int cxm = (prc->left + prc->right) / 2;
+        int cym = (prc->top + prc->bottom) / 2;
+        RECT rcIcon = { cxm - Sc(11), cym - Sc(11), cxm + Sc(11), cym + Sc(11) };
+        HBRUSH hbrFrame = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 90));
+        FrameRect(hdc, prc, hbrFrame);
+        DeleteObject(hbrFrame);
+        TfyDrawFluent(hdc, &rcIcon, bMute ? IDI_FLU_SPKMUTE : IDI_FLU_SPK2);
+    }
+
+    VOID DrawAppTile(HDC hdc, const RECT *prc)
+    {
+        TFYAA aa;
+        HDC hdcAA = TfyAABegin(&aa, hdc, prc, 3, m_Pal.PanelBg);
+        int ss = 3;
+        int w = (prc->right - prc->left) * ss;
+        int h = (prc->bottom - prc->top) * ss;
+
+        HBRUSH hbrTile = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.AccentBg, 70));
+        HPEN hpenTile = CreatePen(PS_SOLID, ss, TfyMix(m_Pal.PanelBg, m_Pal.AccentBg, 150));
+        HGDIOBJ hbrOld = SelectObject(hdcAA, hbrTile);
+        HGDIOBJ hpenOld = SelectObject(hdcAA, hpenTile);
+        RoundRect(hdcAA, ss, ss, w - ss, h - ss, Sc(8) * ss, Sc(8) * ss);
+        SelectObject(hdcAA, hpenOld);
+        SelectObject(hdcAA, hbrOld);
+        DeleteObject(hbrTile);
+        DeleteObject(hpenTile);
+
+        int barW = Sc(3) * ss;
+        int baseY = h * 3 / 4;
+        int heights[3] = { h / 3, h / 2, h / 4 };
+        HBRUSH hbrBar = CreateSolidBrush(m_Pal.AccentBg);
+        for (int i = 0; i < 3; i++)
+        {
+            int x = w / 2 + (i - 1) * Sc(6) * ss - barW / 2;
+            RECT rcBar = { x, baseY - heights[i], x + barW, baseY };
+            FillRect(hdcAA, &rcBar, hbrBar);
+        }
+        DeleteObject(hbrBar);
+        TfyAAEnd(&aa, hdc);
+    }
+
+    VOID DrawVSlider(HDC hdc, const RECT *prc, int nPercent, BOOL bDragging)
+    {
+        TFYAA aa;
+        HDC hdcAA = TfyAABegin(&aa, hdc, prc, 4, m_Pal.PanelBg);
+        int ss = 4;
+        int w = (prc->right - prc->left) * ss;
+        int h = (prc->bottom - prc->top) * ss;
+        int cxm = w / 2;
+        int inset = Sc(6) * ss;
+        int yThumb = h - inset - MulDiv(nPercent, h - 2 * inset, 100);
+
+        RECT rcTrack = { cxm - ss, inset, cxm + ss, h - inset };
+        HBRUSH hbrTrack = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 130));
+        FillRect(hdcAA, &rcTrack, hbrTrack);
+        DeleteObject(hbrTrack);
+
+        HBRUSH hbrThumb = CreateSolidBrush(bDragging ? m_Pal.HotBorder : m_Pal.AccentBg);
+        HPEN hpenThumb = CreatePen(PS_SOLID, ss, TfyMix(m_Pal.AccentBg, m_Pal.PanelText, 60));
+        HGDIOBJ hbrOld = SelectObject(hdcAA, hbrThumb);
+        HGDIOBJ hpenOld = SelectObject(hdcAA, hpenThumb);
+        RoundRect(hdcAA, cxm - Sc(6) * ss, yThumb - Sc(11) * ss,
+                  cxm + Sc(6) * ss, yThumb + Sc(11) * ss, Sc(3) * ss, Sc(3) * ss);
+        SelectObject(hdcAA, hpenOld);
+        SelectObject(hdcAA, hbrOld);
+        DeleteObject(hbrThumb);
+        DeleteObject(hpenThumb);
+
+        TfyAAEnd(&aa, hdc);
+    }
+
+    int ThumbY(const RECT *prcSlider, int nPercent) const
+    {
+        int inset = Sc(6);
+        int h = prcSlider->bottom - prcSlider->top;
+        return prcSlider->top + h - inset - MulDiv(nPercent, h - 2 * inset, 100);
+    }
+
+    VOID DrawMeter(HDC hdc, const RECT *prc, float fPeak)
+    {
+        RECT rcInner = *prc;
+        HBRUSH hbrFrame = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 110));
+        FrameRect(hdc, prc, hbrFrame);
+        DeleteObject(hbrFrame);
+        InflateRect(&rcInner, -1, -1);
+        HBRUSH hbrBg = CreateSolidBrush(TfyMix(m_Pal.PanelBg, RGB(0, 0, 0), 60));
+        FillRect(hdc, &rcInner, hbrBg);
+        DeleteObject(hbrBg);
+        if (fPeak <= 0.0f)
+            return;
+        if (fPeak > 1.0f)
+            fPeak = 1.0f;
+        int h = rcInner.bottom - rcInner.top;
+        int hFill = (int)(h * fPeak + 0.5f);
+        if (hFill < 1)
+            hFill = 1;
+        RECT rcFill = { rcInner.left, rcInner.bottom - hFill, rcInner.right, rcInner.bottom };
+        HBRUSH hbrFill = CreateSolidBrush(RGB(64, 186, 84));
+        FillRect(hdc, &rcFill, hbrFill);
+        DeleteObject(hbrFill);
+        if (fPeak > 0.85f)
+        {
+            RECT rcHot = rcFill;
+            rcHot.bottom = rcInner.top + (int)(h * 0.15f);
+            HBRUSH hbrHot = CreateSolidBrush(RGB(232, 72, 56));
+            FillRect(hdc, &rcHot, hbrHot);
+            DeleteObject(hbrHot);
+        }
+    }
+
+    VOID DrawGroup(HDC hdc, const RECT *prc, LPCWSTR pszLabel)
+    {
+        HBRUSH hbrFrame = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 100));
+        FrameRect(hdc, prc, hbrFrame);
+        DeleteObject(hbrFrame);
+
+        SIZE sz;
+        HGDIOBJ hOldFont = SelectObject(hdc, m_hFontSmall);
+        GetTextExtentPoint32W(hdc, pszLabel, lstrlenW(pszLabel), &sz);
+        RECT rcLabel = { prc->left + Sc(10), prc->top - sz.cy / 2,
+                         prc->left + Sc(10) + sz.cx + Sc(8), prc->top + sz.cy / 2 + 1 };
+        HBRUSH hbrBg = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdc, &rcLabel, hbrBg);
+        DeleteObject(hbrBg);
+        SetTextColor(hdc, m_Pal.DimText);
+        DrawTextW(hdc, pszLabel, -1, &rcLabel,
+                  DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        SelectObject(hdc, hOldFont);
+    }
+
+    VOID DrawDeviceDropdown(HDC hdc)
+    {
+        RECT rc = m_rcDevLabel;
+        if (m_bDevHot || m_bMenu)
+        {
+            HBRUSH hbrFill = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 140));
+            FillRect(hdc, &rc, hbrFill);
+            DeleteObject(hbrFill);
+            HBRUSH hbrFrame = CreateSolidBrush(m_Pal.HotBorder);
+            FrameRect(hdc, &rc, hbrFrame);
+            DeleteObject(hbrFrame);
+        }
+        RECT rcArrow = { rc.right - Sc(16), (rc.top + rc.bottom) / 2 - Sc(6),
+                         rc.right - Sc(4), (rc.top + rc.bottom) / 2 + Sc(6) };
+        TfyDrawFluent(hdc, &rcArrow, IDI_FLU_CHEVDOWN);
+        RECT rcText = { rc.left + Sc(4), rc.top, rcArrow.left - Sc(2), rc.bottom };
+        SelectObject(hdc, m_hFontSmall);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, m_szDevice, -1, &rcText,
+                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+
+    VOID DrawColumn(HDC hdc, const RECT *prcCol, const RECT *prcSlider, const RECT *prcMeter,
+                    const RECT *prcMute, HICON hIcon, int nKind, LPCWSTR pszName,
+                    int nPercent, BOOL bMute, float fPeak, BOOL bDragging)
+    {
+        int cxm = (prcCol->left + prcCol->right) / 2;
+        RECT rcIcon = { cxm - Sc(16), Sc(62), cxm + Sc(16), Sc(62) + Sc(32) };
+
+        if (hIcon)
+            DrawIconEx(hdc, rcIcon.left, rcIcon.top, hIcon, Sc(32), Sc(32), 0, NULL, DI_NORMAL);
+        else if (nKind == 1)
+            TfyDrawFluent(hdc, &rcIcon, IDI_FLU_SPK2);
+        else if (nKind == 2)
+            TfyDrawFluent(hdc, &rcIcon, IDI_FLU_DESKTOP);
+        else
+            DrawAppTile(hdc, &rcIcon);
+
+        if (pszName)
+        {
+            RECT rcName = { prcCol->left + Sc(4), Sc(100), prcCol->right - Sc(4), Sc(134) };
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.PanelText);
+            DrawTextW(hdc, pszName, -1, &rcName,
+                      DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        DrawVSlider(hdc, prcSlider, nPercent, bDragging);
+        DrawMeter(hdc, prcMeter, bMute ? 0.0f : fPeak);
+        DrawMuteGlyph(hdc, prcMute, bMute);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        GetClientRect(&rc);
+
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        TfyDrawFlyoutFrame(hdcMem, &rc, &m_Pal);
+        SetBkMode(hdcMem, TRANSPARENT);
+
+        WCHAR szHeader[192];
+        StringCchPrintfW(szHeader, _countof(szHeader), L"Volume Mixer - %s", m_szDevice);
+        RECT rcHeader = { Sc(14), Sc(8), rc.right - Sc(14), Sc(30) };
+        SelectObject(hdcMem, m_hFont);
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        DrawTextW(hdcMem, szHeader, -1, &rcHeader,
+                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        DrawGroup(hdcMem, &m_rcDeviceGroup, L"Device");
+        DrawGroup(hdcMem, &m_rcAppsGroup, L"Applications");
+
+        if (m_Cols.GetCount())
+        {
+            int yMaster = ThumbY(&m_rcMasterSlider, m_nMaster);
+            RECT rcLine = { m_rcAppsGroup.left + Sc(6), yMaster, m_rcAppsGroup.right - Sc(6), yMaster + 1 };
+            HBRUSH hbrLine = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 120));
+            FillRect(hdcMem, &rcLine, hbrLine);
+            DeleteObject(hbrLine);
+        }
+
+        HBRUSH hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 90));
+        for (SIZE_T i = 1; i < m_Cols.GetCount(); i++)
+        {
+            RECT rcSep = { m_Cols[i].rcCol.left, Sc(66), m_Cols[i].rcCol.left + 1, m_Cols[i].rcMute.bottom - Sc(6) };
+            FillRect(hdcMem, &rcSep, hbrSep);
+        }
+        DeleteObject(hbrSep);
+
+        DrawColumn(hdcMem, &m_rcMasterCol, &m_rcMasterSlider, &m_rcMasterMeter, &m_rcMasterMute,
+                   NULL, 1, NULL, m_nMaster, m_bMasterMute, m_fMasterPeak, m_iDragCol == -1);
+        DrawDeviceDropdown(hdcMem);
+
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            TFYMIXCOL &col = m_Cols[i];
+            DrawColumn(hdcMem, &col.rcCol, &col.rcSlider, &col.rcMeter, &col.rcMute,
+                       col.hIcon, col.bSystem ? 2 : 0, col.szName, col.nPercent, col.bMute,
+                       col.fPeak, m_iDragCol == (int)i);
+        }
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    int HitTestSlider(POINT pt, const RECT *prcSlider) const
+    {
+        RECT rcHit = *prcSlider;
+        InflateRect(&rcHit, Sc(4), Sc(6));
+        return PtInRect(&rcHit, pt);
+    }
+
+    VOID ApplyColPercent(int iCol, int nPercent)
+    {
+        EnsureAudioLoaded();
+        if (nPercent < 0) nPercent = 0;
+        if (nPercent > 100) nPercent = 100;
+
+        if (iCol == -1)
+        {
+            m_nMaster = nPercent;
+            if (m_pEndpointVolume && !TfyRequestMaster(m_pDevice, nPercent, -1))
+                m_pEndpointVolume->SetMasterVolumeLevelScalar(nPercent / 100.0f, NULL);
+        }
+        else if (iCol >= 0 && iCol < (int)m_Cols.GetCount())
+        {
+            TFYMIXCOL &col = m_Cols[iCol];
+            col.nPercent = nPercent;
+            if (col.pVolume)
+                col.pVolume->SetMasterVolume(nPercent / 100.0f, NULL);
+        }
+        if (iCol == -1)
+            InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InvalidateRect(NULL, FALSE);
+        UpdateWindow();
+    }
+
+    int PercentFromY(const RECT *prcSlider, int y) const
+    {
+        int inset = Sc(6);
+        int h = prcSlider->bottom - prcSlider->top - 2 * inset;
+        if (h <= 0)
+            return 0;
+        return MulDiv(prcSlider->bottom - inset - y, 100, h);
+    }
+
+    VOID ShowDeviceMenu()
+    {
+        EnsureAudioLoaded();
+        if (m_Devices.GetCount() == 0 || m_bMenu)
+            return;
+        HMENU hMenu = CreatePopupMenu();
+        if (!hMenu)
+            return;
+        for (SIZE_T i = 0; i < m_Devices.GetCount(); i++)
+            AppendMenuW(hMenu, MF_STRING | (m_Devices[i].bDefault ? MF_CHECKED : 0),
+                        (UINT_PTR)(i + 1), m_Devices[i].szName);
+        POINT pt = { m_rcDevLabel.left, m_rcDevLabel.bottom + Sc(2) };
+        ClientToScreen(&pt);
+        m_bMenu = TRUE;
+        InvalidateRect(NULL, FALSE);
+        int cmd = TrackPopupMenuEx(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                                   pt.x, pt.y, m_hWnd, NULL);
+        m_bMenu = FALSE;
+        DestroyMenu(hMenu);
+        if (cmd > 0 && (SIZE_T)cmd <= m_Devices.GetCount() && !m_Devices[cmd - 1].bDefault)
+        {
+            TfySetDefaultRenderDevice(m_Devices[cmd - 1].szId);
+            BuildAudio();
+            Layout();
+            Reposition();
+        }
+        InvalidateRect(NULL, FALSE);
+    }
+
+    LRESULT OnLButtonDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        if (PtInRect(&m_rcDevLabel, pt))
+        {
+            ShowDeviceMenu();
+            return 0;
+        }
+        if (HitTestSlider(pt, &m_rcMasterSlider))
+        {
+            m_iDragCol = -1;
+            SetCapture();
+            ApplyColPercent(-1, PercentFromY(&m_rcMasterSlider, pt.y));
+            return 0;
+        }
+        if (PtInRect(&m_rcMasterMute, pt))
+        {
+            EnsureAudioLoaded();
+            m_bMasterMute = !m_bMasterMute;
+            if (m_pEndpointVolume && !TfyRequestMaster(m_pDevice, -1, m_bMasterMute))
+                m_pEndpointVolume->SetMute(m_bMasterMute, NULL);
+            InterlockedExchange(&g_TfyAudioMute, m_bMasterMute);
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            TFYMIXCOL &col = m_Cols[i];
+            if (HitTestSlider(pt, &col.rcSlider))
+            {
+                m_iDragCol = (int)i;
+                SetCapture();
+                ApplyColPercent((int)i, PercentFromY(&col.rcSlider, pt.y));
+                return 0;
+            }
+            if (PtInRect(&col.rcMute, pt))
+            {
+                col.bMute = !col.bMute;
+                if (col.pVolume)
+                    col.pVolume->SetMute(col.bMute, NULL);
+                InvalidateRect(NULL, FALSE);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (m_iDragCol < -1)
+        {
+            BOOL bHot = PtInRect(&m_rcDevLabel, pt);
+            if (bHot != m_bDevHot)
+            {
+                m_bDevHot = bHot;
+                InvalidateRect(&m_rcDevLabel, FALSE);
+            }
+            if (!m_bTracking)
+            {
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+                m_bTracking = TrackMouseEvent(&tme);
+            }
+            return 0;
+        }
+        const RECT *prc = (m_iDragCol == -1) ? &m_rcMasterSlider
+                                             : &m_Cols[m_iDragCol].rcSlider;
+        ApplyColPercent(m_iDragCol, PercentFromY(prc, pt.y));
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_bDevHot)
+        {
+            m_bDevHot = FALSE;
+            InvalidateRect(&m_rcDevLabel, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (m_iDragCol >= -1)
+        {
+            m_iDragCol = -2;
+            ReleaseCapture();
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(&pt);
+        int delta = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? 4 : -4;
+
+        if (PtInRect(&m_rcMasterCol, pt))
+        {
+            ApplyColPercent(-1, m_nMaster + delta);
+            return 0;
+        }
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            if (PtInRect(&m_Cols[i].rcCol, pt))
+            {
+                ApplyColPercent((int)i, m_Cols[i].nPercent + delta);
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    static float SmoothPeak(float fOld, float fNew)
+    {
+        if (fNew >= fOld)
+            return fNew;
+        float f = fOld - 0.08f;
+        return f > fNew ? f : fNew;
+    }
+
+    BOOL UpdateMeters()
+    {
+        BOOL bChanged = FALSE;
+        float fMaster = m_nMaster / 100.0f;
+        float fPeak = 0.0f;
+
+        if (m_pMasterMeter && SUCCEEDED(m_pMasterMeter->GetPeakValue(&fPeak)))
+        {
+            float f = SmoothPeak(m_fMasterPeak, m_bMasterMute ? 0.0f : fPeak * fMaster);
+            if (f != m_fMasterPeak)
+            {
+                m_fMasterPeak = f;
+                bChanged = TRUE;
+            }
+        }
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            TFYMIXCOL &col = m_Cols[i];
+            fPeak = 0.0f;
+            if (col.pMeter)
+                col.pMeter->GetPeakValue(&fPeak);
+            float f = SmoothPeak(col.fPeak, col.bMute ? 0.0f : fPeak * (col.nPercent / 100.0f) * fMaster);
+            if (f != col.fPeak)
+            {
+                col.fPeak = f;
+                bChanged = TRUE;
+            }
+        }
+        return bChanged;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+
+        if (wParam == TFY_TIMER_AUDIOLOAD)
+        {
+            if (m_AnimPhase == TFY_OPEN)
+            {
+                SetTimer(TFY_TIMER_AUDIOLOAD, TFY_ANIM_INTERVAL, NULL);
+                return 0;
+            }
+            KillTimer(TFY_TIMER_AUDIOLOAD);
+            if (m_AnimPhase != TFY_CLOSE)
+                EnsureAudioLoaded();
+            return 0;
+        }
+
+        if (wParam == TFY_TIMER_MIXMETER)
+        {
+            if (UpdateMeters() && m_AnimPhase != TFY_CLOSE)
+                InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+
+        if (wParam != TFY_TIMER_MIXSTATE)
+            return 0;
+
+        BOOL bRebuild = FALSE;
+        m_nTick++;
+
+        if (m_pEndpointVolume && m_iDragCol != -1 && !g_bTfyMasterBusy)
+        {
+            float fLevel = 0.0f;
+            BOOL bMute = FALSE;
+            if (SUCCEEDED(m_pEndpointVolume->GetMasterVolumeLevelScalar(&fLevel)))
+                m_nMaster = (int)(fLevel * 100.0f + 0.5f);
+            if (SUCCEEDED(m_pEndpointVolume->GetMute(&bMute)))
+                m_bMasterMute = bMute;
+        }
+
+        for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+        {
+            TFYMIXCOL &col = m_Cols[i];
+            AudioSessionState state;
+            if (col.pControl && SUCCEEDED(col.pControl->GetState(&state)))
+            {
+                if (state == AudioSessionStateExpired)
+                    bRebuild = TRUE;
+                col.bActive = (state == AudioSessionStateActive);
+            }
+            if (m_iDragCol != (int)i && col.pVolume)
+            {
+                float fLevel = 1.0f;
+                BOOL bMute = FALSE;
+                if (SUCCEEDED(col.pVolume->GetMasterVolume(&fLevel)))
+                    col.nPercent = (int)(fLevel * 100.0f + 0.5f);
+                if (SUCCEEDED(col.pVolume->GetMute(&bMute)))
+                    col.bMute = bMute;
+            }
+        }
+
+        if (!bRebuild && (m_nTick % 4) == 0 && m_pSessionMgr)
+        {
+            CComPtr<IAudioSessionEnumerator> pSessions;
+            int nCount = 0;
+            int nLive = 0;
+            if (SUCCEEDED(m_pSessionMgr->GetSessionEnumerator(&pSessions)) &&
+                SUCCEEDED(pSessions->GetCount(&nCount)))
+            {
+                for (int i = 0; i < nCount; i++)
+                {
+                    CComPtr<IAudioSessionControl> pControl;
+                    AudioSessionState state = AudioSessionStateInactive;
+                    if (FAILED(pSessions->GetSession(i, &pControl)))
+                        continue;
+                    if (SUCCEEDED(pControl->GetState(&state)) && state == AudioSessionStateExpired)
+                        continue;
+                    nLive++;
+                }
+                int nHave = 0;
+                for (SIZE_T i = 0; i < m_Cols.GetCount(); i++)
+                    if (m_Cols[i].pControl)
+                        nHave++;
+                if (nLive != nHave)
+                    bRebuild = TRUE;
+            }
+        }
+
+        if (bRebuild && m_iDragCol < -1 && !m_bMenu && m_AnimPhase != TFY_CLOSE)
+        {
+            BuildAudio();
+            Layout();
+            Reposition();
+        }
+
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    VOID Reposition()
+    {
+        RECT rcWin;
+        GetWindowRect(&rcWin);
+        m_ptFinal.x = rcWin.right - m_size.cx;
+        m_ptFinal.y = rcWin.bottom - m_size.cy;
+        SetWindowPos(NULL, m_ptFinal.x, m_ptFinal.y, m_size.cx, m_size.cy,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    VOID EnsureAudioLoaded()
+    {
+        if (m_bAudioLoaded)
+            return;
+        KillTimer(TFY_TIMER_AUDIOLOAD);
+        BuildAudio();
+        Layout();
+        Reposition();
+        InvalidateRect(NULL, FALSE);
+        SetTimer(TFY_TIMER_MIXSTATE, 500, NULL);
+        SetTimer(TFY_TIMER_MIXMETER, 50, NULL);
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE && !m_bMenu)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_AUDIOLOAD);
+        KillTimer(TFY_TIMER_MIXSTATE);
+        KillTimer(TFY_TIMER_MIXMETER);
+        FreeCols();
+        m_pSessionMgr.Release();
+        m_pMasterMeter.Release();
+        m_pEndpointVolume.Release();
+        m_pDevice.Release();
+        m_pEnum.Release();
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    VOID FadeOut();
+
+    VOID Open(const RECT *prcAnchor)
+    {
+        POINT ptRef;
+        int xPos, yPos;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_SEMIBOLD);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+
+        Layout();
+        TfyW11Position(FindWindowW(L"Shell_TrayWnd", NULL), prcAnchor, m_size, FALSE, &ptRef);
+        xPos = ptRef.x;
+        yPos = ptRef.y;
+
+        BeginFlyoutOpen(m_hWnd, xPos, yPos, m_size.cx, m_size.cy, m_Pal.PanelBg);
+        SetTimer(TFY_TIMER_AUDIOLOAD, TFY_ANIM_OPEN_MS + TFY_ANIM_INTERVAL, NULL);
+    }
+
+    LRESULT OnVolumeChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (m_iDragCol != -1)
+        {
+            m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+            m_bMasterMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CVolumeMixerWnd)
+        MESSAGE_HANDLER(TFY_WM_VOLUMECHANGED, OnVolumeChanged)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnLButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CVolumeMixerWnd *g_pVolumeMixer = NULL;
+static ULONGLONG g_MixerDismissTick = 0;
+
+void CVolumeMixerWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pVolumeMixer == this)
+        g_pVolumeMixer = NULL;
+    delete this;
+}
+
+VOID CVolumeMixerWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_MixerDismissTick = m_AnimT0;
+}
+
+VOID TrayMixer_Open(const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_MixerDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pVolumeMixer && g_pVolumeMixer->IsWindow())
+    {
+        ::DestroyWindow(g_pVolumeMixer->m_hWnd);
+        g_pVolumeMixer = NULL;
+    }
+
+    CVolumeMixerWnd *pMixer = new CVolumeMixerWnd();
+    if (!pMixer)
+        return;
+
+    if (!pMixer->Create(NULL, CWindow::rcDefault, NULL))
+    {
+        delete pMixer;
+        return;
+    }
+
+    g_pVolumeMixer = pMixer;
+    pMixer->Open(prcAnchor);
+}
+
+#include <winsock2.h>
+#include <ws2ipdef.h>
+#include <iphlpapi.h>
+#include <wlanapi.h>
+#include <commctrl.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
+
+typedef DWORD (WINAPI *PFN_WLANOPENHANDLE)(DWORD, PVOID, PDWORD, PHANDLE);
+typedef DWORD (WINAPI *PFN_WLANCLOSEHANDLE)(HANDLE, PVOID);
+typedef DWORD (WINAPI *PFN_WLANENUMINTERFACES)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST *);
+typedef DWORD (WINAPI *PFN_WLANGETNETWORKLIST)(HANDLE, const GUID *, DWORD, PVOID, PWLAN_AVAILABLE_NETWORK_LIST *);
+typedef DWORD (WINAPI *PFN_WLANCONNECT)(HANDLE, const GUID *, const PWLAN_CONNECTION_PARAMETERS, PVOID);
+typedef DWORD (WINAPI *PFN_WLANDISCONNECT)(HANDLE, const GUID *, PVOID);
+typedef DWORD (WINAPI *PFN_WLANSCAN)(HANDLE, const GUID *, const PDOT11_SSID, const PWLAN_RAW_DATA, PVOID);
+typedef DWORD (WINAPI *PFN_WLANSETPROFILE)(HANDLE, const GUID *, DWORD, LPCWSTR, LPCWSTR, BOOL, PVOID, DWORD *);
+typedef DWORD (WINAPI *PFN_WLANREGISTERNOTIFICATION)(HANDLE, DWORD, BOOL, WLAN_NOTIFICATION_CALLBACK, PVOID, PVOID, PDWORD);
+typedef DWORD (WINAPI *PFN_WLANQUERYINTERFACE)(HANDLE, const GUID *, WLAN_INTF_OPCODE, PVOID, PDWORD, PVOID *, WLAN_OPCODE_VALUE_TYPE *);
+typedef DWORD (WINAPI *PFN_WLANSETINTERFACE)(HANDLE, const GUID *, WLAN_INTF_OPCODE, DWORD, const VOID *, PVOID);
+typedef VOID (WINAPI *PFN_WLANFREEMEMORY)(PVOID);
+
+#define TFY_WM_WLANNOTIFY (WM_APP + 41)
+#define TFY_WM_NETREFRESH (WM_APP + 42)
+#define TFY_TIMER_SCAN 9
+#define TFY_TIMER_POLL 10
+#define TFY_TIMER_RESCAN 12
+#define TFY_NET_VISROWS 3
+#define TFY_NET_WIFIROWS 6
+#define TFY_TIMER_SPIN 13
+#define TFY_NET_EDIT_ID 101
+
+#define TFY_NETHIT_NONE     -1
+#define TFY_NETHIT_LINK     -2
+#define TFY_NETHIT_REFRESH  -3
+#define TFY_NETHIT_AIRPLANE -4
+#define TFY_NETHIT_WIFI     -5
+#define TFY_NETHIT_BACK     -6
+#define TFY_NETHIT_BUTTON   0x100
+#define TFY_NETHIT_BUTTON2  0x200
+#define TFY_NETHIT_CHECK    0x300
+
+struct TFYNETROW
+{
+    WCHAR szName[128];
+    WCHAR szStatus[96];
+    WCHAR szProfile[128];
+    GUID ifGuid;
+    int nType;
+    int nSignal;
+    BOOL bConnected;
+    BOOL bHasProfile;
+    BOOL bSecure;
+    BOOL bConnectable;
+    DOT11_AUTH_ALGORITHM auth;
+    DOT11_CIPHER_ALGORITHM cipher;
+    RECT rc;
+    RECT rcButton;
+    RECT rcButton2;
+    RECT rcCheck;
+    RECT rcEdit;
+    RECT rcInfo;
+};
+
+struct TFYNETCACHE
+{
+    TFYNETROW Adapters[20];
+    TFYNETROW Wlan[24];
+    DWORD nAdapters;
+    DWORD nWlan;
+    int nWlanIfaces;
+    BOOL bWifiOn;
+    BOOL bValid;
+};
+
+struct TFYNETREFRESH
+{
+    BOOL bScan;
+};
+
+static TFYNETCACHE g_NetCache;
+static SRWLOCK g_NetCacheLock = SRWLOCK_INIT;
+static volatile LONG g_NetRefreshActive = 0;
+static volatile LONG g_NetRadioState = TRUE;
+static PVOID volatile g_NetRefreshWindow = NULL;
+
+static VOID
+TfyCollectAdapterRows(TFYNETCACHE *pCache)
+{
+    ULONG cbBuffer = 16 * 1024;
+    PIP_ADAPTER_ADDRESSES pAddresses = NULL;
+    ULONG ret;
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        pAddresses = (PIP_ADAPTER_ADDRESSES)HeapAlloc(hProcessHeap, 0, cbBuffer);
+        if (!pAddresses)
+            return;
+        ret = GetAdaptersAddresses(AF_INET,
+                                   GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                   GAA_FLAG_SKIP_DNS_SERVER,
+                                   NULL, pAddresses, &cbBuffer);
+        if (ret == ERROR_BUFFER_OVERFLOW)
+        {
+            HeapFree(hProcessHeap, 0, pAddresses);
+            pAddresses = NULL;
+            continue;
+        }
+        if (ret != NO_ERROR)
+        {
+            HeapFree(hProcessHeap, 0, pAddresses);
+            return;
+        }
+        break;
+    }
+    if (!pAddresses)
+        return;
+
+    for (PIP_ADAPTER_ADDRESSES pCurrent = pAddresses;
+         pCurrent != NULL && pCache->nAdapters < _countof(pCache->Adapters);
+         pCurrent = pCurrent->Next)
+    {
+        if (pCurrent->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+            pCurrent->IfType == IF_TYPE_TUNNEL ||
+            pCurrent->IfType == IF_TYPE_IEEE80211)
+        {
+            continue;
+        }
+
+        TFYNETROW *pRow = &pCache->Adapters[pCache->nAdapters++];
+        ZeroMemory(pRow, sizeof(*pRow));
+        pRow->nType = 0;
+        if (pCurrent->AdapterName)
+        {
+            WCHAR szGuid[64];
+            if (MultiByteToWideChar(CP_ACP, 0, pCurrent->AdapterName, -1,
+                                    szGuid, _countof(szGuid)) > 0)
+            {
+                CLSIDFromString(szGuid, &pRow->ifGuid);
+            }
+        }
+        StringCchCopyW(pRow->szName, _countof(pRow->szName),
+                       pCurrent->FriendlyName ? pCurrent->FriendlyName : L"Network adapter");
+        if (pCurrent->OperStatus == IfOperStatusUp)
+        {
+            pRow->bConnected = TRUE;
+            StringCchCopyW(pRow->szStatus, _countof(pRow->szStatus), L"Connected");
+            for (PIP_ADAPTER_UNICAST_ADDRESS pAddr = pCurrent->FirstUnicastAddress;
+                 pAddr != NULL; pAddr = pAddr->Next)
+            {
+                if (pAddr->Address.lpSockaddr &&
+                    pAddr->Address.lpSockaddr->sa_family == AF_INET)
+                {
+                    BYTE *ip = (BYTE *)&((struct sockaddr_in *)pAddr->Address.lpSockaddr)->sin_addr;
+                    StringCchPrintfW(pRow->szStatus, _countof(pRow->szStatus),
+                                     L"Connected \x2014 %u.%u.%u.%u",
+                                     ip[0], ip[1], ip[2], ip[3]);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            StringCchCopyW(pRow->szStatus, _countof(pRow->szStatus), L"Not connected");
+        }
+    }
+    HeapFree(hProcessHeap, 0, pAddresses);
+}
+
+static VOID
+TfyCollectWlanRows(TFYNETCACHE *pCache, BOOL bScan)
+{
+    HMODULE hWlanApi = LoadLibraryW(L"wlanapi.dll");
+    HANDLE hWlan = NULL;
+    PWLAN_INTERFACE_INFO_LIST pInterfaces = NULL;
+    PFN_WLANOPENHANDLE pfnOpen;
+    PFN_WLANCLOSEHANDLE pfnClose;
+    PFN_WLANENUMINTERFACES pfnEnum;
+    PFN_WLANGETNETWORKLIST pfnList;
+    PFN_WLANSCAN pfnScan;
+    PFN_WLANQUERYINTERFACE pfnQuery;
+    PFN_WLANFREEMEMORY pfnFree;
+    DWORD dwVersion = 0;
+    BOOL bAnyRadio = FALSE, bRadioOn = FALSE;
+
+    pCache->bWifiOn = TRUE;
+    if (!hWlanApi)
+        return;
+
+    pfnOpen = (PFN_WLANOPENHANDLE)GetProcAddress(hWlanApi, "WlanOpenHandle");
+    pfnClose = (PFN_WLANCLOSEHANDLE)GetProcAddress(hWlanApi, "WlanCloseHandle");
+    pfnEnum = (PFN_WLANENUMINTERFACES)GetProcAddress(hWlanApi, "WlanEnumInterfaces");
+    pfnList = (PFN_WLANGETNETWORKLIST)GetProcAddress(hWlanApi, "WlanGetAvailableNetworkList");
+    pfnScan = (PFN_WLANSCAN)GetProcAddress(hWlanApi, "WlanScan");
+    pfnQuery = (PFN_WLANQUERYINTERFACE)GetProcAddress(hWlanApi, "WlanQueryInterface");
+    pfnFree = (PFN_WLANFREEMEMORY)GetProcAddress(hWlanApi, "WlanFreeMemory");
+    if (!pfnOpen || !pfnClose || !pfnEnum || !pfnList || !pfnFree ||
+        pfnOpen(2, NULL, &dwVersion, &hWlan) != ERROR_SUCCESS)
+    {
+        FreeLibrary(hWlanApi);
+        return;
+    }
+    if (pfnEnum(hWlan, NULL, &pInterfaces) != ERROR_SUCCESS || !pInterfaces)
+        goto cleanup;
+
+    pCache->nWlanIfaces = (int)pInterfaces->dwNumberOfItems;
+    for (DWORD i = 0; i < pInterfaces->dwNumberOfItems; i++)
+    {
+        const GUID *pGuid = &pInterfaces->InterfaceInfo[i].InterfaceGuid;
+        PWLAN_AVAILABLE_NETWORK_LIST pNetworks = NULL;
+
+        if (pfnQuery)
+        {
+            DWORD cb = 0;
+            PVOID pData = NULL;
+            WLAN_OPCODE_VALUE_TYPE vt;
+            if (pfnQuery(hWlan, pGuid, wlan_intf_opcode_radio_state, NULL,
+                         &cb, &pData, &vt) == ERROR_SUCCESS && pData)
+            {
+                WLAN_RADIO_STATE *pState = (WLAN_RADIO_STATE *)pData;
+                bAnyRadio = TRUE;
+                for (DWORD k = 0; k < pState->dwNumberOfPhys && k < 64; k++)
+                {
+                    if (pState->PhyRadioState[k].dot11SoftwareRadioState == dot11_radio_state_on)
+                        bRadioOn = TRUE;
+                }
+                pfnFree(pData);
+            }
+        }
+        if (bScan && pfnScan)
+            pfnScan(hWlan, pGuid, NULL, NULL, NULL);
+        if (pfnList(hWlan, pGuid, 0, NULL, &pNetworks) != ERROR_SUCCESS || !pNetworks)
+            continue;
+
+        for (DWORD n = 0;
+             n < pNetworks->dwNumberOfItems && pCache->nWlan < _countof(pCache->Wlan);
+             n++)
+        {
+            WLAN_AVAILABLE_NETWORK *pNet = &pNetworks->Network[n];
+            WCHAR szSsid[DOT11_SSID_MAX_LENGTH + 1];
+            UINT cch;
+            BOOL bDuplicate = FALSE;
+
+            if (pNet->dot11Ssid.uSSIDLength == 0)
+                continue;
+            cch = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)pNet->dot11Ssid.ucSSID,
+                                      pNet->dot11Ssid.uSSIDLength,
+                                      szSsid, _countof(szSsid) - 1);
+            if (!cch)
+                continue;
+            szSsid[cch] = 0;
+            for (DWORD r = 0; r < pCache->nWlan; r++)
+            {
+                TFYNETROW *pExisting = &pCache->Wlan[r];
+                if (!IsEqualGUID(pExisting->ifGuid, *pGuid) ||
+                    wcscmp(pExisting->szName, szSsid))
+                    continue;
+                bDuplicate = TRUE;
+                if ((int)pNet->wlanSignalQuality > pExisting->nSignal)
+                    pExisting->nSignal = pNet->wlanSignalQuality;
+                if (pNet->dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED)
+                    pExisting->bConnected = TRUE;
+                if ((pNet->dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) &&
+                    !pExisting->bHasProfile)
+                {
+                    pExisting->bHasProfile = TRUE;
+                    StringCchCopyW(pExisting->szProfile, _countof(pExisting->szProfile),
+                                   pNet->strProfileName);
+                }
+                break;
+            }
+            if (bDuplicate)
+                continue;
+
+            TFYNETROW *pRow = &pCache->Wlan[pCache->nWlan++];
+            ZeroMemory(pRow, sizeof(*pRow));
+            pRow->nType = 2;
+            pRow->ifGuid = *pGuid;
+            pRow->nSignal = pNet->wlanSignalQuality;
+            pRow->bConnected = !!(pNet->dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED);
+            pRow->bHasProfile = !!(pNet->dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE);
+            pRow->bSecure = pNet->bSecurityEnabled;
+            pRow->bConnectable = pNet->bNetworkConnectable;
+            pRow->auth = pNet->dot11DefaultAuthAlgorithm;
+            pRow->cipher = pNet->dot11DefaultCipherAlgorithm;
+            StringCchCopyW(pRow->szName, _countof(pRow->szName), szSsid);
+            if (pRow->bHasProfile)
+                StringCchCopyW(pRow->szProfile, _countof(pRow->szProfile), pNet->strProfileName);
+            if (pRow->bConnected)
+                StringCchCopyW(pRow->szStatus, _countof(pRow->szStatus), L"Connected");
+        }
+        pfnFree(pNetworks);
+    }
+
+    for (DWORD a = 0; a < pCache->nWlan; a++)
+    {
+        for (DWORD b = a + 1; b < pCache->nWlan; b++)
+        {
+            TFYNETROW *pLeft = &pCache->Wlan[a];
+            TFYNETROW *pRight = &pCache->Wlan[b];
+            if ((pRight->bConnected && !pLeft->bConnected) ||
+                (pRight->bConnected == pLeft->bConnected &&
+                 pRight->nSignal > pLeft->nSignal))
+            {
+                TFYNETROW tmp = *pLeft;
+                *pLeft = *pRight;
+                *pRight = tmp;
+            }
+        }
+    }
+    pCache->bWifiOn = bAnyRadio ? bRadioOn : TRUE;
+
+cleanup:
+    if (pInterfaces)
+        pfnFree(pInterfaces);
+    pfnClose(hWlan, NULL);
+    FreeLibrary(hWlanApi);
+}
+
+static DWORD WINAPI
+TfyNetworkRefreshThread(LPVOID lpParameter)
+{
+    TFYNETREFRESH *pRefresh = (TFYNETREFRESH *)lpParameter;
+    TFYNETCACHE Cache;
+    HWND hWnd;
+
+    ZeroMemory(&Cache, sizeof(Cache));
+    TfyCollectAdapterRows(&Cache);
+    TfyCollectWlanRows(&Cache, pRefresh->bScan);
+    Cache.bValid = TRUE;
+
+    AcquireSRWLockExclusive(&g_NetCacheLock);
+    g_NetCache = Cache;
+    ReleaseSRWLockExclusive(&g_NetCacheLock);
+    InterlockedExchange(&g_NetRadioState, Cache.bWifiOn);
+
+    hWnd = (HWND)InterlockedCompareExchangePointer(&g_NetRefreshWindow, NULL, NULL);
+    InterlockedExchange(&g_NetRefreshActive, 0);
+    if (hWnd)
+        PostMessageW(hWnd, TFY_WM_NETREFRESH, pRefresh->bScan, 0);
+    HeapFree(hProcessHeap, 0, pRefresh);
+    return 0;
+}
+
+static BOOL
+TfyQueueNetworkRefresh(HWND hWnd, BOOL bScan)
+{
+    TFYNETREFRESH *pRefresh;
+    HANDLE hThread;
+
+    InterlockedExchangePointer(&g_NetRefreshWindow, hWnd);
+    if (InterlockedCompareExchange(&g_NetRefreshActive, 1, 0) != 0)
+        return FALSE;
+    pRefresh = (TFYNETREFRESH *)HeapAlloc(hProcessHeap, 0, sizeof(*pRefresh));
+    if (!pRefresh)
+    {
+        InterlockedExchange(&g_NetRefreshActive, 0);
+        return FALSE;
+    }
+    pRefresh->bScan = bScan;
+    hThread = CreateThread(NULL, 0, TfyNetworkRefreshThread, pRefresh, 0, NULL);
+    if (!hThread)
+    {
+        HeapFree(hProcessHeap, 0, pRefresh);
+        InterlockedExchange(&g_NetRefreshActive, 0);
+        return FALSE;
+    }
+    CloseHandle(hThread);
+    return TRUE;
+}
+
+static VOID
+TfyXmlEscape(LPCWSTR pszIn, LPWSTR pszOut, SIZE_T cchOut)
+{
+    SIZE_T o = 0;
+    for (; *pszIn && o + 8 < cchOut; pszIn++)
+    {
+        LPCWSTR pszRep = NULL;
+        switch (*pszIn)
+        {
+            case L'&': pszRep = L"&amp;"; break;
+            case L'<': pszRep = L"&lt;"; break;
+            case L'>': pszRep = L"&gt;"; break;
+            case L'"': pszRep = L"&quot;"; break;
+            case L'\'': pszRep = L"&apos;"; break;
+        }
+        if (pszRep)
+        {
+            while (*pszRep)
+                pszOut[o++] = *pszRep++;
+        }
+        else
+        {
+            pszOut[o++] = *pszIn;
+        }
+    }
+    pszOut[o] = 0;
+}
+
+static BOOL g_bTfyNetFromSettings = FALSE;
+
+static VOID
+TfyFillRound(HDC hdc, const RECT *prc, int radius, COLORREF crFill, COLORREF crBack);
+
+static VOID
+TfyDrawSwitch(HDC hdc, const RECT *prc, BOOL bOn, BOOL bHot, BOOL bEnabled, const SM2_FLYOUT_PALETTE *pPal)
+{
+    int h = prc->bottom - prc->top;
+    RECT rcKnob;
+    COLORREF crTrack;
+
+    if (bOn && bEnabled)
+    {
+        crTrack = bHot ? TfyMix(pPal->AccentBg, pPal->PanelBg, 40) : pPal->AccentBg;
+        TfyFillRound(hdc, prc, h / 2, crTrack, pPal->PanelBg);
+        SetRect(&rcKnob, prc->right - h + ShellScaleForDpi(4), prc->top + ShellScaleForDpi(4),
+                prc->right - ShellScaleForDpi(4), prc->bottom - ShellScaleForDpi(4));
+        TfyFillRound(hdc, &rcKnob, (rcKnob.bottom - rcKnob.top) / 2, pPal->AccentText, crTrack);
+        return;
+    }
+
+    RECT rcInner = *prc;
+    COLORREF crEdge = bEnabled ? TfyMix(pPal->PanelBg, pPal->PanelText, 170) : TfyMix(pPal->PanelBg, pPal->DimText, 120);
+
+    crTrack = bHot && bEnabled ? TfyMix(pPal->PanelBg, pPal->HotFill, 130) : pPal->PanelBg;
+    InflateRect(&rcInner, -1, -1);
+    TfyFillRound(hdc, prc, h / 2, crEdge, pPal->PanelBg);
+    TfyFillRound(hdc, &rcInner, (rcInner.bottom - rcInner.top) / 2, crTrack, crEdge);
+    SetRect(&rcKnob, prc->left + ShellScaleForDpi(5), prc->top + ShellScaleForDpi(5),
+            prc->left + h - ShellScaleForDpi(5), prc->bottom - ShellScaleForDpi(5));
+    TfyFillRound(hdc, &rcKnob, (rcKnob.bottom - rcKnob.top) / 2, crEdge, crTrack);
+}
+
+class CTrayNetworkWnd :
+    public CWindowImpl<CTrayNetworkWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayNetworkFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    CAtlArray<TFYNETROW> m_Rows;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    HFONT m_hFontHeader;
+    HMODULE m_hWlanApi;
+    HANDLE m_hWlan;
+    PFN_WLANOPENHANDLE m_pfnOpen;
+    PFN_WLANENUMINTERFACES m_pfnEnum;
+    PFN_WLANGETNETWORKLIST m_pfnList;
+    PFN_WLANCONNECT m_pfnConnect;
+    PFN_WLANDISCONNECT m_pfnDisconnect;
+    PFN_WLANSCAN m_pfnScan;
+    PFN_WLANSETPROFILE m_pfnSetProfile;
+    PFN_WLANREGISTERNOTIFICATION m_pfnRegister;
+    PFN_WLANQUERYINTERFACE m_pfnQuery;
+    PFN_WLANSETINTERFACE m_pfnSet;
+    PFN_WLANCLOSEHANDLE m_pfnClose;
+    PFN_WLANFREEMEMORY m_pfnFree;
+    HWND m_hwndEdit;
+    HBRUSH m_hbrEdit;
+    int m_iHot;
+    int m_iSel;
+    int m_iHotBtn;
+    BOOL m_bAutoConnect;
+    BOOL m_bPassMode;
+    BOOL m_bScanning;
+    BOOL m_bScanPending;
+    BOOL m_bLaunching;
+    int m_nWlanScroll;
+    int m_iWlanFirst;
+    BOOL m_bWlanLoading;
+    ULONGLONG m_SpinT0;
+    RECT m_rcWlanArea;
+    BOOL m_bConnecting;
+    BOOL m_bTracking;
+    int m_nIfaces;
+    WCHAR m_szSelName[128];
+    WCHAR m_szBanner[128];
+    RECT m_rcAnchor;
+    SIZE m_size;
+    RECT m_rcLink;
+    RECT m_rcRefresh;
+    RECT m_rcAirplane;
+    RECT m_rcWifi;
+    BOOL m_bWifiOn;
+    BOOL m_bAirplane;
+    BOOL m_bPane;
+    BOOL m_bBack;
+    int m_nVisRows;
+    HFONT m_hFontPaneTitle;
+    RECT m_rcBack;
+    BOOL m_bWifiPage;
+    int m_yFooter;
+    HFONT m_hFontRow;
+
+    CTrayNetworkWnd() : m_hFont(NULL), m_hFontSmall(NULL), m_hFontHeader(NULL),
+                        m_hWlanApi(NULL), m_hWlan(NULL),
+                        m_pfnOpen(NULL), m_pfnEnum(NULL), m_pfnList(NULL),
+                        m_pfnConnect(NULL), m_pfnDisconnect(NULL), m_pfnScan(NULL),
+                        m_pfnSetProfile(NULL), m_pfnRegister(NULL), m_pfnQuery(NULL), m_pfnSet(NULL),
+                        m_pfnClose(NULL), m_pfnFree(NULL),
+                        m_hwndEdit(NULL), m_hbrEdit(NULL),
+                        m_iHot(TFY_NETHIT_NONE), m_iSel(-1), m_iHotBtn(0),
+                        m_bAutoConnect(TRUE), m_bPassMode(FALSE), m_bScanning(FALSE),
+                        m_bScanPending(FALSE), m_bLaunching(FALSE), m_nWlanScroll(0), m_iWlanFirst(0),
+                        m_bWlanLoading(FALSE), m_SpinT0(0),
+                        m_bConnecting(FALSE), m_bTracking(FALSE), m_nIfaces(0),
+                        m_bWifiOn(TRUE), m_bAirplane(FALSE), m_bPane(FALSE), m_bBack(FALSE),
+                        m_nVisRows(TFY_NET_VISROWS), m_hFontPaneTitle(NULL),
+                        m_bWifiPage(FALSE), m_yFooter(0), m_hFontRow(NULL)
+    {
+        SetRectEmpty(&m_rcBack);
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_rcAnchor, sizeof(m_rcAnchor));
+        ZeroMemory(&m_size, sizeof(m_size));
+        ZeroMemory(&m_rcLink, sizeof(m_rcLink));
+        ZeroMemory(&m_rcRefresh, sizeof(m_rcRefresh));
+        m_szSelName[0] = 0;
+        m_szBanner[0] = 0;
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    static VOID WINAPI WlanNotifyCallback(PWLAN_NOTIFICATION_DATA pData, PVOID pContext)
+    {
+        HWND hWnd = (HWND)pContext;
+        if (!pData || !hWnd)
+            return;
+        if (pData->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM &&
+            pData->NotificationSource != WLAN_NOTIFICATION_SOURCE_MSM)
+            return;
+        ::PostMessageW(hWnd, TFY_WM_WLANNOTIFY, (WPARAM)pData->NotificationCode,
+                       (LPARAM)pData->NotificationSource);
+    }
+
+    BOOL LoadWlan()
+    {
+        DWORD dwVersion = 0;
+        DWORD dwPrev = 0;
+        if (!m_hWlanApi)
+            m_hWlanApi = LoadLibraryW(L"wlanapi.dll");
+        if (!m_hWlanApi)
+            return FALSE;
+        m_pfnOpen = (PFN_WLANOPENHANDLE)GetProcAddress(m_hWlanApi, "WlanOpenHandle");
+        m_pfnEnum = (PFN_WLANENUMINTERFACES)GetProcAddress(m_hWlanApi, "WlanEnumInterfaces");
+        m_pfnList = (PFN_WLANGETNETWORKLIST)GetProcAddress(m_hWlanApi, "WlanGetAvailableNetworkList");
+        m_pfnConnect = (PFN_WLANCONNECT)GetProcAddress(m_hWlanApi, "WlanConnect");
+        m_pfnDisconnect = (PFN_WLANDISCONNECT)GetProcAddress(m_hWlanApi, "WlanDisconnect");
+        m_pfnScan = (PFN_WLANSCAN)GetProcAddress(m_hWlanApi, "WlanScan");
+        m_pfnSetProfile = (PFN_WLANSETPROFILE)GetProcAddress(m_hWlanApi, "WlanSetProfile");
+        m_pfnRegister = (PFN_WLANREGISTERNOTIFICATION)GetProcAddress(m_hWlanApi, "WlanRegisterNotification");
+        m_pfnQuery = (PFN_WLANQUERYINTERFACE)GetProcAddress(m_hWlanApi, "WlanQueryInterface");
+        m_pfnSet = (PFN_WLANSETINTERFACE)GetProcAddress(m_hWlanApi, "WlanSetInterface");
+        m_pfnClose = (PFN_WLANCLOSEHANDLE)GetProcAddress(m_hWlanApi, "WlanCloseHandle");
+        m_pfnFree = (PFN_WLANFREEMEMORY)GetProcAddress(m_hWlanApi, "WlanFreeMemory");
+        if (!m_pfnOpen || !m_pfnEnum || !m_pfnList || !m_pfnClose || !m_pfnFree)
+            return FALSE;
+        if (!m_hWlan)
+        {
+            if (m_pfnOpen(2, NULL, &dwVersion, &m_hWlan) != ERROR_SUCCESS)
+            {
+                m_hWlan = NULL;
+                return FALSE;
+            }
+            if (m_pfnRegister)
+                m_pfnRegister(m_hWlan, WLAN_NOTIFICATION_SOURCE_ACM | WLAN_NOTIFICATION_SOURCE_MSM, TRUE,
+                              WlanNotifyCallback, (PVOID)m_hWnd, NULL, &dwPrev);
+        }
+        return TRUE;
+    }
+
+    static BOOL LoadAirplane(BOOL *pbWifiRestore)
+    {
+        HKEY hKey;
+        DWORD dwValue = 0, cb = sizeof(dwValue), dwType = 0;
+        BOOL bAirplane = FALSE;
+        *pbWifiRestore = TRUE;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ReactOS\\Explorer", 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+            return FALSE;
+        if (RegQueryValueExW(hKey, L"AirplaneMode", NULL, &dwType, (LPBYTE)&dwValue, &cb) == ERROR_SUCCESS && dwType == REG_DWORD)
+            bAirplane = (dwValue != 0);
+        cb = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"WifiRestore", NULL, &dwType, (LPBYTE)&dwValue, &cb) == ERROR_SUCCESS && dwType == REG_DWORD)
+            *pbWifiRestore = (dwValue != 0);
+        RegCloseKey(hKey);
+        return bAirplane;
+    }
+
+    static VOID SaveAirplane(BOOL bAirplane, BOOL bWifiRestore)
+    {
+        HKEY hKey;
+        DWORD dwValue;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ReactOS\\Explorer", 0, NULL, 0,
+                            KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+            return;
+        dwValue = bAirplane ? 1 : 0;
+        RegSetValueExW(hKey, L"AirplaneMode", 0, REG_DWORD, (const BYTE *)&dwValue, sizeof(dwValue));
+        dwValue = bWifiRestore ? 1 : 0;
+        RegSetValueExW(hKey, L"WifiRestore", 0, REG_DWORD, (const BYTE *)&dwValue, sizeof(dwValue));
+        RegCloseKey(hKey);
+    }
+
+    BOOL QueryRadio()
+    {
+        return InterlockedCompareExchange(&g_NetRadioState, 0, 0) != 0;
+    }
+
+    VOID SetRadio(BOOL bOn)
+    {
+        PWLAN_INTERFACE_INFO_LIST pInterfaces = NULL;
+        if (!LoadWlan() || !m_pfnSet)
+            return;
+        if (m_pfnEnum(m_hWlan, NULL, &pInterfaces) != ERROR_SUCCESS || !pInterfaces)
+            return;
+        for (DWORD i = 0; i < pInterfaces->dwNumberOfItems; i++)
+        {
+            WLAN_PHY_RADIO_STATE rs;
+            ZeroMemory(&rs, sizeof(rs));
+            rs.dwPhyIndex = 0;
+            rs.dot11SoftwareRadioState = bOn ? dot11_radio_state_on : dot11_radio_state_off;
+            rs.dot11HardwareRadioState = dot11_radio_state_on;
+            m_pfnSet(m_hWlan, &pInterfaces->InterfaceInfo[i].InterfaceGuid,
+                     wlan_intf_opcode_radio_state, sizeof(rs), &rs, NULL);
+        }
+        m_pfnFree(pInterfaces);
+        InterlockedExchange(&g_NetRadioState, bOn);
+    }
+
+    VOID ToggleAirplane()
+    {
+        BOOL bRestore = TRUE;
+        LoadAirplane(&bRestore);
+        if (!m_bAirplane)
+        {
+            bRestore = m_bWifiOn;
+            m_bAirplane = TRUE;
+            SaveAirplane(TRUE, bRestore);
+            SetRadio(FALSE);
+        }
+        else
+        {
+            m_bAirplane = FALSE;
+            SaveAirplane(FALSE, bRestore);
+            SetRadio(bRestore);
+        }
+        EndScan();
+        Rebuild();
+        if (!m_bAirplane && m_bWifiOn)
+            StartScan();
+        Relayout();
+    }
+
+    VOID ToggleWifi()
+    {
+        BOOL bOn = !m_bWifiOn;
+        SetRadio(bOn);
+        m_bWifiOn = bOn;
+        EndScan();
+        Rebuild();
+        if (bOn)
+            StartScan();
+        Relayout();
+    }
+
+    VOID UnloadWlan()
+    {
+        DWORD dwPrev = 0;
+        if (m_hWlan && m_pfnRegister)
+            m_pfnRegister(m_hWlan, WLAN_NOTIFICATION_SOURCE_NONE, TRUE, NULL, NULL, NULL, &dwPrev);
+        if (m_hWlan && m_pfnClose)
+            m_pfnClose(m_hWlan, NULL);
+        m_hWlan = NULL;
+    }
+
+    VOID AddSection(LPCWSTR pszText)
+    {
+        TFYNETROW row;
+        ZeroMemory(&row, sizeof(row));
+        row.nType = 3;
+        StringCchCopyW(row.szName, _countof(row.szName), pszText);
+        m_Rows.Add(row);
+    }
+
+    VOID Rebuild()
+    {
+        WCHAR szKeep[128];
+        StringCchCopyW(szKeep, _countof(szKeep), m_szSelName);
+        BOOL bRestore = TRUE;
+        DWORD nWlanUp = 0, nWireUp = 0;
+        m_Rows.SetCount(0);
+        AcquireSRWLockShared(&g_NetCacheLock);
+        for (DWORD k = 0; k < g_NetCache.nWlan; k++)
+            nWlanUp += !!g_NetCache.Wlan[k].bConnected;
+        for (DWORD k = 0; k < g_NetCache.nAdapters; k++)
+            nWireUp += !!g_NetCache.Adapters[k].bConnected;
+        if (nWlanUp || nWireUp)
+        {
+            AddSection(L"Currently connected to:");
+            for (DWORD k = 0; k < g_NetCache.nWlan; k++)
+            {
+                if (g_NetCache.Wlan[k].bConnected)
+                    m_Rows.Add(g_NetCache.Wlan[k]);
+            }
+            for (DWORD k = 0; !nWlanUp && k < g_NetCache.nAdapters; k++)
+            {
+                if (g_NetCache.Adapters[k].bConnected)
+                    m_Rows.Add(g_NetCache.Adapters[k]);
+            }
+        }
+        else if (g_NetCache.bValid)
+        {
+            TFYNETROW row;
+            ZeroMemory(&row, sizeof(row));
+            StringCchCopyW(row.szName, _countof(row.szName), L"No connection");
+            m_Rows.Add(row);
+        }
+        m_iWlanFirst = (int)m_Rows.GetCount();
+        if (g_NetCache.nWlan > nWlanUp)
+        {
+            AddSection(L"Wireless Network Connection");
+            m_iWlanFirst = (int)m_Rows.GetCount();
+            for (DWORD k = 0; k < g_NetCache.nWlan; k++)
+            {
+                if (!g_NetCache.Wlan[k].bConnected)
+                    m_Rows.Add(g_NetCache.Wlan[k]);
+            }
+        }
+        m_nIfaces = g_NetCache.nWlanIfaces;
+        ReleaseSRWLockShared(&g_NetCacheLock);
+        m_bAirplane = LoadAirplane(&bRestore);
+        m_bWifiOn = QueryRadio();
+        if (m_nIfaces > 0 && !m_bScanning)
+        {
+            if (m_bAirplane)
+                StringCchCopyW(m_szBanner, _countof(m_szBanner), L"Airplane mode is on");
+            else if (!m_bWifiOn)
+                StringCchCopyW(m_szBanner, _countof(m_szBanner), L"Wi-Fi is turned off");
+            else if (!wcscmp(m_szBanner, L"Airplane mode is on") || !wcscmp(m_szBanner, L"Wi-Fi is turned off"))
+                m_szBanner[0] = 0;
+        }
+        m_iSel = -1;
+        if (szKeep[0])
+        {
+            for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+            {
+                if (m_Rows[i].nType == 2 && !wcscmp(m_Rows[i].szName, szKeep))
+                {
+                    m_iSel = (int)i;
+                    break;
+                }
+            }
+        }
+        if (m_iSel < 0)
+        {
+            m_bPassMode = FALSE;
+            m_szSelName[0] = 0;
+            HideEdit();
+        }
+        if (m_bConnecting)
+        {
+            for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+            {
+                if (m_Rows[i].nType == 2 && !wcscmp(m_Rows[i].szName, szKeep) && !m_Rows[i].bConnected)
+                    StringCchCopyW(m_Rows[i].szStatus, _countof(m_Rows[i].szStatus), L"Connecting...");
+            }
+        }
+    }
+
+    VOID StartScan(BOOL bQuiet = FALSE)
+    {
+        if (!m_bWifiOn || m_bAirplane)
+            return;
+        m_bScanning = TRUE;
+        if (!bQuiet)
+            StringCchCopyW(m_szBanner, _countof(m_szBanner), L"Searching for networks...");
+        if (TfyQueueNetworkRefresh(m_hWnd, TRUE))
+        {
+            m_bScanPending = FALSE;
+            SetTimer(TFY_TIMER_SCAN, 8000, NULL);
+        }
+        else
+        {
+            m_bScanPending = TRUE;
+            SetTimer(TFY_TIMER_RESCAN, 100, NULL);
+        }
+    }
+
+    VOID EndScan()
+    {
+        if (!m_bScanning)
+            return;
+        m_bScanning = FALSE;
+        m_bScanPending = FALSE;
+        KillTimer(TFY_TIMER_SCAN);
+        KillTimer(TFY_TIMER_RESCAN);
+        if (!wcscmp(m_szBanner, L"Searching for networks..."))
+            m_szBanner[0] = 0;
+    }
+
+    VOID LayoutWifiPage()
+    {
+        const int cx = Sc(360);
+        int y = Sc(56);
+        int nListTop;
+        int nWlanTotal = 0;
+        int nWlanIdx = 0;
+
+        m_size.cx = cx;
+        m_nVisRows = TFY_NET_WIFIROWS;
+        SetRect(&m_rcBack, Sc(12), Sc(12), Sc(12) + Sc(32), Sc(12) + Sc(32));
+        SetRect(&m_rcWifi, cx - Sc(20) - Sc(40), Sc(18), cx - Sc(20), Sc(18) + Sc(20));
+        SetRectEmpty(&m_rcAirplane);
+        if (m_szBanner[0])
+            y += Sc(24);
+
+        for (SIZE_T k = (SIZE_T)m_iWlanFirst; k < m_Rows.GetCount(); k++)
+        {
+            if (m_Rows[k].nType == 2)
+                nWlanTotal++;
+        }
+        if (m_nWlanScroll > nWlanTotal - m_nVisRows)
+            m_nWlanScroll = nWlanTotal - m_nVisRows;
+        if (m_nWlanScroll < 0)
+            m_nWlanScroll = 0;
+
+        nListTop = y;
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYNETROW &row = m_Rows[i];
+            BOOL bExpanded = ((int)i == m_iSel);
+            int nHeadH;
+            int yb;
+
+            SetRectEmpty(&row.rc);
+            SetRectEmpty(&row.rcButton);
+            SetRectEmpty(&row.rcButton2);
+            SetRectEmpty(&row.rcCheck);
+            SetRectEmpty(&row.rcEdit);
+            SetRectEmpty(&row.rcInfo);
+            if (row.nType != 2)
+                continue;
+            if ((int)i >= m_iWlanFirst)
+            {
+                int nThis = nWlanIdx++;
+                if (nThis < m_nWlanScroll || nThis >= m_nWlanScroll + m_nVisRows)
+                    continue;
+            }
+
+            nHeadH = (row.bConnected || bExpanded) ? Sc(60) : Sc(48);
+            yb = y + nHeadH;
+            if (row.bConnected)
+            {
+                SetRect(&row.rcInfo, cx - Sc(16) - Sc(32), y + (nHeadH - Sc(32)) / 2,
+                        cx - Sc(16), y + (nHeadH + Sc(32)) / 2);
+            }
+            if (bExpanded)
+            {
+                if (m_bPassMode)
+                {
+                    yb += Sc(22);
+                    SetRect(&row.rcEdit, Sc(52), yb, cx - Sc(24), yb + Sc(28));
+                    yb += Sc(28) + Sc(10);
+                    SetRect(&row.rcButton, cx - Sc(24) - Sc(216), yb, cx - Sc(24) - Sc(112), yb + Sc(32));
+                    SetRect(&row.rcButton2, cx - Sc(24) - Sc(104), yb, cx - Sc(24), yb + Sc(32));
+                    yb += Sc(32) + Sc(12);
+                }
+                else
+                {
+                    if (!row.bConnected)
+                    {
+                        SetRect(&row.rcCheck, Sc(52), yb, cx - Sc(24), yb + Sc(24));
+                        yb += Sc(30);
+                    }
+                    SetRect(&row.rcButton, cx - Sc(24) - Sc(136), yb, cx - Sc(24), yb + Sc(32));
+                    yb += Sc(32) + Sc(12);
+                }
+            }
+            SetRect(&row.rc, Sc(8), y, cx - Sc(8), yb);
+            y = yb + Sc(2);
+        }
+        if (y < nListTop + Sc(48) * 3)
+            y = nListTop + Sc(48) * 3;
+        SetRect(&m_rcWlanArea, Sc(8), nListTop, cx - Sc(8), y);
+
+        y += Sc(6);
+        m_yFooter = y;
+        SetRect(&m_rcLink, Sc(16), y + Sc(8), cx - Sc(64), y + Sc(8) + Sc(32));
+        SetRect(&m_rcRefresh, cx - Sc(16) - Sc(32), y + Sc(8), cx - Sc(16), y + Sc(8) + Sc(32));
+        m_size.cy = y + Sc(48);
+
+        if (m_hwndEdit && m_iSel >= 0 && m_bPassMode)
+        {
+            TFYNETROW &row = m_Rows[m_iSel];
+            ::SetWindowPos(m_hwndEdit, NULL, row.rcEdit.left + Sc(6), row.rcEdit.top + Sc(5),
+                           row.rcEdit.right - row.rcEdit.left - Sc(12), row.rcEdit.bottom - row.rcEdit.top - Sc(10),
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+
+    VOID Layout()
+    {
+        m_bWifiPage = !m_bPane;
+        if (m_bWifiPage)
+        {
+            LayoutWifiPage();
+            return;
+        }
+
+        int y = Sc(84);
+        int yRefresh = Sc(34);
+        int cyPane;
+        POINT ptPane;
+
+        m_size.cx = Sc(TFY_PANE_WIDTH);
+        TfyPanePosition(&m_rcAnchor, &m_size, &ptPane);
+        cyPane = m_size.cy;
+        m_nVisRows = max(TFY_NET_VISROWS, (cyPane - Sc(320)) / Sc(40));
+        SetRect(&m_rcBack, Sc(8), Sc(27), Sc(8) + Sc(36), Sc(27) + Sc(36));
+        SetRect(&m_rcRefresh, m_size.cx - Sc(12) - Sc(22), yRefresh, m_size.cx - Sc(12), yRefresh + Sc(22));
+        if (m_szBanner[0] || (m_nIfaces == 0 && !m_Rows.GetCount()))
+            y += Sc(20);
+        if (m_nIfaces > 0)
+        {
+            int nHalf = (m_size.cx - Sc(16)) / 2;
+            SetRect(&m_rcAirplane, Sc(8), y, Sc(8) + nHalf, y + Sc(32));
+            SetRect(&m_rcWifi, Sc(8) + nHalf, y, Sc(8) + nHalf * 2, y + Sc(32));
+            y += Sc(32) + Sc(6);
+        }
+        else
+        {
+            SetRectEmpty(&m_rcAirplane);
+            SetRectEmpty(&m_rcWifi);
+        }
+        int nWlanTotal = 0;
+        for (SIZE_T k = (SIZE_T)m_iWlanFirst; k < m_Rows.GetCount(); k++)
+        {
+            if (m_Rows[k].nType == 2)
+                nWlanTotal++;
+        }
+        if (m_nWlanScroll > nWlanTotal - m_nVisRows)
+            m_nWlanScroll = nWlanTotal - m_nVisRows;
+        if (m_nWlanScroll < 0)
+            m_nWlanScroll = 0;
+
+        int nWlanIdx = 0;
+        int nWlanStart = -1;
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYNETROW &row = m_Rows[i];
+            int nRowH = (row.nType == 3) ? Sc(28) : (row.nType == 2) ? Sc(40) : Sc(46);
+            BOOL bExpanded = (row.nType == 2 && (int)i == m_iSel);
+            if (row.nType == 2 && (int)i >= m_iWlanFirst)
+            {
+                int nThis = nWlanIdx++;
+                if (nThis < m_nWlanScroll || nThis >= m_nWlanScroll + m_nVisRows)
+                {
+                    SetRectEmpty(&row.rc);
+                    SetRect(&row.rcButton, 0, 0, 0, 0);
+                    SetRect(&row.rcButton2, 0, 0, 0, 0);
+                    SetRect(&row.rcCheck, 0, 0, 0, 0);
+                    SetRect(&row.rcEdit, 0, 0, 0, 0);
+                    continue;
+                }
+            }
+            SetRect(&row.rcButton, 0, 0, 0, 0);
+            SetRect(&row.rcButton2, 0, 0, 0, 0);
+            SetRect(&row.rcCheck, 0, 0, 0, 0);
+            SetRect(&row.rcEdit, 0, 0, 0, 0);
+            if (bExpanded)
+            {
+                int yb = y + nRowH;
+                if (m_bPassMode)
+                {
+                    yb += Sc(22);
+                    SetRect(&row.rcEdit, Sc(46), yb, m_size.cx - Sc(20), yb + Sc(24));
+                    yb += Sc(24) + Sc(8);
+                    SetRect(&row.rcButton, m_size.cx - Sc(20) - Sc(160), yb, m_size.cx - Sc(20) - Sc(84), yb + Sc(26));
+                    SetRect(&row.rcButton2, m_size.cx - Sc(20) - Sc(76), yb, m_size.cx - Sc(20), yb + Sc(26));
+                    yb += Sc(26) + Sc(10);
+                }
+                else
+                {
+                    if (!row.bConnected)
+                    {
+                        SetRect(&row.rcCheck, Sc(46), yb + Sc(4), m_size.cx - Sc(20), yb + Sc(24));
+                        yb += Sc(26);
+                    }
+                    SetRect(&row.rcButton, m_size.cx - Sc(20) - Sc(96), yb, m_size.cx - Sc(20), yb + Sc(26));
+                    yb += Sc(26) + Sc(10);
+                }
+                nRowH = yb - y;
+            }
+            SetRect(&row.rc, Sc(8), y, m_size.cx - Sc(8), y + nRowH);
+            if (row.nType == 2 && (int)i >= m_iWlanFirst && nWlanStart < 0)
+                nWlanStart = y;
+            y += nRowH;
+        }
+        if (nWlanStart < 0)
+            nWlanStart = y;
+        if ((nWlanTotal || m_bWlanLoading) && nWlanTotal < m_nVisRows)
+            y += (m_nVisRows - nWlanTotal) * Sc(40);
+        SetRect(&m_rcWlanArea, Sc(8), nWlanStart, m_size.cx - Sc(8), y);
+        y += Sc(8) + Sc(26) + Sc(10);
+        SetRect(&m_rcLink, Sc(20), max(y - Sc(36), cyPane - Sc(58)), m_size.cx - Sc(20), max(y - Sc(10), cyPane - Sc(32)));
+        m_size.cy = max(y, cyPane);
+        if (m_hwndEdit && m_iSel >= 0 && m_bPassMode)
+        {
+            TFYNETROW &row = m_Rows[m_iSel];
+            ::SetWindowPos(m_hwndEdit, NULL, row.rcEdit.left, row.rcEdit.top,
+                           row.rcEdit.right - row.rcEdit.left, row.rcEdit.bottom - row.rcEdit.top,
+                           SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+
+    VOID Reposition()
+    {
+        MONITORINFO mi;
+        POINT ptRef;
+        int xPos, yPos;
+        if (m_bPane)
+        {
+            SIZE size = m_size;
+
+            TfyPanePosition(&m_rcAnchor, &size, &ptRef);
+        }
+        else
+        {
+            TfyW11Position(::GetWindow(m_hWnd, GW_OWNER), &m_rcAnchor, m_size, FALSE, &ptRef);
+        }
+        xPos = ptRef.x;
+        yPos = ptRef.y;
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromRect(&m_rcAnchor, MONITOR_DEFAULTTONEAREST), &mi);
+        if (yPos < mi.rcWork.top) yPos = mi.rcWork.top;
+        m_ptFinal.x = xPos;
+        m_ptFinal.y = yPos;
+        if (m_AnimPhase == TFY_NONE)
+            SetWindowPos(NULL, xPos, yPos, m_size.cx, m_size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        else
+            SetWindowPos(NULL, 0, 0, m_size.cx, m_size.cy,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Relayout()
+    {
+        Layout();
+        Reposition();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        BOOL bCacheValid;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_SEMIBOLD);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+        if (!m_hFontHeader) m_hFontHeader = TfyCreateFont(14, FW_SEMIBOLD);
+        if (!m_hFontRow) m_hFontRow = TfyCreateFont(12, FW_NORMAL);
+        m_bPane = !IsThemeActive();
+        m_bSlideFromRight = m_bPane;
+        m_bBack = m_bPane && g_bTfyNetFromSettings;
+        g_bTfyNetFromSettings = FALSE;
+        if (m_bPane && !m_hFontPaneTitle)
+            m_hFontPaneTitle = TfyCreateFont(27, FW_LIGHT);
+        m_rcAnchor = *prcAnchor;
+        Rebuild();
+        AcquireSRWLockShared(&g_NetCacheLock);
+        bCacheValid = g_NetCache.bValid;
+        ReleaseSRWLockShared(&g_NetCacheLock);
+        if (!bCacheValid)
+        {
+            m_bWlanLoading = TRUE;
+            m_SpinT0 = GetTickCount64();
+            SetTimer(TFY_TIMER_SPIN, 33, NULL);
+        }
+        Layout();
+        Reposition();
+        BeginFlyoutOpen(m_hWnd, m_ptFinal.x, m_ptFinal.y,
+                        m_size.cx, m_size.cy, m_Pal.PanelBg);
+        if (m_bWifiOn && !m_bAirplane)
+            StartScan(TRUE);
+        else
+            TfyQueueNetworkRefresh(m_hWnd, FALSE);
+    }
+
+    VOID FadeOut();
+
+    VOID HideEdit()
+    {
+        if (m_hwndEdit)
+            ::ShowWindow(m_hwndEdit, SW_HIDE);
+    }
+
+    VOID ShowEdit()
+    {
+        if (!m_hwndEdit)
+        {
+            m_hwndEdit = CreateWindowExW(0, L"EDIT", NULL,
+                                         WS_CHILD | ES_PASSWORD | ES_AUTOHSCROLL | ES_LEFT,
+                                         0, 0, Sc(200), Sc(24), m_hWnd, (HMENU)(INT_PTR)TFY_NET_EDIT_ID,
+                                         hExplorerInstance, NULL);
+            if (!m_hwndEdit)
+                return;
+            ::SendMessageW(m_hwndEdit, WM_SETFONT, (WPARAM)m_hFont, FALSE);
+            ::SendMessageW(m_hwndEdit, EM_SETLIMITTEXT, 64, 0);
+            SetWindowSubclass(m_hwndEdit, TfyFlyoutEditSubclassProc, 1, 0);
+        }
+        ::SetWindowTextW(m_hwndEdit, L"");
+        ::ShowWindow(m_hwndEdit, SW_SHOWNOACTIVATE);
+        ::SetFocus(m_hwndEdit);
+    }
+
+    LPCWSTR AuthName(const TFYNETROW &row) const
+    {
+        switch (row.auth)
+        {
+            case DOT11_AUTH_ALGO_RSNA_PSK: return L"WPA2PSK";
+            case DOT11_AUTH_ALGO_WPA_PSK: return L"WPAPSK";
+            case DOT11_AUTH_ALGO_WPA3_SAE: return L"WPA3SAE";
+            case DOT11_AUTH_ALGO_RSNA: return L"WPA2";
+            case DOT11_AUTH_ALGO_WPA: return L"WPA";
+            case DOT11_AUTH_ALGO_80211_SHARED_KEY: return L"shared";
+            default: return L"open";
+        }
+    }
+
+    LPCWSTR CipherName(const TFYNETROW &row) const
+    {
+        switch (row.cipher)
+        {
+            case DOT11_CIPHER_ALGO_CCMP: return L"AES";
+            case DOT11_CIPHER_ALGO_TKIP: return L"TKIP";
+            case DOT11_CIPHER_ALGO_WEP:
+            case DOT11_CIPHER_ALGO_WEP40:
+            case DOT11_CIPHER_ALGO_WEP104: return L"WEP";
+            default: return row.bSecure ? L"AES" : L"none";
+        }
+    }
+
+    BOOL NeedsKey(const TFYNETROW &row) const
+    {
+        return row.bSecure && !row.bHasProfile;
+    }
+
+    BOOL IsEnterprise(const TFYNETROW &row) const
+    {
+        return row.auth == DOT11_AUTH_ALGO_RSNA || row.auth == DOT11_AUTH_ALGO_WPA;
+    }
+
+    BOOL SaveProfile(TFYNETROW &row, LPCWSTR pszKey)
+    {
+        WCHAR szSsid[512], szKey[512], szXml[2048];
+        DWORD dwReason = 0;
+        if (!m_hWlan || !m_pfnSetProfile)
+            return FALSE;
+        TfyXmlEscape(row.szName, szSsid, _countof(szSsid));
+        szKey[0] = 0;
+        if (pszKey && pszKey[0])
+            TfyXmlEscape(pszKey, szKey, _countof(szKey));
+        if (row.bSecure)
+        {
+            StringCchPrintfW(szXml, _countof(szXml),
+                L"<?xml version=\"1.0\"?>"
+                L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
+                L"<name>%s</name><SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
+                L"<connectionType>ESS</connectionType><connectionMode>%s</connectionMode>"
+                L"<MSM><security><authEncryption><authentication>%s</authentication>"
+                L"<encryption>%s</encryption><useOneX>false</useOneX></authEncryption>"
+                L"<sharedKey><keyType>passPhrase</keyType><protected>false</protected>"
+                L"<keyMaterial>%s</keyMaterial></sharedKey></security></MSM></WLANProfile>",
+                szSsid, szSsid, m_bAutoConnect ? L"auto" : L"manual",
+                AuthName(row), CipherName(row), szKey);
+        }
+        else
+        {
+            StringCchPrintfW(szXml, _countof(szXml),
+                L"<?xml version=\"1.0\"?>"
+                L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
+                L"<name>%s</name><SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
+                L"<connectionType>ESS</connectionType><connectionMode>%s</connectionMode>"
+                L"<MSM><security><authEncryption><authentication>open</authentication>"
+                L"<encryption>none</encryption><useOneX>false</useOneX></authEncryption>"
+                L"</security></MSM></WLANProfile>",
+                szSsid, szSsid, m_bAutoConnect ? L"auto" : L"manual");
+        }
+        DWORD dwRet = m_pfnSetProfile(m_hWlan, &row.ifGuid, 0, szXml, NULL, TRUE, NULL, &dwReason);
+        SecureZeroMemory(szXml, sizeof(szXml));
+        SecureZeroMemory(szKey, sizeof(szKey));
+        if (dwRet != ERROR_SUCCESS)
+            return FALSE;
+        row.bHasProfile = TRUE;
+        StringCchCopyW(row.szProfile, _countof(row.szProfile), row.szName);
+        return TRUE;
+    }
+
+    VOID SetRowFailed(TFYNETROW &row, LPCWSTR pszText)
+    {
+        StringCchCopyW(row.szStatus, _countof(row.szStatus), pszText);
+        m_bConnecting = FALSE;
+        KillTimer(TFY_TIMER_POLL);
+    }
+
+    VOID ConnectRow(int i, LPCWSTR pszKey)
+    {
+        if (i < 0 || i >= (int)m_Rows.GetCount())
+            return;
+        TFYNETROW &row = m_Rows[i];
+        if (row.nType != 2 || !LoadWlan() || !m_pfnConnect)
+            return;
+        if (IsEnterprise(row) && !row.bHasProfile)
+        {
+            SetRowFailed(row, L"Enterprise networks are not supported");
+            InvalidateRect(NULL, FALSE);
+            return;
+        }
+        if (NeedsKey(row) && (!pszKey || !pszKey[0]))
+        {
+            m_bPassMode = TRUE;
+            Relayout();
+            ShowEdit();
+            Relayout();
+            return;
+        }
+        WLAN_CONNECTION_PARAMETERS params;
+        ZeroMemory(&params, sizeof(params));
+        params.dot11BssType = dot11_BSS_type_infrastructure;
+        DOT11_SSID ssid;
+        ZeroMemory(&ssid, sizeof(ssid));
+        if (row.bHasProfile || row.bSecure || m_bAutoConnect)
+        {
+            if (!row.bHasProfile || (pszKey && pszKey[0]))
+            {
+                if (!SaveProfile(row, pszKey))
+                {
+                    SetRowFailed(row, L"Can't save the network profile");
+                    m_bPassMode = FALSE;
+                    HideEdit();
+                    Relayout();
+                    return;
+                }
+            }
+            params.wlanConnectionMode = wlan_connection_mode_profile;
+            params.strProfile = row.szProfile;
+        }
+        else
+        {
+            int cb = WideCharToMultiByte(CP_UTF8, 0, row.szName, -1, (LPSTR)ssid.ucSSID,
+                                         DOT11_SSID_MAX_LENGTH, NULL, NULL);
+            ssid.uSSIDLength = (cb > 0) ? (ULONG)(cb - 1) : 0;
+            params.wlanConnectionMode = wlan_connection_mode_discovery_unsecure;
+            params.pDot11Ssid = &ssid;
+        }
+        m_bPassMode = FALSE;
+        HideEdit();
+        StringCchCopyW(m_szSelName, _countof(m_szSelName), row.szName);
+        if (m_pfnConnect(m_hWlan, &row.ifGuid, &params, NULL) == ERROR_SUCCESS)
+        {
+            m_bConnecting = TRUE;
+            StringCchCopyW(row.szStatus, _countof(row.szStatus), L"Connecting...");
+            SetTimer(TFY_TIMER_POLL, 2000, NULL);
+        }
+        else
+        {
+            SetRowFailed(row, L"Can't connect to this network");
+        }
+        Relayout();
+    }
+
+    VOID DisconnectRow(int i)
+    {
+        if (i < 0 || i >= (int)m_Rows.GetCount())
+            return;
+        TFYNETROW &row = m_Rows[i];
+        if (row.nType != 2 || !LoadWlan() || !m_pfnDisconnect)
+            return;
+        m_pfnDisconnect(m_hWlan, &row.ifGuid, NULL);
+        row.bConnected = FALSE;
+        StringCchCopyW(row.szStatus, _countof(row.szStatus), L"Disconnecting...");
+        SetTimer(TFY_TIMER_POLL, 1500, NULL);
+        Relayout();
+    }
+
+    VOID SubmitPassword()
+    {
+        WCHAR szKey[128];
+        if (!m_hwndEdit || m_iSel < 0)
+            return;
+        szKey[0] = 0;
+        ::GetWindowTextW(m_hwndEdit, szKey, _countof(szKey));
+        if (wcslen(szKey) < 8)
+        {
+            StringCchCopyW(m_szBanner, _countof(m_szBanner), L"The security key must be at least 8 characters");
+            Relayout();
+            return;
+        }
+        m_szBanner[0] = 0;
+        ConnectRow(m_iSel, szKey);
+        SecureZeroMemory(szKey, sizeof(szKey));
+        if (m_hwndEdit)
+            ::SetWindowTextW(m_hwndEdit, L"");
+    }
+
+    VOID CancelPassword()
+    {
+        m_bPassMode = FALSE;
+        HideEdit();
+        if (!wcscmp(m_szBanner, L"The security key must be at least 8 characters"))
+            m_szBanner[0] = 0;
+        Relayout();
+    }
+
+    VOID SelectRow(int i)
+    {
+        if (m_bPassMode)
+            CancelPassword();
+        if (i == m_iSel)
+        {
+            m_iSel = -1;
+            m_szSelName[0] = 0;
+        }
+        else
+        {
+            m_iSel = i;
+            if (i >= 0 && m_Rows[i].nType == 2)
+            {
+                int nWlanIndex = i - m_iWlanFirst;
+                if (nWlanIndex >= 0 && nWlanIndex < m_nWlanScroll)
+                    m_nWlanScroll = nWlanIndex;
+                else if (nWlanIndex >= m_nWlanScroll + m_nVisRows)
+                    m_nWlanScroll = nWlanIndex - m_nVisRows + 1;
+                StringCchCopyW(m_szSelName, _countof(m_szSelName), m_Rows[i].szName);
+            }
+            else
+                m_szSelName[0] = 0;
+        }
+        Relayout();
+    }
+
+    UINT WifiToggleIcon()
+    {
+        if (m_bAirplane || !m_bWifiOn)
+            return IDI_FLU_WIFIOFF;
+
+        for (size_t i = 0; i < m_Rows.GetCount(); i++)
+        {
+            const TFYNETROW &row = m_Rows[i];
+
+            if (row.nType != 2 || !row.bConnected)
+                continue;
+            return row.nSignal >= 75 ? IDI_FLU_WIFI1 :
+                   row.nSignal >= 50 ? IDI_FLU_WIFI2 :
+                   row.nSignal >= 25 ? IDI_FLU_WIFI3 : IDI_FLU_WIFI4;
+        }
+        return IDI_FLU_WIFI1;
+    }
+
+    VOID DrawToggle(HDC hdc, const RECT *prc, LPCWSTR pszLabel, BOOL bOn, BOOL bHot, BOOL bEnabled, UINT nIcon, BOOL bCompact = FALSE)
+    {
+        RECT rcBtn = *prc;
+        InflateRect(&rcBtn, -Sc(2), -Sc(2));
+        int iState = (bOn ? 4 : 0) + (!bEnabled ? 4 : bHot ? 2 : 1);
+        TfyDrawThemeButton(m_hFlyoutButtonTheme, hdc, &rcBtn, iState, &m_Pal);
+        int cyMid = (rcBtn.top + rcBtn.bottom) / 2;
+        RECT rcIcon = { rcBtn.left + Sc(8), cyMid - Sc(11), rcBtn.left + Sc(8) + Sc(22), cyMid + Sc(11) };
+        TfyDrawFluent(hdc, &rcIcon, nIcon);
+        RECT rcLabel = { rcIcon.right + Sc(6), rcBtn.top, rcBtn.right - Sc(6), rcBtn.bottom };
+        SelectObject(hdc, bCompact ? m_hFontSmall : m_hFont);
+        SetTextColor(hdc, bEnabled ? m_Pal.PanelText : m_Pal.DimText);
+        DrawTextW(hdc, pszLabel, -1, &rcLabel, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+
+    VOID DrawInfoButton(HDC hdc, const RECT *prc, BOOL bHot, COLORREF crBack)
+    {
+        int cx = (prc->left + prc->right) / 2;
+        int cy = (prc->top + prc->bottom) / 2;
+        RECT rcRing = { cx - Sc(8), cy - Sc(8), cx + Sc(8), cy + Sc(8) };
+        RECT rcHole = rcRing;
+        COLORREF crFill = crBack;
+
+        if (bHot)
+        {
+            crFill = TfyMix(crBack, m_Pal.PanelText, 24);
+            TfyFillRound(hdc, prc, Sc(4), crFill, crBack);
+        }
+        InflateRect(&rcHole, -Sc(1), -Sc(1));
+        TfyFillRound(hdc, &rcRing, Sc(8), m_Pal.HotBorder, crFill);
+        TfyFillRound(hdc, &rcHole, Sc(7), crFill, m_Pal.HotBorder);
+        HGDIOBJ hOld = SelectObject(hdc, m_hFont);
+        SetTextColor(hdc, m_Pal.HotBorder);
+        DrawTextW(hdc, L"i", -1, &rcRing, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        SelectObject(hdc, hOld);
+    }
+
+    VOID DrawLoadingSpinner(HDC hdc)
+    {
+        const double kPi = 3.14159265358979;
+        double t = (double)(GetTickCount64() - m_SpinT0) / 1000.0;
+        double a = (t * kPi * 0.5) + sin(t * kPi) * 0.5;
+        int cxMid = (m_rcWlanArea.left + m_rcWlanArea.right) / 2;
+        int cyMid2 = (m_rcWlanArea.top + m_rcWlanArea.bottom) / 2;
+        int r = Sc(12);
+        HPEN hPen = CreatePen(PS_SOLID, Sc(2), TfyMix(m_Pal.PanelBg, m_Pal.AccentBg, 220));
+        HGDIOBJ hPenOld = SelectObject(hdc, hPen);
+        HGDIOBJ hBrOld = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+        Arc(hdc, cxMid - r, cyMid2 - r, cxMid + r, cyMid2 + r,
+            cxMid + (int)(r * cos(a)), cyMid2 + (int)(r * sin(a)),
+            cxMid + (int)(r * cos(a + kPi * 1.35)),
+            cyMid2 + (int)(r * sin(a + kPi * 1.35)));
+
+        SelectObject(hdc, hBrOld);
+        SelectObject(hdc, hPenOld);
+        DeleteObject(hPen);
+    }
+
+    VOID PaintWifiPage(HDC hdc, const RECT *prc)
+    {
+        RECT rcTitle = { m_rcBack.right + Sc(8), m_rcBack.top, m_rcWifi.left - Sc(8), m_rcBack.bottom };
+        RECT rcArrow = { m_rcBack.left + Sc(8), m_rcBack.top + Sc(8), m_rcBack.right - Sc(8), m_rcBack.bottom - Sc(8) };
+        HGDIOBJ hFontOld;
+
+        if (m_iHot == TFY_NETHIT_BACK)
+            TfyFillRound(hdc, &m_rcBack, Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24), m_Pal.PanelBg);
+        TfyDrawFluent(hdc, &rcArrow, IDI_FLU_ARROWLEFT);
+        hFontOld = SelectObject(hdc, m_hFontHeader);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, L"Wi-Fi", -1, &rcTitle, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        TfyDrawSwitch(hdc, &m_rcWifi, m_bWifiOn && !m_bAirplane, m_iHot == TFY_NETHIT_WIFI,
+                      !m_bAirplane && m_nIfaces > 0, &m_Pal);
+
+        if (m_szBanner[0])
+        {
+            RECT rcBanner = { Sc(20), Sc(52), prc->right - Sc(20), Sc(52) + Sc(24) };
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            DrawTextW(hdc, m_szBanner, -1, &rcBanner, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYNETROW &row = m_Rows[i];
+            BOOL bExpanded = ((int)i == m_iSel);
+            BOOL bHot = ((int)i == m_iHot);
+            BOOL bTwoLines = row.bConnected || bExpanded;
+            int nHeadH = bTwoLines ? Sc(60) : Sc(48);
+            int cyMid;
+            COLORREF crRow = m_Pal.PanelBg;
+            RECT rcIcon;
+            RECT rcName;
+            UINT nWifi;
+
+            if (row.nType != 2 || IsRectEmpty(&row.rc))
+                continue;
+
+            if (bExpanded || bHot)
+            {
+                crRow = TfyMix(m_Pal.PanelBg, m_Pal.HotFill, bExpanded ? 90 : 130);
+                TfyFillRound(hdc, &row.rc, Sc(4), crRow, m_Pal.PanelBg);
+            }
+            if (bExpanded)
+            {
+                RECT rcBar = { row.rc.left, row.rc.top + Sc(14), row.rc.left + Sc(3), row.rc.bottom - Sc(14) };
+                TfyFillRound(hdc, &rcBar, Sc(1), m_Pal.AccentBg, crRow);
+            }
+
+            cyMid = row.rc.top + nHeadH / 2;
+            SetRect(&rcIcon, row.rc.left + Sc(12), cyMid - Sc(10), row.rc.left + Sc(32), cyMid + Sc(10));
+            nWifi = row.nSignal >= 75 ? IDI_FLU_WIFI1 :
+                    row.nSignal >= 50 ? IDI_FLU_WIFI2 :
+                    row.nSignal >= 25 ? IDI_FLU_WIFI3 : IDI_FLU_WIFI4;
+            TfyDrawFluent(hdc, &rcIcon, nWifi);
+            if (row.bSecure)
+            {
+                RECT rcLock = { rcIcon.right - Sc(7), rcIcon.bottom - Sc(9), rcIcon.right + Sc(3), rcIcon.bottom + Sc(1) };
+                TfyDrawFluent(hdc, &rcLock, IDI_FLU_LOCK);
+            }
+
+            SetRect(&rcName, row.rc.left + Sc(44), row.rc.top, row.bConnected ? row.rcInfo.left - Sc(8) : row.rc.right - Sc(12),
+                    row.rc.top + nHeadH);
+            SelectObject(hdc, m_hFontRow);
+            SetTextColor(hdc, m_Pal.PanelText);
+            if (bTwoLines)
+            {
+                RECT rcStatus = rcName;
+                LPCWSTR pszStatus = row.szStatus;
+
+                rcName.top = row.rc.top + Sc(10);
+                rcName.bottom = cyMid + Sc(1);
+                rcStatus.top = cyMid + Sc(1);
+                rcStatus.bottom = cyMid + Sc(20);
+                DrawTextW(hdc, row.szName, -1, &rcName, DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS | DT_NOPREFIX);
+                if (row.bConnected && (!pszStatus[0] || !wcsncmp(pszStatus, L"Connected", 9)))
+                    pszStatus = row.bSecure ? L"Connected, secured" : L"Connected";
+                else if (!pszStatus[0])
+                    pszStatus = row.bSecure ? (IsEnterprise(row) ? L"Secured (enterprise)" : L"Secured") : L"Open";
+                SelectObject(hdc, m_hFontSmall);
+                SetTextColor(hdc, m_Pal.DimText);
+                DrawTextW(hdc, pszStatus, -1, &rcStatus, DT_SINGLELINE | DT_TOP | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            else
+            {
+                DrawTextW(hdc, row.szName, -1, &rcName, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+
+            if (row.bConnected)
+                DrawInfoButton(hdc, &row.rcInfo, bHot && m_iHotBtn == 5, crRow);
+
+            if (!bExpanded)
+                continue;
+            if (m_bPassMode)
+            {
+                RECT rcPrompt = { row.rcEdit.left, row.rc.top + nHeadH, row.rcEdit.right, row.rcEdit.top };
+                RECT rcEditFrame = row.rcEdit;
+
+                SelectObject(hdc, m_hFontSmall);
+                SetTextColor(hdc, m_Pal.PanelText);
+                DrawTextW(hdc, L"Enter the network security key", -1, &rcPrompt, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                TfyFillRound(hdc, &rcEditFrame, Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 70), crRow);
+                InflateRect(&rcEditFrame, -1, -1);
+                TfyFillRound(hdc, &rcEditFrame, Sc(3), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 20),
+                             TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 70));
+                DrawButton(hdc, &row.rcButton, L"Next", m_iHotBtn == 1, TRUE);
+                DrawButton(hdc, &row.rcButton2, L"Cancel", m_iHotBtn == 2, FALSE);
+            }
+            else
+            {
+                if (!row.bConnected)
+                    DrawCheck(hdc, &row.rcCheck, m_bAutoConnect, L"Connect automatically", m_iHotBtn == 3);
+                DrawButton(hdc, &row.rcButton, row.bConnected ? L"Disconnect" : L"Connect",
+                           m_iHotBtn == 1, !row.bConnected);
+            }
+        }
+
+        if (m_bWlanLoading)
+        {
+            DrawLoadingSpinner(hdc);
+        }
+        else if (m_nIfaces == 0)
+        {
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            DrawTextW(hdc, L"No Wi-Fi adapter was found", -1, &m_rcWlanArea,
+                      DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+        else if (m_bWifiOn && !m_bAirplane)
+        {
+            BOOL bAny = FALSE;
+
+            for (SIZE_T i = 0; i < m_Rows.GetCount() && !bAny; i++)
+                bAny = (m_Rows[i].nType == 2);
+            if (!bAny && !m_bScanning)
+            {
+                SelectObject(hdc, m_hFontSmall);
+                SetTextColor(hdc, m_Pal.DimText);
+                DrawTextW(hdc, L"No Wi-Fi networks found", -1, &m_rcWlanArea,
+                          DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            }
+        }
+
+        {
+            RECT rcSep = { 0, m_yFooter, prc->right, m_yFooter + 1 };
+            HBRUSH hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.Border, 140));
+            RECT rcLinkText = m_rcLink;
+            RECT rcRefreshIcon = { m_rcRefresh.left + Sc(8), m_rcRefresh.top + Sc(8),
+                                   m_rcRefresh.right - Sc(8), m_rcRefresh.bottom - Sc(8) };
+
+            FillRect(hdc, &rcSep, hbrSep);
+            DeleteObject(hbrSep);
+            if (m_iHot == TFY_NETHIT_LINK)
+                TfyFillRound(hdc, &m_rcLink, Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24), m_Pal.PanelBg);
+            rcLinkText.left += Sc(4);
+            SelectObject(hdc, m_hFontRow);
+            SetTextColor(hdc, m_Pal.PanelText);
+            DrawTextW(hdc, L"More Wi-Fi settings", -1, &rcLinkText, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            if (m_nIfaces > 0)
+            {
+                if (m_iHot == TFY_NETHIT_REFRESH)
+                    TfyFillRound(hdc, &m_rcRefresh, Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24), m_Pal.PanelBg);
+                TfyDrawFluent(hdc, &rcRefreshIcon, IDI_FLU_REFRESH);
+            }
+        }
+        SelectObject(hdc, hFontOld);
+    }
+
+    VOID DrawLock(HDC hdc, int x, int y, COLORREF cr)
+    {
+        HPEN hPen = CreatePen(PS_SOLID, Sc(1), cr);
+        HBRUSH hbr = CreateSolidBrush(cr);
+        HGDIOBJ hOldPen = SelectObject(hdc, hPen);
+        HGDIOBJ hOldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Arc(hdc, x + Sc(2), y, x + Sc(8), y + Sc(7), x + Sc(8), y + Sc(4), x + Sc(2), y + Sc(4));
+        SelectObject(hdc, hbr);
+        RECT rcBody = { x, y + Sc(4), x + Sc(10), y + Sc(11) };
+        FillRect(hdc, &rcBody, hbr);
+        SelectObject(hdc, hOldBrush);
+        SelectObject(hdc, hOldPen);
+        DeleteObject(hbr);
+        DeleteObject(hPen);
+    }
+
+    VOID DrawButton(HDC hdc, const RECT *prc, LPCWSTR pszText, BOOL bHot, BOOL bPrimary)
+    {
+        TfyDrawThemeButton(m_hFlyoutButtonTheme, hdc, prc, (bPrimary ? 4 : 0) + (bHot ? 2 : 1), &m_Pal);
+        HGDIOBJ hOld = SelectObject(hdc, m_hFont);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, pszText, -1, (LPRECT)prc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        SelectObject(hdc, hOld);
+    }
+
+    VOID DrawCheck(HDC hdc, const RECT *prc, BOOL bChecked, LPCWSTR pszText, BOOL bHot)
+    {
+        int cy = (prc->top + prc->bottom) / 2;
+        RECT rcBox = { prc->left, cy - Sc(7), prc->left + Sc(14), cy + Sc(7) };
+        HBRUSH hbrBox = CreateSolidBrush(bChecked ? m_Pal.HotBorder : m_Pal.PanelBg);
+        FillRect(hdc, &rcBox, hbrBox);
+        DeleteObject(hbrBox);
+        HBRUSH hbrEdge = CreateSolidBrush(bHot ? m_Pal.PanelText : m_Pal.DimText);
+        FrameRect(hdc, &rcBox, hbrEdge);
+        DeleteObject(hbrEdge);
+        if (bChecked)
+        {
+            HPEN hPen = CreatePen(PS_SOLID, Sc(2), RGB(255, 255, 255));
+            HGDIOBJ hOldPen = SelectObject(hdc, hPen);
+            MoveToEx(hdc, rcBox.left + Sc(3), cy, NULL);
+            LineTo(hdc, rcBox.left + Sc(6), cy + Sc(3));
+            LineTo(hdc, rcBox.right - Sc(3), cy - Sc(4));
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hPen);
+        }
+        RECT rcText = { rcBox.right + Sc(8), prc->top, prc->right, prc->bottom };
+        HGDIOBJ hOld = SelectObject(hdc, m_hFontSmall);
+        SetTextColor(hdc, m_Pal.PanelText);
+        DrawTextW(hdc, pszText, -1, &rcText, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(hdc, hOld);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        GetClientRect(&rc);
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        SetBkMode(hdcMem, TRANSPARENT);
+        if (m_bWifiPage)
+        {
+            PaintWifiPage(hdcMem, &rc);
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+            SelectObject(hdcMem, hbmOld);
+            DeleteObject(hbm);
+            DeleteDC(hdcMem);
+            EndPaint(&ps);
+            return 0;
+        }
+        HGDIOBJ hFontOld = SelectObject(hdcMem, m_hFontPaneTitle);
+        RECT rcTitle = { m_bBack ? m_rcBack.right + Sc(8) : Sc(26), Sc(22), m_rcRefresh.left - Sc(6), Sc(68) };
+        if (m_bBack)
+        {
+            RECT rcArrow = { m_rcBack.left + Sc(8), m_rcBack.top + Sc(8), m_rcBack.right - Sc(8), m_rcBack.bottom - Sc(8) };
+
+            if (m_iHot == TFY_NETHIT_BACK)
+            {
+                HBRUSH hbrBack = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24));
+                FillRect(hdcMem, &m_rcBack, hbrBack);
+                DeleteObject(hbrBack);
+            }
+            TfyDrawFluent(hdcMem, &rcArrow, IDI_FLU_ARROWLEFT);
+        }
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        DrawTextW(hdcMem, L"Networks", -1, &rcTitle,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (m_nIfaces > 0)
+        {
+            if (m_iHot == TFY_NETHIT_REFRESH)
+            {
+                HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+                FillRect(hdcMem, &m_rcRefresh, hbrHot);
+                DeleteObject(hbrHot);
+            }
+            RECT rcIcon = { m_rcRefresh.left + Sc(3), m_rcRefresh.top + Sc(3),
+                            m_rcRefresh.right - Sc(3), m_rcRefresh.bottom - Sc(3) };
+            TfyDrawFluent(hdcMem, &rcIcon, IDI_FLU_REFRESH);
+        }
+        if (m_szBanner[0])
+        {
+            RECT rcBanner = { Sc(26), Sc(80), rc.right - Sc(26), Sc(100) };
+            SelectObject(hdcMem, m_hFontSmall);
+            SetTextColor(hdcMem, m_Pal.DimText);
+            DrawTextW(hdcMem, m_szBanner, -1, &rcBanner,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        if (m_nIfaces > 0)
+        {
+            DrawToggle(hdcMem, &m_rcAirplane, L"Airplane mode", m_bAirplane,
+                       m_iHot == TFY_NETHIT_AIRPLANE, TRUE, IDI_FLU_AIRPLANE, TRUE);
+            DrawToggle(hdcMem, &m_rcWifi, L"Wi-Fi", m_bWifiOn && !m_bAirplane,
+                       m_iHot == TFY_NETHIT_WIFI, !m_bAirplane, WifiToggleIcon(), TRUE);
+        }
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYNETROW &row = m_Rows[i];
+            RECT rcRow = row.rc;
+            if (IsRectEmpty(&rcRow))
+                continue;
+            if (row.nType == 3)
+            {
+                RECT rcSep = { rcRow.left + Sc(8), rcRow.top, rcRow.right - Sc(8), rcRow.top + 1 };
+                HBRUSH hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.Border, 140));
+                FillRect(hdcMem, &rcSep, hbrSep);
+                DeleteObject(hbrSep);
+                RECT rcSec = { rcRow.left + Sc(10), rcRow.top + Sc(6),
+                               rcRow.right - Sc(8), rcRow.bottom };
+                SelectObject(hdcMem, m_hFontSmall);
+                SetTextColor(hdcMem, m_Pal.DimText);
+                DrawTextW(hdcMem, row.szName, -1, &rcSec,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                continue;
+            }
+            BOOL bExpanded = (row.nType == 2 && (int)i == m_iSel);
+            if ((int)i == m_iHot || bExpanded)
+            {
+                HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, bExpanded ? 90 : 130));
+                FillRect(hdcMem, &rcRow, hbrHot);
+                DeleteObject(hbrHot);
+            }
+            int nHeadH = (row.nType == 2) ? Sc(40) : Sc(46);
+            int cyMid = rcRow.top + nHeadH / 2;
+            RECT rcNetIcon = { rcRow.left + Sc(8), cyMid - Sc(12),
+                               rcRow.left + Sc(32), cyMid + Sc(12) };
+            if (row.nType == 2)
+            {
+                UINT nWifi = row.nSignal >= 75 ? IDI_FLU_WIFI1 :
+                             row.nSignal >= 50 ? IDI_FLU_WIFI2 :
+                             row.nSignal >= 25 ? IDI_FLU_WIFI3 : IDI_FLU_WIFI4;
+                TfyDrawFluent(hdcMem, &rcNetIcon, nWifi);
+                if (row.bSecure)
+                {
+                    RECT rcLock = { rcRow.right - Sc(26), cyMid - Sc(7),
+                                    rcRow.right - Sc(12), cyMid + Sc(7) };
+                    TfyDrawFluent(hdcMem, &rcLock, IDI_FLU_LOCK);
+                }
+            }
+            else
+            {
+                TfyDrawFluent(hdcMem, &rcNetIcon,
+                              row.bConnected ? IDI_FLU_NETADAPTER : IDI_FLU_GLOBE);
+            }
+            RECT rcText = { rcRow.left + Sc(40), rcRow.top + Sc(4), rcRow.right - Sc(8), cyMid + Sc(4) };
+            SelectObject(hdcMem, m_hFont);
+            SetTextColor(hdcMem, m_Pal.PanelText);
+            if (row.nType == 2)
+            {
+                RECT rcSsid = { rcRow.left + Sc(40), rcRow.top, rcRow.right - ((row.szStatus[0] && row.bSecure) ? Sc(108) : Sc(86)), rcRow.top + nHeadH };
+                if (bExpanded)
+                {
+                    rcSsid.bottom = rcRow.top + nHeadH / 2 + Sc(3);
+                    rcSsid.top = rcRow.top + Sc(2);
+                }
+                DrawTextW(hdcMem, row.szName, -1, &rcSsid,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                if (bExpanded)
+                {
+                    RECT rcInfo = { rcSsid.left, rcSsid.bottom, rcRow.right - Sc(8), rcRow.top + nHeadH };
+                    SelectObject(hdcMem, m_hFontSmall);
+                    SetTextColor(hdcMem, m_Pal.DimText);
+                    LPCWSTR pszInfo = row.bSecure ? (IsEnterprise(row) ? L"Secured (enterprise)" : L"Secured") : L"Open";
+                    DrawTextW(hdcMem, pszInfo, -1, &rcInfo,
+                              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                }
+                if (row.szStatus[0])
+                {
+                    RECT rcTag = { rcRow.right - (row.bSecure ? Sc(106) : Sc(84)), rcRow.top, rcRow.right - (row.bSecure ? Sc(30) : Sc(8)), rcRow.top + nHeadH };
+                    SelectObject(hdcMem, m_hFontSmall);
+                    SetTextColor(hdcMem, row.bConnected ? m_Pal.HotBorder : m_Pal.DimText);
+                    DrawTextW(hdcMem, row.szStatus, -1, &rcTag,
+                              DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS | DT_NOPREFIX);
+                }
+                if (bExpanded)
+                {
+                    if (m_bPassMode)
+                    {
+                        RECT rcPrompt = { rcRow.left + Sc(40), rcRow.top + nHeadH, rcRow.right - Sc(8), rcRow.top + nHeadH + Sc(22) };
+                        SelectObject(hdcMem, m_hFontSmall);
+                        SetTextColor(hdcMem, m_Pal.PanelText);
+                        DrawTextW(hdcMem, L"Enter the network security key", -1, &rcPrompt,
+                                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                        HBRUSH hbrEditEdge = CreateSolidBrush(m_Pal.DimText);
+                        RECT rcEditFrame = row.rcEdit;
+                        InflateRect(&rcEditFrame, 1, 1);
+                        FrameRect(hdcMem, &rcEditFrame, hbrEditEdge);
+                        DeleteObject(hbrEditEdge);
+                        DrawButton(hdcMem, &row.rcButton, L"Next", m_iHotBtn == 1, TRUE);
+                        DrawButton(hdcMem, &row.rcButton2, L"Cancel", m_iHotBtn == 2, FALSE);
+                    }
+                    else
+                    {
+                        if (!row.bConnected)
+                            DrawCheck(hdcMem, &row.rcCheck, m_bAutoConnect, L"Connect automatically", m_iHotBtn == 3);
+                        DrawButton(hdcMem, &row.rcButton, row.bConnected ? L"Disconnect" : L"Connect",
+                                   m_iHotBtn == 1, !row.bConnected);
+                    }
+                }
+            }
+            else
+            {
+                if (!row.szStatus[0])
+                    SetRect(&rcText, rcText.left, rcRow.top, rcText.right, rcRow.top + nHeadH);
+                DrawTextW(hdcMem, row.szName, -1, &rcText,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                RECT rcStatus = { rcText.left, cyMid + Sc(2), rcText.right, rcRow.bottom - Sc(2) };
+                SelectObject(hdcMem, m_hFontSmall);
+                SetTextColor(hdcMem, row.bConnected ? m_Pal.HotBorder : m_Pal.DimText);
+                DrawTextW(hdcMem, row.szStatus, -1, &rcStatus,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+        }
+        if (m_bWlanLoading)
+        {
+            DrawLoadingSpinner(hdcMem);
+        }
+        else if (m_Rows.GetCount() == 0 && !m_szBanner[0])
+        {
+            RECT rcNone = { Sc(26), Sc(84), rc.right - Sc(26), Sc(114) };
+            SelectObject(hdcMem, m_hFontSmall);
+            SetTextColor(hdcMem, m_Pal.DimText);
+            DrawTextW(hdcMem, L"No networks found", -1, &rcNone,
+                      DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
+        {
+            int cyLink = (m_rcLink.top + m_rcLink.bottom) / 2;
+            RECT rcGear = { m_rcLink.left, cyLink - Sc(8),
+                            m_rcLink.left + Sc(16), cyLink + Sc(8) };
+            TfyDrawFluent(hdcMem, &rcGear, IDI_FLU_SETTINGS);
+        }
+        RECT rcLinkText = m_rcLink;
+        rcLinkText.left += Sc(22);
+        SelectObject(hdcMem, m_hFontSmall);
+        SetTextColor(hdcMem, m_iHot == TFY_NETHIT_LINK ? m_Pal.HotBorder : m_Pal.DimText);
+        DrawTextW(hdcMem, L"Network & internet settings", -1, &rcLinkText,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        {
+            RECT rcEdge = { 0, 0, 1, rc.bottom };
+            HBRUSH hbrEdge = CreateSolidBrush(m_Pal.Border);
+            FillRect(hdcMem, &rcEdge, hbrEdge);
+            DeleteObject(hbrEdge);
+        }
+        SelectObject(hdcMem, hFontOld);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnCtlColorEdit(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        HDC hdc = (HDC)wParam;
+        COLORREF crBg = TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 20);
+        SetBkColor(hdc, crBg);
+        SetTextColor(hdc, m_Pal.PanelText);
+        if (m_hbrEdit)
+            DeleteObject(m_hbrEdit);
+        m_hbrEdit = CreateSolidBrush(crBg);
+        return (LRESULT)m_hbrEdit;
+    }
+
+    LRESULT OnWlanNotify(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if ((DWORD)lParam == WLAN_NOTIFICATION_SOURCE_MSM)
+        {
+            if ((int)wParam == wlan_notification_msm_radio_state_change)
+            {
+                EndScan();
+                TfyQueueNetworkRefresh(m_hWnd, FALSE);
+            }
+            return 0;
+        }
+        switch ((int)wParam)
+        {
+            case wlan_notification_acm_scan_complete:
+            case wlan_notification_acm_scan_fail:
+                EndScan();
+                TfyQueueNetworkRefresh(m_hWnd, FALSE);
+                break;
+            case wlan_notification_acm_connection_start:
+                m_bConnecting = TRUE;
+                break;
+            case wlan_notification_acm_connection_complete:
+                m_bConnecting = FALSE;
+                KillTimer(TFY_TIMER_POLL);
+                m_szBanner[0] = 0;
+                TfyQueueNetworkRefresh(m_hWnd, FALSE);
+                break;
+            case wlan_notification_acm_connection_attempt_fail:
+                m_bConnecting = FALSE;
+                KillTimer(TFY_TIMER_POLL);
+                for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+                {
+                    if (m_Rows[i].nType == 2 && m_szSelName[0] && !wcscmp(m_Rows[i].szName, m_szSelName) &&
+                        !m_Rows[i].bConnected)
+                        StringCchCopyW(m_Rows[i].szStatus, _countof(m_Rows[i].szStatus), L"Can't connect");
+                }
+                Relayout();
+                break;
+            case wlan_notification_acm_disconnected:
+            case wlan_notification_acm_interface_arrival:
+            case wlan_notification_acm_interface_removal:
+            case wlan_notification_acm_profile_change:
+                TfyQueueNetworkRefresh(m_hWnd, FALSE);
+                break;
+        }
+        return 0;
+    }
+
+    LRESULT OnNetRefresh(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_SPIN);
+        m_bWlanLoading = FALSE;
+        if (!wParam && !m_bScanPending)
+            EndScan();
+        if (wParam)
+            m_bScanPending = FALSE;
+        Rebuild();
+        if (m_bConnecting)
+        {
+            for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+            {
+                if (m_Rows[i].nType == 2 && m_Rows[i].bConnected)
+                {
+                    m_bConnecting = FALSE;
+                    KillTimer(TFY_TIMER_POLL);
+                    break;
+                }
+            }
+        }
+        Relayout();
+        if (wParam)
+            SetTimer(TFY_TIMER_RESCAN, 1500, NULL);
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == TFY_TIMER_SPIN)
+        {
+            InvalidateRect(&m_rcWlanArea, FALSE);
+            return 0;
+        }
+        if (wParam == TFY_TIMER_RESCAN)
+        {
+            KillTimer(TFY_TIMER_RESCAN);
+            if (m_bScanPending)
+            {
+                if (TfyQueueNetworkRefresh(m_hWnd, TRUE))
+                {
+                    m_bScanPending = FALSE;
+                    SetTimer(TFY_TIMER_SCAN, 8000, NULL);
+                }
+                else
+                    SetTimer(TFY_TIMER_RESCAN, 100, NULL);
+            }
+            else if (m_bScanning && !TfyQueueNetworkRefresh(m_hWnd, FALSE))
+                SetTimer(TFY_TIMER_RESCAN, 100, NULL);
+            return 0;
+        }
+        if (wParam == TFY_TIMER_SCAN)
+        {
+            EndScan();
+            TfyQueueNetworkRefresh(m_hWnd, FALSE);
+            return 0;
+        }
+        if (wParam == TFY_TIMER_POLL)
+        {
+            TfyQueueNetworkRefresh(m_hWnd, FALSE);
+            return 0;
+        }
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        return 0;
+    }
+
+    int HitTest(POINT pt, int *pnBtn)
+    {
+        *pnBtn = 0;
+        if ((m_bBack || m_bWifiPage) && PtInRect(&m_rcBack, pt))
+            return TFY_NETHIT_BACK;
+        if (m_nIfaces > 0 && PtInRect(&m_rcRefresh, pt))
+            return TFY_NETHIT_REFRESH;
+        if (m_nIfaces > 0 && PtInRect(&m_rcAirplane, pt))
+            return TFY_NETHIT_AIRPLANE;
+        if (m_nIfaces > 0 && PtInRect(&m_rcWifi, pt))
+            return TFY_NETHIT_WIFI;
+        if (PtInRect(&m_rcLink, pt))
+            return TFY_NETHIT_LINK;
+        for (SIZE_T i = 0; i < m_Rows.GetCount(); i++)
+        {
+            TFYNETROW &row = m_Rows[i];
+            if (!PtInRect(&row.rc, pt))
+                continue;
+            if (row.nType == 3)
+                return TFY_NETHIT_NONE;
+            if (m_bWifiPage && PtInRect(&row.rcInfo, pt))
+            {
+                *pnBtn = 5;
+                return (int)i;
+            }
+            if ((int)i == m_iSel && row.nType == 2)
+            {
+                if (PtInRect(&row.rcButton, pt)) *pnBtn = 1;
+                else if (PtInRect(&row.rcButton2, pt)) *pnBtn = 2;
+                else if (PtInRect(&row.rcCheck, pt)) *pnBtn = 3;
+                else if (PtInRect(&row.rcEdit, pt)) *pnBtn = 4;
+            }
+            return (int)i;
+        }
+        return TFY_NETHIT_NONE;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int nBtn = 0;
+        int iHot = HitTest(pt, &nBtn);
+        if (iHot != m_iHot || nBtn != m_iHotBtn)
+        {
+            m_iHot = iHot;
+            m_iHotBtn = nBtn;
+            InvalidateRect(NULL, FALSE);
+        }
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        int nOld = m_nWlanScroll;
+
+        m_nWlanScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        if (m_nWlanScroll < 0)
+            m_nWlanScroll = 0;
+        Relayout();
+        if (m_nWlanScroll != nOld)
+            InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot != TFY_NETHIT_NONE || m_iHotBtn)
+        {
+            m_iHot = TFY_NETHIT_NONE;
+            m_iHotBtn = 0;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int nBtn = 0;
+        int i = HitTest(pt, &nBtn);
+        if (i == TFY_NETHIT_BACK)
+        {
+            HWND hwndOwner = ::GetWindow(m_hWnd, GW_OWNER);
+            RECT rcAnchor = m_rcAnchor;
+
+            HandOffFlyout(m_hWnd);
+            FadeOut();
+            TrayQuickSettings_Toggle(hwndOwner, &rcAnchor);
+            return 0;
+        }
+        if (i == TFY_NETHIT_LINK)
+        {
+            m_bLaunching = TRUE;
+            ShellExecuteW(NULL, NULL, m_bWifiPage ? L"ms-settings:network-wifi" : L"ms-settings:network",
+                          NULL, NULL, SW_SHOWNORMAL);
+            m_bLaunching = FALSE;
+            FadeOut();
+            return 0;
+        }
+        if (i == TFY_NETHIT_REFRESH)
+        {
+            if (!m_bScanning)
+            {
+                StartScan();
+                Relayout();
+            }
+            return 0;
+        }
+        if (i == TFY_NETHIT_AIRPLANE)
+        {
+            ToggleAirplane();
+            return 0;
+        }
+        if (i == TFY_NETHIT_WIFI)
+        {
+            if (!m_bAirplane)
+                ToggleWifi();
+            return 0;
+        }
+        if (i < 0)
+            return 0;
+        TFYNETROW &row = m_Rows[i];
+        if (nBtn == 5)
+        {
+            m_bLaunching = TRUE;
+            ShellExecuteW(NULL, NULL, L"ms-settings:network-wifi", NULL, NULL, SW_SHOWNORMAL);
+            m_bLaunching = FALSE;
+            FadeOut();
+            return 0;
+        }
+        if (row.nType != 2)
+        {
+            m_bLaunching = TRUE;
+            ShellExecuteW(NULL, NULL, L"ms-settings:network-ethernet", NULL, NULL, SW_SHOWNORMAL);
+            m_bLaunching = FALSE;
+            FadeOut();
+            return 0;
+        }
+        if (i == m_iSel)
+        {
+            if (nBtn == 1)
+            {
+                if (m_bPassMode)
+                    SubmitPassword();
+                else if (row.bConnected)
+                    DisconnectRow(i);
+                else
+                    ConnectRow(i, NULL);
+                return 0;
+            }
+            if (nBtn == 2)
+            {
+                CancelPassword();
+                return 0;
+            }
+            if (nBtn == 3)
+            {
+                m_bAutoConnect = !m_bAutoConnect;
+                InvalidateRect(NULL, FALSE);
+                return 0;
+            }
+            if (nBtn == 4)
+            {
+                if (m_hwndEdit)
+                    ::SetFocus(m_hwndEdit);
+                return 0;
+            }
+        }
+        SelectRow(i);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE && !m_bLaunching)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+        {
+            if (m_bPassMode)
+                CancelPassword();
+            else
+                FadeOut();
+            return 0;
+        }
+        if (wParam == VK_RETURN)
+        {
+            if (m_bPassMode)
+                SubmitPassword();
+            else if (m_iSel >= 0 && m_Rows[m_iSel].nType == 2)
+            {
+                if (m_Rows[m_iSel].bConnected)
+                    DisconnectRow(m_iSel);
+                else
+                    ConnectRow(m_iSel, NULL);
+            }
+            return 0;
+        }
+        if (wParam == VK_DOWN || wParam == VK_UP)
+        {
+            int n = (int)m_Rows.GetCount();
+            if (n == 0)
+                return 0;
+            int i = m_iSel;
+            for (int k = 0; k < n; k++)
+            {
+                i = (wParam == VK_DOWN) ? i + 1 : i - 1;
+                if (i < 0) i = n - 1;
+                if (i >= n) i = 0;
+                if (m_Rows[i].nType == 2)
+                {
+                    if (i != m_iSel)
+                        SelectRow(i);
+                    break;
+                }
+            }
+            return 0;
+        }
+        if (wParam == VK_F5 && !m_bScanning)
+        {
+            StartScan();
+            Relayout();
+        }
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        InterlockedCompareExchangePointer(&g_NetRefreshWindow, NULL, (PVOID)m_hWnd);
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_SCAN);
+        KillTimer(TFY_TIMER_POLL);
+        KillTimer(TFY_TIMER_RESCAN);
+        KillTimer(TFY_TIMER_SPIN);
+        UnloadWlan();
+        if (m_hwndEdit)
+        {
+            ::DestroyWindow(m_hwndEdit);
+            m_hwndEdit = NULL;
+        }
+        if (m_hbrEdit) { DeleteObject(m_hbrEdit); m_hbrEdit = NULL; }
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = NULL; }
+        if (m_hFontPaneTitle) { DeleteObject(m_hFontPaneTitle); m_hFontPaneTitle = NULL; }
+        if (m_hFontRow) { DeleteObject(m_hFontRow); m_hFontRow = NULL; }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayNetworkWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_CTLCOLOREDIT, OnCtlColorEdit)
+        MESSAGE_HANDLER(TFY_WM_WLANNOTIFY, OnWlanNotify)
+        MESSAGE_HANDLER(TFY_WM_NETREFRESH, OnNetRefresh)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayNetworkWnd *g_pTrayNetwork = NULL;
+static ULONGLONG g_NetDismissTick = 0;
+
+void CTrayNetworkWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayNetwork == this)
+        g_pTrayNetwork = NULL;
+    delete this;
+}
+
+VOID CTrayNetworkWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_NetDismissTick = m_AnimT0;
+    KillTimer(TFY_TIMER_RESCAN);
+    KillTimer(TFY_TIMER_SPIN);
+    HideEdit();
+}
+
+static BOOL TfyQsWlanQuery(BOOL *pbHasWlan, BOOL *pbRadioOn);
+
+static VOID
+TfyNetworkToggle(HWND hwndOwner, const RECT *prcAnchor, BOOL bWiredSettings)
+{
+    BOOL bHasWlan, bRadioOn;
+
+    if (GetTickCount64() - g_NetDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+    if (g_pTrayNetwork && g_pTrayNetwork->IsWindow())
+    {
+        if (g_pTrayNetwork->IsWindowVisible() &&
+            g_pTrayNetwork->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayNetwork->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayNetwork->m_hWnd);
+        g_pTrayNetwork = NULL;
+    }
+    if (bWiredSettings && IsThemeActive())
+    {
+        TfyQsWlanQuery(&bHasWlan, &bRadioOn);
+        if (!bHasWlan)
+        {
+            ShellExecuteW(NULL, NULL, L"ms-settings:network-ethernet", NULL, NULL, SW_SHOWNORMAL);
+            return;
+        }
+    }
+    CTrayNetworkWnd *pNetwork = new CTrayNetworkWnd();
+    if (!pNetwork)
+        return;
+    if (!pNetwork->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pNetwork;
+        return;
+    }
+    g_pTrayNetwork = pNetwork;
+    pNetwork->Toggle(hwndOwner, prcAnchor);
+}
+
+VOID TrayNetwork_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    TfyNetworkToggle(hwndOwner, prcAnchor, TRUE);
+}
+
+typedef DWORD (WINAPI *PFN_POWERGETACTIVESCHEME)(HKEY, GUID **);
+typedef DWORD (WINAPI *PFN_POWERSETACTIVESCHEME)(HKEY, const GUID *);
+
+static HMODULE g_hPowrProf = NULL;
+static PFN_POWERGETACTIVESCHEME g_pfnPowerGetActiveScheme = NULL;
+static PFN_POWERSETACTIVESCHEME g_pfnPowerSetActiveScheme = NULL;
+
+static const struct
+{
+    GUID Scheme;
+    LPCWSTR pszName;
+} g_TfyPowerModes[] =
+{
+    { { 0xA1841308, 0x3541, 0x4FAB, { 0xBC, 0x81, 0xF7, 0x15, 0x56, 0xF2, 0x0B, 0x4A } }, L"Best power efficiency" },
+    { { 0x381B4222, 0xF694, 0x41F0, { 0x96, 0x85, 0xFF, 0x5B, 0xB2, 0x60, 0xDF, 0x2E } }, L"Balanced" },
+    { { 0x8C5E7FDA, 0xE8BF, 0x4A96, { 0x9A, 0x85, 0xA6, 0xE2, 0x3A, 0x8C, 0x63, 0x5C } }, L"Best performance" }
+};
+
+static BOOL TfyLoadPowrProf()
+{
+    if (g_hPowrProf)
+        return g_pfnPowerGetActiveScheme && g_pfnPowerSetActiveScheme;
+    g_hPowrProf = LoadLibraryW(L"powrprof.dll");
+    if (!g_hPowrProf)
+        return FALSE;
+    g_pfnPowerGetActiveScheme = (PFN_POWERGETACTIVESCHEME)GetProcAddress(g_hPowrProf, "PowerGetActiveScheme");
+    g_pfnPowerSetActiveScheme = (PFN_POWERSETACTIVESCHEME)GetProcAddress(g_hPowrProf, "PowerSetActiveScheme");
+    return g_pfnPowerGetActiveScheme && g_pfnPowerSetActiveScheme;
+}
+
+static int
+TfyActivePowerMode(VOID)
+{
+    GUID *pScheme = NULL;
+    int iMode = -1;
+
+    if (!TfyLoadPowrProf() || g_pfnPowerGetActiveScheme(NULL, &pScheme) != ERROR_SUCCESS || !pScheme)
+        return -1;
+    for (int i = 0; i < (int)_countof(g_TfyPowerModes); i++)
+    {
+        if (IsEqualGUID(*pScheme, g_TfyPowerModes[i].Scheme))
+            iMode = i;
+    }
+    LocalFree(pScheme);
+    return iMode;
+}
+
+#define TFY_PWRHIT_NONE  -1
+#define TFY_PWRHIT_LINK  -2
+
+class CTrayPowerWnd :
+    public CWindowImpl<CTrayPowerWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayPowerFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HFONT m_hFontHeader;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    int m_iActive;
+    SYSTEM_POWER_STATUS m_sps;
+    int m_iHot;
+    BOOL m_bTracking;
+    SIZE m_size;
+    RECT m_rcIcon, m_rcHeader, m_rcSub, m_rcPlanLabel, m_rcLink;
+    RECT m_rcModes[_countof(g_TfyPowerModes)];
+
+    CTrayPowerWnd() : m_hFontHeader(NULL), m_hFont(NULL), m_hFontSmall(NULL),
+                      m_iActive(-1), m_iHot(TFY_PWRHIT_NONE), m_bTracking(FALSE)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_sps, sizeof(m_sps));
+        ZeroMemory(&m_size, sizeof(m_size));
+        ZeroMemory(m_rcModes, sizeof(m_rcModes));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID Build()
+    {
+        ZeroMemory(&m_sps, sizeof(m_sps));
+        if (!GetSystemPowerStatus(&m_sps))
+        {
+            m_sps.ACLineStatus = 255;
+            m_sps.BatteryFlag = 255;
+            m_sps.BatteryLifePercent = 255;
+            m_sps.BatteryLifeTime = (DWORD)-1;
+        }
+        m_iActive = TfyActivePowerMode();
+    }
+
+    BOOL HasBattery() const
+    {
+        return !(m_sps.BatteryFlag & 128) && m_sps.BatteryFlag != 255 && m_sps.BatteryLifePercent != 255;
+    }
+
+    UINT BatteryIcon() const
+    {
+        if (!HasBattery())
+            return IDI_FLU_PLUG;
+        if (m_sps.BatteryFlag & 8)
+            return IDI_FLU_BATTCHG;
+        int p = m_sps.BatteryLifePercent;
+        if (p <= 12) return IDI_FLU_BATT0;
+        if (p <= 37) return IDI_FLU_BATT1;
+        if (p <= 62) return IDI_FLU_BATT2;
+        if (p <= 87) return IDI_FLU_BATT3;
+        return IDI_FLU_BATT4;
+    }
+
+    VOID HeaderText(LPWSTR pszHeader, SIZE_T cchHeader, LPWSTR pszSub, SIZE_T cchSub) const
+    {
+        pszSub[0] = 0;
+        if (!HasBattery())
+        {
+            StringCchCopyW(pszHeader, cchHeader, L"No battery is detected");
+            StringCchCopyW(pszSub, cchSub, m_sps.ACLineStatus == 1 ? L"Plugged in" : L"");
+            return;
+        }
+        int p = m_sps.BatteryLifePercent;
+        if (m_sps.ACLineStatus == 1)
+        {
+            if (p >= 100)
+                StringCchCopyW(pszHeader, cchHeader, L"Fully charged (100%)");
+            else if (m_sps.BatteryFlag & 8)
+                StringCchPrintfW(pszHeader, cchHeader, L"%d%% available (plugged in, charging)", p);
+            else
+                StringCchPrintfW(pszHeader, cchHeader, L"%d%% available (plugged in, not charging)", p);
+        }
+        else
+        {
+            StringCchPrintfW(pszHeader, cchHeader, L"%d%% remaining", p);
+            if (m_sps.BatteryLifeTime != (DWORD)-1)
+            {
+                DWORD mins = m_sps.BatteryLifeTime / 60;
+                if (mins >= 60)
+                    StringCchPrintfW(pszSub, cchSub, L"%u hr %02u min remaining", mins / 60, mins % 60);
+                else
+                    StringCchPrintfW(pszSub, cchSub, L"%u min remaining", mins);
+            }
+        }
+    }
+
+    VOID Layout()
+    {
+        int pad = Sc(12);
+        int y = pad;
+        m_size.cx = Sc(300);
+        SetRect(&m_rcIcon, pad, y, pad + Sc(44), y + Sc(44));
+        SetRect(&m_rcHeader, pad + Sc(56), y, m_size.cx - pad, y + Sc(24));
+        SetRect(&m_rcSub, pad + Sc(56), y + Sc(24), m_size.cx - pad, y + Sc(44));
+        y += Sc(44) + Sc(12);
+        y += Sc(8);
+        SetRect(&m_rcPlanLabel, pad, y, m_size.cx - pad, y + Sc(20));
+        y += Sc(22);
+        for (UINT i = 0; i < _countof(m_rcModes); i++)
+        {
+            SetRect(&m_rcModes[i], Sc(8), y, m_size.cx - Sc(8), y + Sc(28));
+            y += Sc(28);
+        }
+        y += Sc(16);
+        SetRect(&m_rcLink, Sc(8), y, m_size.cx - Sc(8), y + Sc(26));
+        y += Sc(26) + Sc(10);
+        m_size.cy = y;
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        POINT ptRef;
+        int xPos, yPos;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFontHeader) m_hFontHeader = TfyCreateFont(13, FW_SEMIBOLD);
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+
+        Build();
+        Layout();
+
+        TfyW11Position(hwndOwner, prcAnchor, m_size, FALSE, &ptRef);
+        xPos = ptRef.x;
+        yPos = ptRef.y;
+
+        BeginFlyoutOpen(m_hWnd, xPos, yPos, m_size.cx, m_size.cy, m_Pal.PanelBg);
+        SetTimer(TFY_TIMER_TICK, 2000, NULL);
+    }
+
+    VOID FadeOut();
+
+    VOID DrawRadio(HDC hdc, const RECT *prc, BOOL bChecked, BOOL bHot)
+    {
+        RECT rcDot = { prc->left + Sc(10), (prc->top + prc->bottom) / 2 - Sc(7),
+                       prc->left + Sc(24), (prc->top + prc->bottom) / 2 + Sc(7) };
+        TFYAA aa;
+        int ss = 3;
+        HDC hdcAA = TfyAABegin(&aa, hdc, &rcDot, ss, bHot ? TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130) : m_Pal.PanelBg);
+        int w = (rcDot.right - rcDot.left) * ss;
+        int h = (rcDot.bottom - rcDot.top) * ss;
+        HPEN hpen = CreatePen(PS_SOLID, ss, bChecked ? m_Pal.AccentBg : m_Pal.DimText);
+        HGDIOBJ hpenOld = SelectObject(hdcAA, hpen);
+        HGDIOBJ hbrOld = SelectObject(hdcAA, GetStockObject(NULL_BRUSH));
+        Ellipse(hdcAA, ss, ss, w - ss, h - ss);
+        SelectObject(hdcAA, hbrOld);
+        SelectObject(hdcAA, hpenOld);
+        DeleteObject(hpen);
+        if (bChecked)
+        {
+            HBRUSH hbr = CreateSolidBrush(m_Pal.AccentBg);
+            hbrOld = SelectObject(hdcAA, hbr);
+            hpenOld = SelectObject(hdcAA, GetStockObject(NULL_PEN));
+            Ellipse(hdcAA, w / 2 - Sc(3) * ss, h / 2 - Sc(3) * ss, w / 2 + Sc(3) * ss, h / 2 + Sc(3) * ss);
+            SelectObject(hdcAA, hpenOld);
+            SelectObject(hdcAA, hbrOld);
+            DeleteObject(hbr);
+        }
+        TfyAAEnd(&aa, hdc);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        GetClientRect(&rc);
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ hbmOld = SelectObject(hdcMem, hbm);
+        HBRUSH hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdcMem, &rc, hbr);
+        DeleteObject(hbr);
+        TfyDrawFlyoutFrame(hdcMem, &rc, &m_Pal);
+        SetBkMode(hdcMem, TRANSPARENT);
+
+        WCHAR szHeader[128], szSub[128];
+        HeaderText(szHeader, _countof(szHeader), szSub, _countof(szSub));
+        TfyDrawFluent(hdcMem, &m_rcIcon, BatteryIcon());
+        HGDIOBJ hFontOld = SelectObject(hdcMem, m_hFontHeader);
+        SetTextColor(hdcMem, m_Pal.PanelText);
+        DrawTextW(hdcMem, szHeader, -1, &m_rcHeader, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(hdcMem, m_hFontSmall);
+        SetTextColor(hdcMem, m_Pal.DimText);
+        DrawTextW(hdcMem, szSub, -1, &m_rcSub, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        HBRUSH hbrSep = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.DimText, 90));
+        RECT rcSep = { Sc(12), m_rcIcon.bottom + Sc(12), rc.right - Sc(12), m_rcIcon.bottom + Sc(13) };
+        FillRect(hdcMem, &rcSep, hbrSep);
+
+        SelectObject(hdcMem, m_hFontSmall);
+        SetTextColor(hdcMem, m_Pal.DimText);
+        DrawTextW(hdcMem, L"Power mode", -1, &m_rcPlanLabel, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        for (UINT i = 0; i < _countof(m_rcModes); i++)
+        {
+            BOOL bHot = (m_iHot == (int)i);
+            RECT rcText = { m_rcModes[i].left + Sc(34), m_rcModes[i].top, m_rcModes[i].right - Sc(8), m_rcModes[i].bottom };
+
+            if (bHot)
+            {
+                HBRUSH hbrHot = CreateSolidBrush(TfyMix(m_Pal.PanelBg, m_Pal.HotFill, 130));
+                FillRect(hdcMem, &m_rcModes[i], hbrHot);
+                DeleteObject(hbrHot);
+            }
+            DrawRadio(hdcMem, &m_rcModes[i], m_iActive == (int)i, bHot);
+            SelectObject(hdcMem, m_hFont);
+            SetTextColor(hdcMem, m_Pal.PanelText);
+            DrawTextW(hdcMem, g_TfyPowerModes[i].pszName, -1, &rcText,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        {
+            RECT rcSep2 = { Sc(12), m_rcLink.top - Sc(9), rc.right - Sc(12), m_rcLink.top - Sc(8) };
+            FillRect(hdcMem, &rcSep2, hbrSep);
+        }
+        DeleteObject(hbrSep);
+
+        {
+            int cyLink = (m_rcLink.top + m_rcLink.bottom) / 2;
+            RECT rcGear = { m_rcLink.left + Sc(4), cyLink - Sc(8), m_rcLink.left + Sc(20), cyLink + Sc(8) };
+            TfyDrawFluent(hdcMem, &rcGear, IDI_FLU_SETTINGS);
+        }
+        RECT rcLinkText = m_rcLink;
+        rcLinkText.left += Sc(26);
+        SelectObject(hdcMem, m_hFontSmall);
+        SetTextColor(hdcMem, m_iHot == TFY_PWRHIT_LINK ? m_Pal.HotBorder : m_Pal.DimText);
+        DrawTextW(hdcMem, L"Power & battery settings", -1, &rcLinkText, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+        SelectObject(hdcMem, hFontOld);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    int HitTest(POINT pt) const
+    {
+        if (PtInRect(&m_rcLink, pt))
+            return TFY_PWRHIT_LINK;
+        for (UINT i = 0; i < _countof(m_rcModes); i++)
+        {
+            if (PtInRect(&m_rcModes[i], pt))
+                return (int)i;
+        }
+        return TFY_PWRHIT_NONE;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHot = HitTest(pt);
+        if (iHot != m_iHot)
+        {
+            m_iHot = iHot;
+            InvalidateRect(NULL, FALSE);
+        }
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot != TFY_PWRHIT_NONE)
+        {
+            m_iHot = TFY_PWRHIT_NONE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int i = HitTest(pt);
+        if (i == TFY_PWRHIT_LINK)
+        {
+            ShellExecuteW(NULL, L"open", L"ms-settings:powersleep", NULL, NULL, SW_SHOWNORMAL);
+            FadeOut();
+            return 0;
+        }
+        if (i >= 0 && i < (int)_countof(g_TfyPowerModes))
+        {
+            if (TfyLoadPowrProf() && g_pfnPowerSetActiveScheme(NULL, &g_TfyPowerModes[i].Scheme) == ERROR_SUCCESS)
+                m_iActive = i;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == TFY_TIMER_TICK)
+        {
+            SYSTEM_POWER_STATUS sps;
+            if (GetSystemPowerStatus(&sps) && memcmp(&sps, &m_sps, sizeof(sps)))
+            {
+                m_sps = sps;
+                InvalidateRect(NULL, FALSE);
+            }
+            return 0;
+        }
+        HandleFlyoutAnimation(m_hWnd, wParam);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_TICK);
+        if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = NULL; }
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayPowerWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayPowerWnd *g_pTrayPower = NULL;
+static ULONGLONG g_PowerDismissTick = 0;
+
+void CTrayPowerWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayPower == this)
+        g_pTrayPower = NULL;
+    delete this;
+}
+
+VOID CTrayPowerWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_PowerDismissTick = m_AnimT0;
+}
+
+VOID TrayPower_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_PowerDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pTrayPower && g_pTrayPower->IsWindow())
+    {
+        if (g_pTrayPower->IsWindowVisible() && g_pTrayPower->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayPower->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayPower->m_hWnd);
+        g_pTrayPower = NULL;
+    }
+
+    CTrayPowerWnd *pPower = new CTrayPowerWnd();
+    if (!pPower)
+        return;
+    if (!pPower->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pPower;
+        return;
+    }
+    g_pTrayPower = pPower;
+    pPower->Toggle(hwndOwner, prcAnchor);
+}
+
+static VOID
+TfyW11Position(HWND hwndOwner, const RECT *prcAnchor, SIZE size, BOOL bCenter, POINT *ppt)
+{
+    MONITORINFO mi;
+    RECT rcBar;
+    HWND hwndRoot = GetAncestor(hwndOwner, GA_ROOT);
+    int nGap = ShellScaleForDpi(12);
+
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromRect(prcAnchor, MONITOR_DEFAULTTONEAREST), &mi);
+    if (!hwndRoot || !::GetWindowRect(hwndRoot, &rcBar))
+        rcBar = *prcAnchor;
+
+    if (bCenter)
+        ppt->x = (prcAnchor->left + prcAnchor->right - size.cx) / 2;
+    else
+        ppt->x = mi.rcMonitor.right - nGap - size.cx;
+    if (ppt->x + size.cx > mi.rcMonitor.right - nGap)
+        ppt->x = mi.rcMonitor.right - nGap - size.cx;
+    if (ppt->x < mi.rcMonitor.left + nGap)
+        ppt->x = mi.rcMonitor.left + nGap;
+
+    if (rcBar.top > (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2)
+        ppt->y = rcBar.top - nGap - size.cy;
+    else
+        ppt->y = rcBar.bottom + nGap;
+}
+
+static HWND
+TfyFindPager(VOID)
+{
+    HWND hwnd = FindWindowW(L"Shell_TrayWnd", NULL);
+    hwnd = hwnd ? FindWindowExW(hwnd, NULL, L"TrayNotifyWnd", NULL) : NULL;
+    return hwnd ? FindWindowExW(hwnd, NULL, L"SysPager", NULL) : NULL;
+}
+
+static VOID
+TfySendIconEvent(HWND hwndPager, const TRAYICONITEM *pItem, UINT uMsg)
+{
+    TRAYICONEVENT Event;
+
+    Event.hWnd = pItem->hWnd;
+    Event.uID = pItem->uID;
+    Event.uMsg = uMsg;
+    ::SendMessageW(hwndPager, TNWM_TRAYICONEVENT, 0, (LPARAM)&Event);
+}
+
+#define TFY_OVF_CELL 32
+#define TFY_OVF_PAD  8
+
+class CTrayOverflowWnd :
+    public CWindowImpl<CTrayOverflowWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayOverflowFlyout", CS_DROPSHADOW | CS_DBLCLKS, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HWND m_hwndOwner;
+    HWND m_hwndPager;
+    RECT m_rcAnchor;
+    TRAYICONLIST m_List;
+    int m_cCols;
+    int m_cRows;
+    int m_iHot;
+    int m_iPressed;
+    POINT m_ptDown;
+    BOOL m_bDragging;
+    BOOL m_bTracking;
+    SIZE m_size;
+    CTooltips m_Tip;
+
+    CTrayOverflowWnd() : m_hwndOwner(NULL), m_hwndPager(NULL), m_cCols(1), m_cRows(1),
+                         m_iHot(-1), m_iPressed(-1), m_bDragging(FALSE), m_bTracking(FALSE)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_rcAnchor, sizeof(m_rcAnchor));
+        ZeroMemory(&m_List, sizeof(m_List));
+        ZeroMemory(&m_size, sizeof(m_size));
+        m_ptDown.x = m_ptDown.y = 0;
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    RECT CellRect(int i) const
+    {
+        RECT rc;
+        int x = Sc(TFY_OVF_PAD) + (i % m_cCols) * Sc(TFY_OVF_CELL);
+        int y = Sc(TFY_OVF_PAD) + (i / m_cCols) * Sc(TFY_OVF_CELL);
+        SetRect(&rc, x, y, x + Sc(TFY_OVF_CELL), y + Sc(TFY_OVF_CELL));
+        return rc;
+    }
+
+    int HitTest(POINT pt) const
+    {
+        for (UINT i = 0; i < m_List.cItems; i++)
+        {
+            RECT rc = CellRect(i);
+            if (PtInRect(&rc, pt))
+                return (int)i;
+        }
+        return -1;
+    }
+
+    VOID Reload()
+    {
+        UINT n;
+
+        ZeroMemory(&m_List, sizeof(m_List));
+        if (m_hwndPager)
+            ::SendMessageW(m_hwndPager, TNWM_GETTRAYICONS, 0, (LPARAM)&m_List);
+        n = max(1u, m_List.cItems);
+        m_cCols = (int)ceil(sqrt((double)n));
+        m_cRows = (int)((n + m_cCols - 1) / m_cCols);
+        m_size.cx = Sc(TFY_OVF_PAD) * 2 + m_cCols * Sc(TFY_OVF_CELL);
+        m_size.cy = Sc(TFY_OVF_PAD) * 2 + m_cRows * Sc(TFY_OVF_CELL);
+
+        if (m_Tip.m_hWnd)
+        {
+            while (m_Tip.GetToolCount() > 0)
+            {
+                TTTOOLINFOW ti = { TTTOOLINFOW_V1_SIZE };
+                if (!m_Tip.EnumTools(&ti))
+                    break;
+                m_Tip.DelTool(ti.hwnd, (UINT)ti.uId);
+            }
+            for (UINT i = 0; i < m_List.cItems; i++)
+            {
+                TTTOOLINFOW ti = { TTTOOLINFOW_V1_SIZE };
+                ti.uFlags = TTF_SUBCLASS;
+                ti.hwnd = m_hWnd;
+                ti.uId = i + 1;
+                ti.rect = CellRect(i);
+                ti.lpszText = m_List.Items[i].szTip;
+                m_Tip.AddTool(&ti);
+            }
+        }
+    }
+
+    VOID Refresh()
+    {
+        Reload();
+        if (!m_List.cItems)
+        {
+            FadeOut();
+            return;
+        }
+        POINT pt;
+        TfyW11Position(m_hwndOwner, &m_rcAnchor, m_size, TRUE, &pt);
+        m_ptFinal = pt;
+        SetWindowPos(NULL, pt.x, pt.y, m_size.cx, m_size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor, HWND hwndPager)
+    {
+        POINT pt;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        m_hwndOwner = hwndOwner;
+        m_hwndPager = hwndPager;
+        m_rcAnchor = *prcAnchor;
+        if (!m_Tip.m_hWnd)
+            m_Tip.Create(m_hWnd, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP);
+        Reload();
+        TfyW11Position(hwndOwner, prcAnchor, m_size, TRUE, &pt);
+        BeginFlyoutOpen(m_hWnd, pt.x, pt.y, m_size.cx, m_size.cy, m_Pal.PanelBg);
+        SetPropW(m_hWnd, DWM_PROP_CORNER_RADIUS, (HANDLE)(ULONG_PTR)TfyFlyoutRadius());
+        ::InvalidateRect(m_hwndOwner, NULL, TRUE);
+    }
+
+    VOID FadeOut();
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+        HBRUSH hbr;
+        int cx = 0, cy = 0;
+
+        GetClientRect(&rc);
+        hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdc, &rc, hbr);
+        DeleteObject(hbr);
+
+        if (m_List.himl)
+            ImageList_GetIconSize(m_List.himl, &cx, &cy);
+        for (UINT i = 0; i < m_List.cItems; i++)
+        {
+            RECT rcCell = CellRect(i);
+            if ((int)i == m_iHot)
+                ShellDrawTrayPill(hdc, &rcCell, (m_iPressed == (int)i) ? TRAY_PILL_PRESSED : TRAY_PILL_HOT);
+            if (m_List.himl && m_List.Items[i].iImage >= 0)
+            {
+                ImageList_Draw(m_List.himl, m_List.Items[i].iImage, hdc,
+                               rcCell.left + (rcCell.right - rcCell.left - cx) / 2,
+                               rcCell.top + (rcCell.bottom - rcCell.top - cy) / 2,
+                               ILD_TRANSPARENT);
+            }
+        }
+        TfyDrawFlyoutFrame(hdc, &rc, &m_Pal);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int i = HitTest(pt);
+
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        if ((wParam & MK_LBUTTON) && m_iPressed >= 0 && !m_bDragging &&
+            (abs(static_cast<int>(pt.x - m_ptDown.x)) > GetSystemMetrics(SM_CXDRAG) ||
+             abs(static_cast<int>(pt.y - m_ptDown.y)) > GetSystemMetrics(SM_CYDRAG)))
+        {
+            m_bDragging = TRUE;
+        }
+        if (m_bDragging)
+            SetCursor(LoadCursorW(NULL, IDC_HAND));
+        if (i != m_iHot)
+        {
+            m_iHot = i;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot >= 0 && !m_bDragging)
+        {
+            m_iHot = -1;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnButtonDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int i = HitTest(pt);
+
+        if (i < 0)
+            return 0;
+        if (uMsg == WM_LBUTTONDOWN)
+        {
+            m_iPressed = i;
+            m_ptDown = pt;
+            m_bDragging = FALSE;
+            SetCapture();
+            InvalidateRect(NULL, FALSE);
+        }
+        else if (uMsg == WM_LBUTTONDBLCLK)
+        {
+            TfySendIconEvent(m_hwndPager, &m_List.Items[i], WM_LBUTTONDBLCLK);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iPressed = m_iPressed;
+        BOOL bDragging = m_bDragging;
+
+        m_iPressed = -1;
+        m_bDragging = FALSE;
+        if (GetCapture() == m_hWnd)
+            ReleaseCapture();
+        if (iPressed < 0 || iPressed >= (int)m_List.cItems)
+            return 0;
+
+        if (bDragging)
+        {
+            POINT ptScreen = pt;
+            RECT rcBar;
+            HWND hwndRoot = GetAncestor(m_hwndOwner, GA_ROOT);
+
+            ClientToScreen(&ptScreen);
+            if (hwndRoot && ::GetWindowRect(hwndRoot, &rcBar) && PtInRect(&rcBar, ptScreen))
+            {
+                TRAYICONEVENT Event;
+                Event.hWnd = m_List.Items[iPressed].hWnd;
+                Event.uID = m_List.Items[iPressed].uID;
+                Event.uMsg = 0;
+                ::SendMessageW(m_hwndPager, TNWM_SETPROMOTED, TRUE, (LPARAM)&Event);
+                FadeOut();
+            }
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+
+        if (HitTest(pt) == iPressed)
+        {
+            TRAYICONITEM Item = m_List.Items[iPressed];
+            TfySendIconEvent(m_hwndPager, &Item, WM_LBUTTONDOWN);
+            TfySendIconEvent(m_hwndPager, &Item, WM_LBUTTONUP);
+            TfySendIconEvent(m_hwndPager, &Item, NIN_SELECT);
+        }
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnRButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int i = HitTest(pt);
+
+        if (i >= 0)
+        {
+            TRAYICONITEM Item = m_List.Items[i];
+            TfySendIconEvent(m_hwndPager, &Item, WM_RBUTTONDOWN);
+            TfySendIconEvent(m_hwndPager, &Item, WM_RBUTTONUP);
+            TfySendIconEvent(m_hwndPager, &Item, WM_CONTEXTMENU);
+        }
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        HandleFlyoutAnimation(m_hWnd, wParam);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        m_Tip.Detach();
+        if (::IsWindow(m_hwndOwner))
+            ::InvalidateRect(m_hwndOwner, NULL, TRUE);
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayOverflowWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONDBLCLK, OnButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_RBUTTONUP, OnRButtonUp)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayOverflowWnd *g_pTrayOverflow = NULL;
+static ULONGLONG g_OverflowDismissTick = 0;
+
+void CTrayOverflowWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayOverflow == this)
+        g_pTrayOverflow = NULL;
+    delete this;
+}
+
+VOID CTrayOverflowWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_OverflowDismissTick = m_AnimT0;
+    if (::IsWindow(m_hwndOwner))
+        ::InvalidateRect(m_hwndOwner, NULL, TRUE);
+}
+
+VOID TrayOverflow_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor, IN HWND hwndPager)
+{
+    if (GetTickCount64() - g_OverflowDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pTrayOverflow && g_pTrayOverflow->IsWindow())
+    {
+        if (g_pTrayOverflow->IsWindowVisible() && g_pTrayOverflow->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayOverflow->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayOverflow->m_hWnd);
+        g_pTrayOverflow = NULL;
+    }
+
+    CTrayOverflowWnd *pOverflow = new CTrayOverflowWnd();
+    if (!pOverflow)
+        return;
+    if (!pOverflow->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pOverflow;
+        return;
+    }
+    g_pTrayOverflow = pOverflow;
+    pOverflow->Toggle(hwndOwner, prcAnchor, hwndPager);
+}
+
+BOOL TrayOverflow_IsOpen(VOID)
+{
+    return g_pTrayOverflow && g_pTrayOverflow->IsWindow() &&
+           g_pTrayOverflow->IsWindowVisible() && g_pTrayOverflow->m_AnimPhase != TFY_CLOSE;
+}
+
+VOID TrayOverflow_Refresh(VOID)
+{
+    if (TrayOverflow_IsOpen())
+        g_pTrayOverflow->Refresh();
+}
+
+static BOOL
+TfyQsWlanQuery(BOOL *pbHasWlan, BOOL *pbRadioOn)
+{
+    static HMODULE s_hWlanApi;
+    PFN_WLANOPENHANDLE pfnOpen;
+    PFN_WLANCLOSEHANDLE pfnClose;
+    PFN_WLANENUMINTERFACES pfnEnum;
+    PFN_WLANQUERYINTERFACE pfnQuery;
+    PFN_WLANFREEMEMORY pfnFree;
+    PWLAN_INTERFACE_INFO_LIST pInterfaces = NULL;
+    HANDLE hWlan = NULL;
+    DWORD dwVersion = 0;
+
+    *pbHasWlan = FALSE;
+    *pbRadioOn = FALSE;
+    if (!s_hWlanApi)
+        s_hWlanApi = LoadLibraryW(L"wlanapi.dll");
+    if (!s_hWlanApi)
+        return FALSE;
+    pfnOpen = (PFN_WLANOPENHANDLE)GetProcAddress(s_hWlanApi, "WlanOpenHandle");
+    pfnClose = (PFN_WLANCLOSEHANDLE)GetProcAddress(s_hWlanApi, "WlanCloseHandle");
+    pfnEnum = (PFN_WLANENUMINTERFACES)GetProcAddress(s_hWlanApi, "WlanEnumInterfaces");
+    pfnQuery = (PFN_WLANQUERYINTERFACE)GetProcAddress(s_hWlanApi, "WlanQueryInterface");
+    pfnFree = (PFN_WLANFREEMEMORY)GetProcAddress(s_hWlanApi, "WlanFreeMemory");
+    if (!pfnOpen || !pfnClose || !pfnEnum || !pfnFree ||
+        pfnOpen(2, NULL, &dwVersion, &hWlan) != ERROR_SUCCESS)
+    {
+        return FALSE;
+    }
+
+    if (pfnEnum(hWlan, NULL, &pInterfaces) == ERROR_SUCCESS && pInterfaces)
+    {
+        for (DWORD i = 0; i < pInterfaces->dwNumberOfItems; i++)
+        {
+            PWLAN_RADIO_STATE pState = NULL;
+            DWORD cbState = 0;
+
+            *pbHasWlan = TRUE;
+            if (pfnQuery &&
+                pfnQuery(hWlan, &pInterfaces->InterfaceInfo[i].InterfaceGuid,
+                         wlan_intf_opcode_radio_state, NULL, &cbState, (PVOID *)&pState, NULL) == ERROR_SUCCESS &&
+                pState)
+            {
+                for (DWORD j = 0; j < pState->dwNumberOfPhys && j < WLAN_MAX_PHY_INDEX; j++)
+                {
+                    if (pState->PhyRadioState[j].dot11SoftwareRadioState == dot11_radio_state_on &&
+                        pState->PhyRadioState[j].dot11HardwareRadioState == dot11_radio_state_on)
+                    {
+                        *pbRadioOn = TRUE;
+                    }
+                }
+                pfnFree(pState);
+            }
+        }
+        pfnFree(pInterfaces);
+    }
+    pfnClose(hWlan, NULL);
+    InterlockedExchange(&g_NetRadioState, *pbRadioOn);
+    return TRUE;
+}
+
+static VOID
+TfyQsWlanSetRadio(BOOL bOn)
+{
+    HMODULE hWlanApi = LoadLibraryW(L"wlanapi.dll");
+    PFN_WLANOPENHANDLE pfnOpen;
+    PFN_WLANCLOSEHANDLE pfnClose;
+    PFN_WLANENUMINTERFACES pfnEnum;
+    PFN_WLANSETINTERFACE pfnSet;
+    PFN_WLANFREEMEMORY pfnFree;
+    PWLAN_INTERFACE_INFO_LIST pInterfaces = NULL;
+    HANDLE hWlan = NULL;
+    DWORD dwVersion = 0;
+
+    if (!hWlanApi)
+        return;
+    pfnOpen = (PFN_WLANOPENHANDLE)GetProcAddress(hWlanApi, "WlanOpenHandle");
+    pfnClose = (PFN_WLANCLOSEHANDLE)GetProcAddress(hWlanApi, "WlanCloseHandle");
+    pfnEnum = (PFN_WLANENUMINTERFACES)GetProcAddress(hWlanApi, "WlanEnumInterfaces");
+    pfnSet = (PFN_WLANSETINTERFACE)GetProcAddress(hWlanApi, "WlanSetInterface");
+    pfnFree = (PFN_WLANFREEMEMORY)GetProcAddress(hWlanApi, "WlanFreeMemory");
+    if (pfnOpen && pfnClose && pfnEnum && pfnSet && pfnFree &&
+        pfnOpen(2, NULL, &dwVersion, &hWlan) == ERROR_SUCCESS)
+    {
+        if (pfnEnum(hWlan, NULL, &pInterfaces) == ERROR_SUCCESS && pInterfaces)
+        {
+            for (DWORD i = 0; i < pInterfaces->dwNumberOfItems; i++)
+            {
+                WLAN_PHY_RADIO_STATE rs;
+                ZeroMemory(&rs, sizeof(rs));
+                rs.dwPhyIndex = 0;
+                rs.dot11SoftwareRadioState = bOn ? dot11_radio_state_on : dot11_radio_state_off;
+                rs.dot11HardwareRadioState = dot11_radio_state_on;
+                pfnSet(hWlan, &pInterfaces->InterfaceInfo[i].InterfaceGuid,
+                       wlan_intf_opcode_radio_state, sizeof(rs), &rs, NULL);
+            }
+            pfnFree(pInterfaces);
+        }
+        pfnClose(hWlan, NULL);
+        InterlockedExchange(&g_NetRadioState, bOn);
+    }
+    FreeLibrary(hWlanApi);
+}
+
+#define TFY_NETCONNECTIONS_KEY L"SYSTEM\\CurrentControlSet\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+#define TFY_WM_DEVICESCHANGED (WM_APP + 45)
+
+struct TFYDEVICES
+{
+    WCHAR szInstance[8][MAX_DEVICE_ID_LEN];
+    BOOL bDisabled[8];
+    UINT cDevices;
+};
+
+struct TFYDEVICETOGGLE
+{
+    HWND hWnd;
+    BOOL bEnable;
+    TFYDEVICES Devices;
+};
+
+static volatile LONG g_TfyDeviceToggleActive = 0;
+
+static VOID
+TfyAddDevice(TFYDEVICES *pDevices, DEVINST hDevice, LPCWSTR pszInstance)
+{
+    ULONG ulStatus = 0, ulProblem = 0;
+
+    if (pDevices->cDevices >= _countof(pDevices->szInstance))
+        return;
+    StringCchCopyW(pDevices->szInstance[pDevices->cDevices], MAX_DEVICE_ID_LEN, pszInstance);
+    pDevices->bDisabled[pDevices->cDevices] = CM_Get_DevNode_Status(&ulStatus, &ulProblem, hDevice, 0) == CR_SUCCESS &&
+                                              (ulStatus & DN_HAS_PROBLEM) && ulProblem == CM_PROB_DISABLED;
+    pDevices->cDevices++;
+}
+
+static VOID
+TfyQueryWiredAdapters(TFYDEVICES *pDevices)
+{
+    WCHAR szGuid[64], szPath[96], szInstance[MAX_DEVICE_ID_LEN];
+    HKEY hKey;
+
+    ZeroMemory(pDevices, sizeof(*pDevices));
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, TFY_NETCONNECTIONS_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return;
+    for (DWORD i = 0;; i++)
+    {
+        DWORD cchGuid = _countof(szGuid), cb, dwType, dwIfType;
+        DEVINST hDevice;
+        HKEY hDriver;
+
+        if (RegEnumKeyExW(hKey, i, szGuid, &cchGuid, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+            break;
+        if (szGuid[0] != L'{')
+            continue;
+        StringCchPrintfW(szPath, _countof(szPath), L"%s\\Connection", szGuid);
+        cb = sizeof(szInstance);
+        if (RegGetValueW(hKey, szPath, L"PnpInstanceID", RRF_RT_REG_SZ, NULL, szInstance, &cb) != ERROR_SUCCESS ||
+            CM_Locate_DevNodeW(&hDevice, szInstance, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS ||
+            CM_Open_DevNode_Key(hDevice, KEY_QUERY_VALUE, 0, RegDisposition_OpenExisting, &hDriver,
+                                CM_REGISTRY_SOFTWARE) != CR_SUCCESS)
+        {
+            continue;
+        }
+        cb = sizeof(dwIfType);
+        if (RegQueryValueExW(hDriver, L"*IfType", NULL, &dwType, (LPBYTE)&dwIfType, &cb) != ERROR_SUCCESS ||
+            dwType != REG_DWORD)
+        {
+            dwIfType = 0;
+        }
+        RegCloseKey(hDriver);
+        if (dwIfType == IF_TYPE_ETHERNET_CSMACD)
+            TfyAddDevice(pDevices, hDevice, szInstance);
+    }
+    RegCloseKey(hKey);
+}
+
+static VOID
+TfyQueryBluetoothRadios(TFYDEVICES *pDevices)
+{
+    WCHAR szInstance[MAX_DEVICE_ID_LEN];
+    SP_DEVINFO_DATA Data;
+    DEVINST hDevice;
+    HDEVINFO hSet;
+
+    ZeroMemory(pDevices, sizeof(*pDevices));
+    hSet = SetupDiGetClassDevsW(&GUID_BTHPORT_DEVICE_INTERFACE, NULL, NULL, DIGCF_DEVICEINTERFACE);
+    if (hSet == INVALID_HANDLE_VALUE)
+        return;
+    Data.cbSize = sizeof(Data);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hSet, i, &Data); i++)
+    {
+        if (SetupDiGetDeviceInstanceIdW(hSet, &Data, szInstance, _countof(szInstance), NULL) &&
+            CM_Locate_DevNodeW(&hDevice, szInstance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS)
+        {
+            TfyAddDevice(pDevices, hDevice, szInstance);
+        }
+    }
+    SetupDiDestroyDeviceInfoList(hSet);
+}
+
+static BOOL
+TfyDevicesOn(const TFYDEVICES *pDevices)
+{
+    for (UINT i = 0; i < pDevices->cDevices; i++)
+    {
+        if (!pDevices->bDisabled[i])
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static VOID
+TfySetDeviceEnabled(LPCWSTR pszInstance, BOOL bEnable)
+{
+    HDEVINFO hSet = SetupDiCreateDeviceInfoList(NULL, NULL);
+    SP_DEVINFO_DATA Data = { sizeof(Data) };
+    SP_PROPCHANGE_PARAMS Params;
+
+    if (hSet == INVALID_HANDLE_VALUE)
+        return;
+    ZeroMemory(&Params, sizeof(Params));
+    Params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+    Params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    Params.StateChange = bEnable ? DICS_ENABLE : DICS_DISABLE;
+    Params.Scope = DICS_FLAG_GLOBAL;
+    if (SetupDiOpenDeviceInfoW(hSet, pszInstance, NULL, 0, &Data) &&
+        SetupDiSetClassInstallParamsW(hSet, &Data, &Params.ClassInstallHeader, sizeof(Params)))
+    {
+        SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hSet, &Data);
+    }
+    SetupDiDestroyDeviceInfoList(hSet);
+}
+
+static DWORD WINAPI
+TfyDeviceToggleThread(LPVOID lpParameter)
+{
+    TFYDEVICETOGGLE *pToggle = (TFYDEVICETOGGLE *)lpParameter;
+
+    for (UINT i = 0; i < pToggle->Devices.cDevices; i++)
+    {
+        if (pToggle->Devices.bDisabled[i] == pToggle->bEnable)
+            TfySetDeviceEnabled(pToggle->Devices.szInstance[i], pToggle->bEnable);
+    }
+    InterlockedExchange(&g_TfyDeviceToggleActive, 0);
+    PostMessageW(pToggle->hWnd, TFY_WM_DEVICESCHANGED, 0, 0);
+    HeapFree(hProcessHeap, 0, pToggle);
+    return 0;
+}
+
+static BOOL
+TfyToggleDevices(HWND hWnd, TFYDEVICES *pDevices, BOOL bEnable)
+{
+    TFYDEVICETOGGLE *pToggle;
+    HANDLE hThread;
+
+    if (!pDevices->cDevices || InterlockedCompareExchange(&g_TfyDeviceToggleActive, 1, 0) != 0)
+        return FALSE;
+    pToggle = (TFYDEVICETOGGLE *)HeapAlloc(hProcessHeap, 0, sizeof(*pToggle));
+    if (!pToggle)
+    {
+        InterlockedExchange(&g_TfyDeviceToggleActive, 0);
+        return FALSE;
+    }
+    pToggle->hWnd = hWnd;
+    pToggle->bEnable = bEnable;
+    pToggle->Devices = *pDevices;
+    for (UINT i = 0; i < pDevices->cDevices; i++)
+        pDevices->bDisabled[i] = !bEnable;
+    hThread = CreateThread(NULL, 0, TfyDeviceToggleThread, pToggle, 0, NULL);
+    if (hThread)
+        CloseHandle(hThread);
+    else
+        TfyDeviceToggleThread(pToggle);
+    return TRUE;
+}
+
+static VOID
+TfyFillRound(HDC hdc, const RECT *prc, int radius, COLORREF crFill, COLORREF crBack)
+{
+    TFYAA aa;
+    RECT rc = *prc;
+    HDC hdcAA = TfyAABegin(&aa, hdc, &rc, 3, crBack);
+
+    if (!hdcAA)
+        return;
+    HBRUSH hbr = CreateSolidBrush(crFill);
+    HGDIOBJ hbrOld = SelectObject(hdcAA, hbr);
+    HGDIOBJ hpenOld = SelectObject(hdcAA, GetStockObject(NULL_PEN));
+    RoundRect(hdcAA, 0, 0, (rc.right - rc.left) * 3 + 1, (rc.bottom - rc.top) * 3 + 1,
+              radius * 6, radius * 6);
+    SelectObject(hdcAA, hpenOld);
+    SelectObject(hdcAA, hbrOld);
+    DeleteObject(hbr);
+    TfyAAEnd(&aa, hdc);
+}
+
+enum
+{
+    TFY_QSTILE_WIFI,
+    TFY_QSTILE_ETHERNET,
+    TFY_QSTILE_BLUETOOTH,
+    TFY_QSTILE_POWER
+};
+
+#define TFY_QSHIT_NONE      -1
+#define TFY_QSHIT_ARROW     0x100
+#define TFY_QSHIT_MUTE      0x200
+#define TFY_QSHIT_SLIDER    0x201
+#define TFY_QSHIT_SOUNDMORE 0x202
+#define TFY_QSHIT_BATTERY   0x203
+#define TFY_QSHIT_SETTINGS  0x204
+#define TFY_QSHIT_BRIGHTNESS 0x205
+#define TFY_QSHIT_PANELINK  0x300
+#define TFY_QSHIT_PANETILE  0x310
+#define TFY_QSHIT_PANECHANGE 0x320
+#define TFY_QSHIT_PANEMUTE  0x321
+
+enum
+{
+    TFY_PANE_NETWORK,
+    TFY_PANE_VOLUME,
+    TFY_PANE_BRIGHTNESS,
+    TFY_PANE_NOTIFICATIONS,
+    TFY_PANE_POWER,
+    TFY_PANE_KEYBOARD,
+    TFY_PANE_TILES
+};
+
+#define TFY_PANE_LINKS 4
+
+#define TFY_TIMER_QSTHEME   0x51
+
+struct TFYQSTILE
+{
+    INT Kind;
+    BOOL bToggle;
+    BOOL bMore;
+    BOOL bOn;
+    BOOL bEnabled;
+    RECT rc;
+    RECT rcBadge;
+    RECT rcMore;
+    WCHAR szStatus[64];
+};
+
+struct TFYBTDEVICE
+{
+    WCHAR szName[BLUETOOTH_MAX_NAME_SIZE];
+    ULONG ulClass;
+    BOOL bConnected;
+    BOOL bAuthenticated;
+};
+
+static UINT
+TfyBluetoothDevices(TFYBTDEVICE *pDevices, UINT cMax)
+{
+    typedef HBLUETOOTH_RADIO_FIND (WINAPI *PFN_FINDFIRSTRADIO)(const BLUETOOTH_FIND_RADIO_PARAMS *, HANDLE *);
+    typedef BOOL (WINAPI *PFN_FINDRADIOCLOSE)(HBLUETOOTH_RADIO_FIND);
+    typedef HBLUETOOTH_DEVICE_FIND (WINAPI *PFN_FINDFIRSTDEVICE)(const BLUETOOTH_DEVICE_SEARCH_PARAMS *,
+                                                                  BLUETOOTH_DEVICE_INFO *);
+    typedef BOOL (WINAPI *PFN_FINDNEXTDEVICE)(HBLUETOOTH_DEVICE_FIND, BLUETOOTH_DEVICE_INFO *);
+    typedef BOOL (WINAPI *PFN_FINDDEVICECLOSE)(HBLUETOOTH_DEVICE_FIND);
+    HMODULE hBluetooth = LoadLibraryW(L"bluetoothapis.dll");
+    BLUETOOTH_FIND_RADIO_PARAMS RadioParams = { sizeof(RadioParams) };
+    BLUETOOTH_DEVICE_SEARCH_PARAMS SearchParams = { sizeof(SearchParams) };
+    BLUETOOTH_DEVICE_INFO Info = { sizeof(Info) };
+    HBLUETOOTH_RADIO_FIND hRadioFind;
+    HBLUETOOTH_DEVICE_FIND hFind;
+    HANDLE hRadio = NULL;
+    PFN_FINDFIRSTRADIO pfnFirstRadio;
+    PFN_FINDRADIOCLOSE pfnRadioClose;
+    PFN_FINDFIRSTDEVICE pfnFirstDevice;
+    PFN_FINDNEXTDEVICE pfnNextDevice;
+    PFN_FINDDEVICECLOSE pfnDeviceClose;
+    UINT cDevices = 0;
+
+    if (!hBluetooth)
+        return 0;
+    pfnFirstRadio = (PFN_FINDFIRSTRADIO)GetProcAddress(hBluetooth, "BluetoothFindFirstRadio");
+    pfnRadioClose = (PFN_FINDRADIOCLOSE)GetProcAddress(hBluetooth, "BluetoothFindRadioClose");
+    pfnFirstDevice = (PFN_FINDFIRSTDEVICE)GetProcAddress(hBluetooth, "BluetoothFindFirstDevice");
+    pfnNextDevice = (PFN_FINDNEXTDEVICE)GetProcAddress(hBluetooth, "BluetoothFindNextDevice");
+    pfnDeviceClose = (PFN_FINDDEVICECLOSE)GetProcAddress(hBluetooth, "BluetoothFindDeviceClose");
+    if (pfnFirstRadio && pfnRadioClose && pfnFirstDevice && pfnNextDevice && pfnDeviceClose &&
+        (hRadioFind = pfnFirstRadio(&RadioParams, &hRadio)) != NULL)
+    {
+        pfnRadioClose(hRadioFind);
+        SearchParams.fReturnAuthenticated = TRUE;
+        SearchParams.fReturnRemembered = TRUE;
+        SearchParams.fReturnConnected = TRUE;
+        SearchParams.hRadio = hRadio;
+        hFind = pfnFirstDevice(&SearchParams, &Info);
+        if (hFind)
+        {
+            do
+            {
+                TFYBTDEVICE *pDevice = &pDevices[cDevices++];
+
+                if (Info.szName[0])
+                {
+                    StringCchCopyW(pDevice->szName, _countof(pDevice->szName), Info.szName);
+                }
+                else
+                {
+                    StringCchPrintfW(pDevice->szName, _countof(pDevice->szName), L"%02X:%02X:%02X:%02X:%02X:%02X",
+                                     Info.Address.rgBytes[5], Info.Address.rgBytes[4], Info.Address.rgBytes[3],
+                                     Info.Address.rgBytes[2], Info.Address.rgBytes[1], Info.Address.rgBytes[0]);
+                }
+                pDevice->ulClass = Info.ulClassofDevice;
+                pDevice->bConnected = Info.fConnected;
+                pDevice->bAuthenticated = Info.fAuthenticated;
+                Info.dwSize = sizeof(Info);
+            } while (cDevices < cMax && pfnNextDevice(hFind, &Info));
+            pfnDeviceClose(hFind);
+        }
+        CloseHandle(hRadio);
+    }
+    FreeLibrary(hBluetooth);
+    return cDevices;
+}
+
+static BOOL
+TfyQsActivePowerPlan(LPWSTR pszName, DWORD cchName)
+{
+    typedef DWORD (WINAPI *PFN_GETACTIVESCHEME)(HKEY, GUID **);
+    typedef DWORD (WINAPI *PFN_READFRIENDLYNAME)(HKEY, const GUID *, const GUID *, const GUID *, PUCHAR, LPDWORD);
+    HMODULE hPowrProf;
+    PFN_GETACTIVESCHEME pfnActive;
+    PFN_READFRIENDLYNAME pfnName;
+    GUID *pScheme = NULL;
+    DWORD cbName = cchName * sizeof(WCHAR);
+    BOOL bResult = FALSE;
+    int iMode = TfyActivePowerMode();
+
+    pszName[0] = UNICODE_NULL;
+    if (iMode >= 0)
+        return SUCCEEDED(StringCchCopyW(pszName, cchName, g_TfyPowerModes[iMode].pszName));
+    hPowrProf = LoadLibraryW(L"powrprof.dll");
+    if (!hPowrProf)
+        return FALSE;
+    pfnActive = (PFN_GETACTIVESCHEME)GetProcAddress(hPowrProf, "PowerGetActiveScheme");
+    pfnName = (PFN_READFRIENDLYNAME)GetProcAddress(hPowrProf, "PowerReadFriendlyName");
+    if (pfnActive && pfnName && pfnActive(NULL, &pScheme) == ERROR_SUCCESS && pScheme)
+    {
+        bResult = pfnName(NULL, pScheme, NULL, NULL, (PUCHAR)pszName, &cbName) == ERROR_SUCCESS;
+        LocalFree(pScheme);
+    }
+    FreeLibrary(hPowrProf);
+    if (!bResult)
+        pszName[0] = UNICODE_NULL;
+    return bResult;
+}
+
+static VOID
+TfyQsOpenSettings(LPCWSTR pszUri)
+{
+    ShellExecuteW(NULL, L"open", pszUri, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static VOID TrayMediaCard_Open(HWND hwndOwner, const RECT *prcQuickSettings);
+static VOID TrayMediaCard_Close(VOID);
+
+class CTrayQuickSettingsWnd :
+    public CWindowImpl<CTrayQuickSettingsWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayQuickSettingsFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HWND m_hwndOwner;
+    RECT m_rcAnchor;
+    HFONT m_hFont;
+    HFONT m_hFontTitle;
+    HFONT m_hFontSmall;
+    TFYQSTILE m_Tiles[8];
+    UINT m_cTiles;
+    BOOL m_bHasWlan;
+    BOOL m_bWifiOn;
+    TFYDEVICES m_Wired;
+    TFYDEVICES m_Radios;
+    BOOL m_bNetConnected;
+    BOOL m_bAirplane;
+    WCHAR m_szPowerPlan[64];
+    TFYVOLUME m_Fallback;
+    CComPtr<IMMDeviceEnumerator> m_pEnum;
+    CComPtr<IMMDevice> m_pDevice;
+    CComPtr<IAudioEndpointVolume> m_pEndpointVolume;
+    BOOL m_bComVolume;
+    BOOL m_bLoaded;
+    BOOL m_bFrameStarted;
+    int m_nMaster;
+    BOOL m_bMute;
+    BOOL m_bDragSlider;
+    int m_nBrightness;
+    BOOL m_bDragBrightness;
+    RECT m_rcBright, m_rcBrightTitle, m_rcBrightIcon, m_rcBrightSlider;
+    SYSTEM_POWER_STATUS m_sps;
+    BOOL m_bBattery;
+    int m_iHot;
+    int m_iPressed;
+    BOOL m_bTracking;
+    SIZE m_size;
+    RECT m_rcSound, m_rcSoundTitle, m_rcMute, m_rcSlider, m_rcSoundMore, m_rcFooter, m_rcBattery, m_rcSettings;
+    BOOL m_bPane;
+    int m_iPaneSlider;
+    HFONT m_hFontPaneTitle;
+    HFONT m_hFontPane;
+    HFONT m_hFontPaneSmall;
+    WCHAR m_szLang[16];
+    RECT m_rcPaneTitle, m_rcPaneSection, m_rcPaneChange, m_rcPaneBox, m_rcPaneValue, m_rcPaneMute, m_rcPaneSlider;
+    RECT m_rcPaneLinks[TFY_PANE_LINKS];
+    RECT m_rcPaneTiles[TFY_PANE_TILES];
+
+    CTrayQuickSettingsWnd() : m_hwndOwner(NULL), m_hFont(NULL), m_hFontTitle(NULL), m_hFontSmall(NULL),
+                              m_cTiles(0), m_bHasWlan(FALSE), m_bWifiOn(FALSE), m_bNetConnected(FALSE),
+                              m_bAirplane(FALSE), m_bComVolume(FALSE), m_bLoaded(FALSE), m_bFrameStarted(FALSE),
+                              m_nMaster(0), m_bMute(FALSE), m_bDragSlider(FALSE),
+                              m_nBrightness(-1), m_bDragBrightness(FALSE), m_bBattery(FALSE),
+                              m_iHot(TFY_QSHIT_NONE), m_iPressed(TFY_QSHIT_NONE), m_bTracking(FALSE),
+                              m_bPane(FALSE), m_iPaneSlider(-1), m_hFontPaneTitle(NULL), m_hFontPane(NULL),
+                              m_hFontPaneSmall(NULL)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        m_szLang[0] = UNICODE_NULL;
+        SetRectEmpty(&m_rcPaneTitle);
+        SetRectEmpty(&m_rcPaneSection);
+        SetRectEmpty(&m_rcPaneChange);
+        SetRectEmpty(&m_rcPaneBox);
+        SetRectEmpty(&m_rcPaneValue);
+        SetRectEmpty(&m_rcPaneMute);
+        SetRectEmpty(&m_rcPaneSlider);
+        ZeroMemory(m_rcPaneLinks, sizeof(m_rcPaneLinks));
+        ZeroMemory(m_rcPaneTiles, sizeof(m_rcPaneTiles));
+        ZeroMemory(&m_rcAnchor, sizeof(m_rcAnchor));
+        ZeroMemory(m_Tiles, sizeof(m_Tiles));
+        ZeroMemory(&m_Wired, sizeof(m_Wired));
+        ZeroMemory(&m_Radios, sizeof(m_Radios));
+        ZeroMemory(&m_sps, sizeof(m_sps));
+        ZeroMemory(&m_size, sizeof(m_size));
+        m_szPowerPlan[0] = UNICODE_NULL;
+        m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+        m_bMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+        ZeroMemory(&m_rcBright, sizeof(m_rcBright));
+        ZeroMemory(&m_rcBrightTitle, sizeof(m_rcBrightTitle));
+        ZeroMemory(&m_rcBrightIcon, sizeof(m_rcBrightIcon));
+        ZeroMemory(&m_rcBrightSlider, sizeof(m_rcBrightSlider));
+        if (!TfyBrightnessQuery(&m_nBrightness))
+            m_nBrightness = -1;
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID WifiStatus(LPWSTR pszStatus, SIZE_T cchStatus)
+    {
+        StringCchCopyW(pszStatus, cchStatus, m_bWifiOn ? L"On" : L"Off");
+        if (!m_bWifiOn)
+            return;
+        AcquireSRWLockShared(&g_NetCacheLock);
+        if (g_NetCache.bValid)
+        {
+            for (DWORD i = 0; i < g_NetCache.nWlan; i++)
+            {
+                if (g_NetCache.Wlan[i].bConnected && g_NetCache.Wlan[i].szName[0])
+                {
+                    StringCchCopyW(pszStatus, cchStatus, g_NetCache.Wlan[i].szName);
+                    break;
+                }
+            }
+        }
+        ReleaseSRWLockShared(&g_NetCacheLock);
+    }
+
+    BOOL NetworkConnected()
+    {
+        BOOL bConnected = m_bNetConnected;
+
+        AcquireSRWLockShared(&g_NetCacheLock);
+        if (g_NetCache.bValid)
+        {
+            for (DWORD i = 0; i < g_NetCache.nAdapters && !bConnected; i++)
+                bConnected = g_NetCache.Adapters[i].bConnected;
+        }
+        ReleaseSRWLockShared(&g_NetCacheLock);
+        return bConnected;
+    }
+
+    TFYQSTILE *AddTile(INT Kind, BOOL bToggle, BOOL bMore, BOOL bOn, LPCWSTR pszStatus)
+    {
+        TFYQSTILE *pTile = &m_Tiles[m_cTiles++];
+
+        pTile->Kind = Kind;
+        pTile->bToggle = bToggle;
+        pTile->bMore = bMore;
+        pTile->bOn = bOn;
+        pTile->bEnabled = TRUE;
+        StringCchCopyW(pTile->szStatus, _countof(pTile->szStatus), pszStatus ? pszStatus : L"");
+        return pTile;
+    }
+
+    VOID BuildTiles()
+    {
+        BOOL bRestore = TRUE, bOn;
+        WCHAR szStatus[64];
+
+        m_cTiles = 0;
+        ZeroMemory(m_Tiles, sizeof(m_Tiles));
+        WifiStatus(szStatus, _countof(szStatus));
+        AddTile(TFY_QSTILE_WIFI, TRUE, TRUE, m_bHasWlan && m_bWifiOn,
+                m_bHasWlan ? szStatus : L"Not available")->bEnabled = m_bHasWlan;
+        bOn = TfyDevicesOn(&m_Radios);
+        AddTile(TFY_QSTILE_BLUETOOTH, TRUE, TRUE, bOn,
+                !m_Radios.cDevices ? L"Not available" : bOn ? L"On" : L"Off")->bEnabled = m_Radios.cDevices != 0;
+        bOn = TfyDevicesOn(&m_Wired);
+        AddTile(TFY_QSTILE_ETHERNET, TRUE, TRUE, bOn,
+                !m_Wired.cDevices ? L"Not available" : !bOn ? L"Off" : NetworkConnected() ? L"Connected" :
+                L"Not connected")->bEnabled = m_Wired.cDevices != 0;
+        m_bAirplane = CTrayNetworkWnd::LoadAirplane(&bRestore);
+        AddTile(TFY_QSTILE_POWER, FALSE, TRUE, FALSE, m_szPowerPlan);
+    }
+
+    VOID QueryDevices()
+    {
+        TfyQueryWiredAdapters(&m_Wired);
+        TfyQueryBluetoothRadios(&m_Radios);
+    }
+
+    VOID Layout()
+    {
+        int pad = Sc(16), gap = Sc(10), tileH = Sc(60), badge = Sc(36);
+        int colW, y, rows;
+
+        if (m_bPane)
+        {
+            LayoutPane();
+            return;
+        }
+        m_size.cx = Sc(360);
+        colW = (m_size.cx - pad * 2 - gap) / 2;
+        y = pad;
+        for (UINT i = 0; i < m_cTiles; i++)
+        {
+            TFYQSTILE *pTile = &m_Tiles[i];
+            int x = pad + (int)(i % 2) * (colW + gap);
+            int top = y + (int)(i / 2) * (tileH + gap);
+
+            SetRect(&pTile->rc, x, top, x + colW, top + tileH);
+            SetRect(&pTile->rcBadge, x + Sc(12), top + (tileH - badge) / 2, x + Sc(12) + badge,
+                    top + (tileH - badge) / 2 + badge);
+            if (pTile->bMore)
+                SetRect(&pTile->rcMore, x + colW - Sc(36), top, x + colW, top + tileH);
+            else
+                SetRectEmpty(&pTile->rcMore);
+        }
+        rows = (int)(m_cTiles + 1) / 2;
+        y += rows * (tileH + gap);
+
+        if (m_nBrightness >= 0)
+        {
+            SetRect(&m_rcBright, pad, y, m_size.cx - pad, y + Sc(88));
+            SetRect(&m_rcBrightTitle, m_rcBright.left + Sc(16), m_rcBright.top + Sc(10), m_rcBright.right - Sc(16),
+                    m_rcBright.top + Sc(34));
+            SetRect(&m_rcBrightIcon, m_rcBright.left + Sc(8), m_rcBright.top + Sc(40), m_rcBright.left + Sc(44),
+                    m_rcBright.top + Sc(76));
+            SetRect(&m_rcBrightSlider, m_rcBrightIcon.right + Sc(10), (m_rcBrightIcon.top + m_rcBrightIcon.bottom) / 2 - Sc(2),
+                    m_rcBright.right - Sc(54), (m_rcBrightIcon.top + m_rcBrightIcon.bottom) / 2 + Sc(2));
+            y = m_rcBright.bottom + gap;
+        }
+
+        SetRect(&m_rcSound, pad, y, m_size.cx - pad, y + Sc(88));
+        SetRect(&m_rcSoundTitle, m_rcSound.left + Sc(16), m_rcSound.top + Sc(10), m_rcSound.right - Sc(16),
+                m_rcSound.top + Sc(34));
+        SetRect(&m_rcMute, m_rcSound.left + Sc(8), m_rcSound.top + Sc(40), m_rcSound.left + Sc(44),
+                m_rcSound.top + Sc(76));
+        SetRect(&m_rcSoundMore, m_rcSound.right - Sc(44), m_rcMute.top, m_rcSound.right - Sc(8), m_rcMute.bottom);
+        SetRect(&m_rcSlider, m_rcMute.right + Sc(10), (m_rcMute.top + m_rcMute.bottom) / 2 - Sc(2),
+                m_rcSoundMore.left - Sc(10), (m_rcMute.top + m_rcMute.bottom) / 2 + Sc(2));
+        y = m_rcSound.bottom + pad;
+
+        SetRect(&m_rcFooter, 0, y, m_size.cx, y + Sc(48));
+        SetRect(&m_rcBattery, Sc(12), y + Sc(8), Sc(100), y + Sc(40));
+        SetRect(&m_rcSettings, m_size.cx - Sc(48), y + Sc(8), m_size.cx - Sc(16), y + Sc(40));
+        y += Sc(48);
+        m_size.cy = y;
+    }
+
+    VOID LoadState()
+    {
+        m_pEndpointVolume.Release();
+        m_pDevice.Release();
+        m_pEnum.Release();
+        m_bComVolume = FALSE;
+        if (SUCCEEDED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARG(IMMDeviceEnumerator, &m_pEnum))) &&
+            SUCCEEDED(m_pEnum->GetDefaultAudioEndpoint(eRender, eMultimedia, &m_pDevice)) &&
+            SUCCEEDED(m_pDevice->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER,
+                                          NULL, (void **)&m_pEndpointVolume)))
+        {
+            float fLevel = 0.0f;
+            BOOL bMute = FALSE;
+            if (SUCCEEDED(m_pEndpointVolume->GetMasterVolumeLevelScalar(&fLevel)))
+            {
+                m_nMaster = (int)(fLevel * 100.0f + 0.5f);
+                m_pEndpointVolume->GetMute(&bMute);
+                m_bMute = bMute;
+                m_bComVolume = TRUE;
+            }
+        }
+        if (!m_bComVolume && m_Fallback.Open())
+        {
+            m_nMaster = m_Fallback.GetVolume();
+            m_bMute = m_Fallback.GetMute();
+        }
+        InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InterlockedExchange(&g_TfyAudioMute, m_bMute);
+
+        TfyQsWlanQuery(&m_bHasWlan, &m_bWifiOn);
+        QueryDevices();
+        {
+            TFYNETCACHE *pCache = (TFYNETCACHE *)HeapAlloc(hProcessHeap, HEAP_ZERO_MEMORY, sizeof(TFYNETCACHE));
+            m_bNetConnected = FALSE;
+            if (pCache)
+            {
+                TfyCollectAdapterRows(pCache);
+                for (DWORD i = 0; i < pCache->nAdapters && !m_bNetConnected; i++)
+                    m_bNetConnected = pCache->Adapters[i].bConnected;
+                HeapFree(hProcessHeap, 0, pCache);
+            }
+        }
+        TfyQsActivePowerPlan(m_szPowerPlan, _countof(m_szPowerPlan));
+        m_bLoaded = TRUE;
+        BuildTiles();
+        Layout();
+        SetWindowPos(NULL, 0, 0, m_size.cx, m_size.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        Reposition();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Reposition()
+    {
+        POINT pt;
+        if (m_bPane)
+            TfyPanePosition(&m_rcAnchor, &m_size, &pt);
+        else
+            TfyW11Position(m_hwndOwner, &m_rcAnchor, m_size, FALSE, &pt);
+        m_ptFinal = pt;
+        if (m_AnimPhase == TFY_NONE)
+            SetWindowPos(NULL, pt.x, pt.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        POINT pt;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        m_hwndOwner = hwndOwner;
+        m_rcAnchor = *prcAnchor;
+        if (!m_hFont)
+            m_hFont = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontTitle)
+            m_hFontTitle = TfyCreateFont(12, FW_SEMIBOLD);
+        if (!m_hFontSmall)
+            m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+        if (!m_bFrameStarted)
+            m_bFrameStarted = ShellFrame::Startup();
+        m_bBattery = GetSystemPowerStatus(&m_sps) && m_sps.BatteryFlag != 128 && m_sps.BatteryFlag != 255;
+        m_bPane = !IsThemeActive();
+        m_bSlideFromRight = m_bPane;
+        if (m_bPane)
+        {
+            if (!m_hFontPaneTitle)
+                m_hFontPaneTitle = TfyCreateFont(27, FW_LIGHT);
+            if (!m_hFontPane)
+                m_hFontPane = TfyCreateFont(15, FW_NORMAL);
+            if (!m_hFontPaneSmall)
+                m_hFontPaneSmall = TfyCreateFont(13, FW_NORMAL);
+            PaneLanguage(GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL)));
+        }
+        AcquireSRWLockShared(&g_NetCacheLock);
+        if (g_NetCache.bValid)
+        {
+            m_bHasWlan = g_NetCache.nWlanIfaces > 0;
+            m_bWifiOn = g_NetCache.bWifiOn;
+        }
+        ReleaseSRWLockShared(&g_NetCacheLock);
+        QueryDevices();
+        BuildTiles();
+        Layout();
+        if (m_bPane)
+            TfyPanePosition(prcAnchor, &m_size, &pt);
+        else
+            TfyW11Position(hwndOwner, prcAnchor, m_size, FALSE, &pt);
+        BeginFlyoutOpen(m_hWnd, pt.x, pt.y, m_size.cx, m_size.cy, m_Pal.PanelBg);
+        SetPropW(m_hWnd, DWM_PROP_CORNER_RADIUS, (HANDLE)(ULONG_PTR)TfyFlyoutRadius());
+        SetTimer(TFY_TIMER_AUDIOLOAD, TFY_ANIM_OPEN_MS + TFY_ANIM_INTERVAL, NULL);
+        ::InvalidateRect(m_hwndOwner, NULL, FALSE);
+        if (!m_bPane)
+        {
+            RECT rcQuickSettings = { pt.x, pt.y, pt.x + m_size.cx, pt.y + m_size.cy };
+            TrayMediaCard_Open(m_hWnd, &rcQuickSettings);
+        }
+    }
+
+    VOID FadeOut();
+
+    VOID ApplyVolume(int nPercent)
+    {
+        if (nPercent < 0) nPercent = 0;
+        if (nPercent > 100) nPercent = 100;
+        m_nMaster = nPercent;
+        if (m_bComVolume && m_pEndpointVolume)
+        {
+            BOOL bUnmute = (m_bMute && nPercent > 0);
+            if (!TfyRequestMaster(m_pDevice, nPercent, bUnmute ? FALSE : -1))
+            {
+                m_pEndpointVolume->SetMasterVolumeLevelScalar((float)nPercent / 100.0f, NULL);
+                if (bUnmute)
+                    m_pEndpointVolume->SetMute(FALSE, NULL);
+            }
+            if (bUnmute)
+                m_bMute = FALSE;
+        }
+        else if (m_Fallback.bValid)
+        {
+            m_Fallback.SetVolume(nPercent);
+            if (m_bMute && nPercent > 0)
+            {
+                m_bMute = FALSE;
+                m_Fallback.SetMute(FALSE);
+            }
+        }
+        InterlockedExchange(&g_TfyAudioPercent, m_nMaster);
+        InterlockedExchange(&g_TfyAudioMute, m_bMute);
+        InvalidateRect(NULL, FALSE);
+        UpdateWindow();
+    }
+
+    VOID ToggleMute()
+    {
+        m_bMute = !m_bMute;
+        if (m_bComVolume && m_pEndpointVolume)
+        {
+            if (!TfyRequestMaster(m_pDevice, -1, m_bMute))
+                m_pEndpointVolume->SetMute(m_bMute, NULL);
+        }
+        else if (m_Fallback.bValid)
+        {
+            m_Fallback.SetMute(m_bMute);
+        }
+        InterlockedExchange(&g_TfyAudioMute, m_bMute);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    int PercentFromX(int x)
+    {
+        int w = m_rcSlider.right - m_rcSlider.left;
+        return w > 0 ? MulDiv(x - m_rcSlider.left, 100, w) : 0;
+    }
+
+    int BrightnessFromX(int x)
+    {
+        int w = m_rcBrightSlider.right - m_rcBrightSlider.left;
+        return w > 0 ? max(0, min(MulDiv(x - m_rcBrightSlider.left, 100, w), 100)) : 0;
+    }
+
+    VOID ApplyBrightness(int nPercent)
+    {
+        int nActual;
+
+        if (!TfyBrightnessSet(nPercent))
+            return;
+        m_nBrightness = TfyBrightnessQuery(&nActual) ? nActual : nPercent;
+        InterlockedExchange(&g_TfyBrightness, m_nBrightness);
+        InvalidateRect(NULL, FALSE);
+        UpdateWindow();
+    }
+
+    VOID LayoutPane()
+    {
+        POINT pt;
+        int pad = Sc(26), gap = Sc(4), tileH = Sc(78), tileW, y, i;
+
+        m_size.cx = Sc(TFY_PANE_WIDTH);
+        TfyPanePosition(&m_rcAnchor, &m_size, &pt);
+        SetRect(&m_rcPaneTitle, pad, Sc(22), m_size.cx - pad, Sc(22) + Sc(46));
+        SetRect(&m_rcPaneSection, pad, m_rcPaneTitle.bottom + Sc(16), m_size.cx - pad, m_rcPaneTitle.bottom + Sc(40));
+        y = m_rcPaneSection.bottom + Sc(6);
+        for (i = 0; i < TFY_PANE_LINKS; i++)
+        {
+            SetRect(&m_rcPaneLinks[i], 0, y, m_size.cx, y + Sc(38));
+            y += Sc(38);
+        }
+        SetRect(&m_rcPaneChange, 0, m_size.cy - Sc(14) - Sc(44), m_size.cx, m_size.cy - Sc(14));
+        tileW = (m_size.cx - 2 * pad - 2 * gap) / 3;
+        y = m_rcPaneChange.top - Sc(18) - 2 * tileH - gap;
+        for (i = 0; i < TFY_PANE_TILES; i++)
+        {
+            int x = pad + (i % 3) * (tileW + gap);
+            int top = y + (i / 3) * (tileH + gap);
+
+            SetRect(&m_rcPaneTiles[i], x, top, x + tileW, top + tileH);
+        }
+        SetRectEmpty(&m_rcPaneBox);
+        SetRectEmpty(&m_rcPaneValue);
+        SetRectEmpty(&m_rcPaneMute);
+        SetRectEmpty(&m_rcPaneSlider);
+        if (m_iPaneSlider >= 0)
+        {
+            const RECT *prcTile = &m_rcPaneTiles[m_iPaneSlider];
+            int xMid = (prcTile->left + prcTile->right) / 2;
+
+            SetRect(&m_rcPaneBox, prcTile->left, y - gap - Sc(236), prcTile->right, y - gap);
+            SetRect(&m_rcPaneValue, m_rcPaneBox.left, m_rcPaneBox.top + Sc(8), m_rcPaneBox.right, m_rcPaneBox.top + Sc(40));
+            if (m_iPaneSlider == TFY_PANE_VOLUME)
+                SetRect(&m_rcPaneMute, m_rcPaneBox.left, m_rcPaneBox.bottom - Sc(40), m_rcPaneBox.right, m_rcPaneBox.bottom);
+            SetRect(&m_rcPaneSlider, xMid - Sc(2), m_rcPaneValue.bottom + Sc(12), xMid + Sc(2),
+                    (m_iPaneSlider == TFY_PANE_VOLUME ? m_rcPaneMute.top : m_rcPaneBox.bottom - Sc(14)) - Sc(12));
+        }
+    }
+
+    int HitTestPane(POINT pt)
+    {
+        RECT rcHit;
+        int i;
+
+        if (m_iPaneSlider >= 0)
+        {
+            rcHit = m_rcPaneSlider;
+            InflateRect(&rcHit, Sc(18), Sc(8));
+            if (PtInRect(&rcHit, pt))
+                return m_iPaneSlider == TFY_PANE_VOLUME ? TFY_QSHIT_SLIDER : TFY_QSHIT_BRIGHTNESS;
+            if (PtInRect(&m_rcPaneMute, pt))
+                return TFY_QSHIT_PANEMUTE;
+            if (PtInRect(&m_rcPaneBox, pt))
+                return TFY_QSHIT_NONE;
+        }
+        for (i = 0; i < TFY_PANE_TILES; i++)
+        {
+            if (PtInRect(&m_rcPaneTiles[i], pt))
+                return TFY_QSHIT_PANETILE + i;
+        }
+        for (i = 0; i < TFY_PANE_LINKS; i++)
+        {
+            if (PtInRect(&m_rcPaneLinks[i], pt))
+                return TFY_QSHIT_PANELINK + i;
+        }
+        if (PtInRect(&m_rcPaneChange, pt))
+            return TFY_QSHIT_PANECHANGE;
+        return TFY_QSHIT_NONE;
+    }
+
+    int DragPercent(POINT pt, BOOL bBrightness)
+    {
+        int h = m_rcPaneSlider.bottom - m_rcPaneSlider.top;
+
+        if (!m_bPane)
+            return bBrightness ? BrightnessFromX(pt.x) : PercentFromX(pt.x);
+        return h > 0 ? max(0, min(MulDiv(m_rcPaneSlider.bottom - pt.y, 100, h), 100)) : 0;
+    }
+
+    VOID PaneLanguage(HKL hkl)
+    {
+        LCID lcid = MAKELCID(LOWORD((ULONG_PTR)hkl), SORT_DEFAULT);
+
+        if (!GetLocaleInfoW(lcid, LOCALE_SISO639LANGNAME2, m_szLang, _countof(m_szLang)) &&
+            !GetLocaleInfoW(lcid, LOCALE_SABBREVLANGNAME, m_szLang, _countof(m_szLang)))
+        {
+            m_szLang[0] = UNICODE_NULL;
+        }
+        CharUpperW(m_szLang);
+    }
+
+    LPCWSTR PaneTileLabel(int i, LPWSTR pszBuf, SIZE_T cchBuf, LPCWSTR *ppszGlyph, BOOL *pbEnabled)
+    {
+        *pbEnabled = TRUE;
+        switch (i)
+        {
+            case TFY_PANE_NETWORK:
+            {
+                if (m_bAirplane)
+                {
+                    *ppszGlyph = L"airplane_20_regular";
+                    return L"Airplane mode";
+                }
+                if (!m_bLoaded)
+                {
+                    *ppszGlyph = L"wifi_1_20_regular";
+                    return L"";
+                }
+                if (m_bHasWlan)
+                {
+                    *ppszGlyph = m_bWifiOn ? L"wifi_1_20_regular" : L"wifi_off_20_regular";
+                    if (!m_bWifiOn)
+                        return L"Unavailable";
+                    WifiStatus(pszBuf, cchBuf);
+                    return wcscmp(pszBuf, L"On") ? pszBuf : L"Available";
+                }
+                *ppszGlyph = L"plug_connected_20_regular";
+                return NetworkConnected() ? L"Connected" : L"Unavailable";
+            }
+            case TFY_PANE_VOLUME:
+                if (m_bMute)
+                    *ppszGlyph = L"speaker_mute_20_regular";
+                else if (m_nMaster == 0)
+                    *ppszGlyph = L"speaker_0_20_regular";
+                else if (m_nMaster < 50)
+                    *ppszGlyph = L"speaker_1_20_regular";
+                else
+                    *ppszGlyph = L"speaker_2_20_regular";
+                if (m_bMute)
+                    return L"Mute";
+                StringCchPrintfW(pszBuf, cchBuf, L"%d", m_nMaster);
+                return pszBuf;
+            case TFY_PANE_BRIGHTNESS:
+                *ppszGlyph = L"brightness_high_20_regular";
+                *pbEnabled = m_nBrightness >= 0;
+                return L"Brightness";
+            case TFY_PANE_NOTIFICATIONS:
+                *ppszGlyph = L"alert_20_regular";
+                return TrayNotifications_IsHidden() ? L"Hidden" : L"Notifications";
+            case TFY_PANE_POWER:
+                *ppszGlyph = L"power_20_regular";
+                return L"Power";
+            default:
+                *ppszGlyph = L"keyboard_20_regular";
+                return m_szLang[0] ? m_szLang : L"Keyboard";
+        }
+    }
+
+    VOID PaneHover(ShellFrame::Canvas &canvas, const RECT *prc, int iHit)
+    {
+        if (m_iHot == iHit)
+            canvas.Fill(*prc, TfyMix(m_Pal.PanelBg, m_Pal.PanelText, m_iPressed == iHit ? 44 : 24));
+    }
+
+    VOID PaintPane(ShellFrame::Canvas &canvas, const RECT &rc)
+    {
+        static const LPCWSTR s_Links[TFY_PANE_LINKS] = { L"Control Panel", L"Personalization", L"PC info", L"Help" };
+        COLORREF crActive = TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 36);
+        RECT rcText;
+        int i;
+
+        canvas.Fill(rc, m_Pal.PanelBg);
+        canvas.Text(L"Settings", m_rcPaneTitle, m_hFontPaneTitle, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        canvas.Text(L"Desktop", m_rcPaneSection, m_hFontTitle, m_Pal.DimText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        for (i = 0; i < TFY_PANE_LINKS; i++)
+        {
+            PaneHover(canvas, &m_rcPaneLinks[i], TFY_QSHIT_PANELINK + i);
+            rcText = m_rcPaneLinks[i];
+            rcText.left = m_rcPaneTitle.left;
+            rcText.right = m_rcPaneTitle.right;
+            canvas.Text(s_Links[i], rcText, m_hFontPane, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        if (m_iPaneSlider >= 0)
+        {
+            BOOL bVolume = (m_iPaneSlider == TFY_PANE_VOLUME);
+            int nPercent = bVolume ? m_nMaster : m_nBrightness;
+            int yFill = m_rcPaneSlider.bottom - MulDiv(nPercent, m_rcPaneSlider.bottom - m_rcPaneSlider.top, 100);
+            int xMid = (m_rcPaneSlider.left + m_rcPaneSlider.right) / 2;
+            RECT rcFill = m_rcPaneSlider, rcThumb, rcIcon;
+            WCHAR szValue[8];
+
+            canvas.Fill(m_rcPaneBox, crActive);
+            StringCchPrintfW(szValue, _countof(szValue), L"%d", nPercent);
+            canvas.Text(szValue, m_rcPaneValue, m_hFontPane, m_Pal.PanelText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            canvas.Fill(m_rcPaneSlider, TfyMix(crActive, m_Pal.PanelText, 90));
+            rcFill.top = yFill;
+            canvas.Fill(rcFill, m_Pal.AccentBg);
+            SetRect(&rcThumb, xMid - Sc(12), yFill - Sc(4), xMid + Sc(12), yFill + Sc(4));
+            canvas.Fill(rcThumb, m_Pal.PanelText);
+            if (bVolume)
+            {
+                PaneHover(canvas, &m_rcPaneMute, TFY_QSHIT_PANEMUTE);
+                SetRect(&rcIcon, xMid - Sc(10), (m_rcPaneMute.top + m_rcPaneMute.bottom) / 2 - Sc(10),
+                        xMid + Sc(10), (m_rcPaneMute.top + m_rcPaneMute.bottom) / 2 + Sc(10));
+                canvas.Icon(m_bMute ? L"speaker_mute_20_regular" : L"speaker_2_20_regular", rcIcon, m_Pal.PanelText);
+            }
+        }
+
+        for (i = 0; i < TFY_PANE_TILES; i++)
+        {
+            const RECT *prc = &m_rcPaneTiles[i];
+            WCHAR szBuf[64];
+            LPCWSTR pszGlyph, pszLabel;
+            BOOL bEnabled;
+            RECT rcIcon, rcLabel;
+            COLORREF crText;
+
+            pszLabel = PaneTileLabel(i, szBuf, _countof(szBuf), &pszGlyph, &bEnabled);
+            if (m_iPaneSlider == i)
+                canvas.Fill(*prc, crActive);
+            else if (bEnabled)
+                PaneHover(canvas, prc, TFY_QSHIT_PANETILE + i);
+            crText = bEnabled ? m_Pal.PanelText : m_Pal.DimText;
+            SetRect(&rcIcon, (prc->left + prc->right) / 2 - Sc(14), prc->top + Sc(12),
+                    (prc->left + prc->right) / 2 + Sc(14), prc->top + Sc(40));
+            canvas.Icon(pszGlyph, rcIcon, crText);
+            SetRect(&rcLabel, prc->left + Sc(4), prc->bottom - Sc(32), prc->right - Sc(4), prc->bottom - Sc(8));
+            canvas.Text(pszLabel, rcLabel, m_hFontPaneSmall, crText,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        PaneHover(canvas, &m_rcPaneChange, TFY_QSHIT_PANECHANGE);
+        rcText = m_rcPaneChange;
+        rcText.left = m_rcPaneTitle.left;
+        rcText.right = m_rcPaneTitle.right;
+        canvas.Text(L"Change PC settings", rcText, m_hFontPane, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        canvas.Line(0, 0, 0, rc.bottom, m_Pal.Border);
+    }
+
+    UINT PaneTrackMenu(HMENU hMenu, int iTile)
+    {
+        POINT pt = { m_rcPaneTiles[iTile].right, m_rcPaneTiles[iTile].top };
+
+        ClientToScreen(&pt);
+        return (UINT)TrackPopupMenuEx(hMenu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                                      pt.x, pt.y, m_hWnd, NULL);
+    }
+
+    VOID PaneNotificationsMenu()
+    {
+        HMENU hMenu = CreatePopupMenu();
+        UINT uCmd;
+
+        if (!hMenu)
+            return;
+        if (TrayNotifications_IsHidden())
+        {
+            AppendMenuW(hMenu, MF_STRING, 1, L"Show notifications");
+        }
+        else
+        {
+            AppendMenuW(hMenu, MF_STRING, 60, L"Hide for 1 hour");
+            AppendMenuW(hMenu, MF_STRING, 180, L"Hide for 3 hours");
+            AppendMenuW(hMenu, MF_STRING, 480, L"Hide for 8 hours");
+        }
+        uCmd = PaneTrackMenu(hMenu, TFY_PANE_NOTIFICATIONS);
+        DestroyMenu(hMenu);
+        if (uCmd == 1)
+            g_TfyNotifHideUntil = 0;
+        else if (uCmd)
+            g_TfyNotifHideUntil = GetTickCount64() + (ULONGLONG)uCmd * 60000;
+    }
+
+    VOID PanePowerMenu()
+    {
+        HWND hwndOwner = m_hwndOwner;
+        HMENU hMenu = CreatePopupMenu();
+        UINT uCmd;
+
+        if (!hMenu)
+            return;
+        if (StartMenu2_IsPowerCommandAllowed(SM2F_SLEEP))
+            AppendMenuW(hMenu, MF_STRING, SM2F_SLEEP, L"Sleep");
+        if (StartMenu2_IsPowerCommandAllowed(SM2F_HIBERNATE))
+            AppendMenuW(hMenu, MF_STRING, SM2F_HIBERNATE, L"Hibernate");
+        AppendMenuW(hMenu, MF_STRING, SM2F_SHUTDOWN, L"Shut down");
+        AppendMenuW(hMenu, MF_STRING, SM2F_RESTART, L"Restart");
+        uCmd = PaneTrackMenu(hMenu, TFY_PANE_POWER);
+        DestroyMenu(hMenu);
+        if (!uCmd)
+            return;
+        FadeOut();
+        StartMenu2_DoPowerCommand(hwndOwner, (INT)uCmd);
+    }
+
+    VOID PaneKeyboardMenu()
+    {
+        HKL ahkl[32];
+        HKL hklCur = GetKeyboardLayout(0);
+        int n = GetKeyboardLayoutList(_countof(ahkl), ahkl);
+        HMENU hMenu;
+        UINT uCmd;
+
+        if (n <= 0 || !(hMenu = CreatePopupMenu()))
+            return;
+        for (int i = 0; i < n; i++)
+        {
+            LCID lcid = MAKELCID(LOWORD((ULONG_PTR)ahkl[i]), SORT_DEFAULT);
+            WCHAR szName[128], szItem[160], szAbbrev[16];
+
+            if (!GetLocaleInfoW(lcid, LOCALE_SLANGUAGE, szName, _countof(szName)))
+                szName[0] = UNICODE_NULL;
+            if (!GetLocaleInfoW(lcid, LOCALE_SISO639LANGNAME2, szAbbrev, _countof(szAbbrev)) &&
+                !GetLocaleInfoW(lcid, LOCALE_SABBREVLANGNAME, szAbbrev, _countof(szAbbrev)))
+            {
+                szAbbrev[0] = UNICODE_NULL;
+            }
+            CharUpperW(szAbbrev);
+            StringCchPrintfW(szItem, _countof(szItem), L"%s\t%s", szName, szAbbrev);
+            AppendMenuW(hMenu, MF_STRING | (ahkl[i] == hklCur ? MF_CHECKED : 0), (UINT_PTR)(i + 1), szItem);
+        }
+        uCmd = PaneTrackMenu(hMenu, TFY_PANE_KEYBOARD);
+        DestroyMenu(hMenu);
+        if (!uCmd || uCmd > (UINT)n)
+            return;
+        SystemParametersInfoW(SPI_SETDEFAULTINPUTLANG, 0, &ahkl[uCmd - 1], SPIF_SENDCHANGE);
+        ActivateKeyboardLayout(ahkl[uCmd - 1], 0);
+        ::PostMessageW(HWND_BROADCAST, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)ahkl[uCmd - 1]);
+        PaneLanguage(ahkl[uCmd - 1]);
+    }
+
+    VOID OpenPaneLink(int i)
+    {
+        WCHAR szPath[MAX_PATH];
+
+        switch (i)
+        {
+            case 0:
+                ShellExecuteW(NULL, NULL, L"control.exe", NULL, NULL, SW_SHOWNORMAL);
+                break;
+            case 1:
+                ShellExecuteW(NULL, NULL, L"control.exe", L"desk.cpl", NULL, SW_SHOWNORMAL);
+                break;
+            case 2:
+                ShellExecuteW(NULL, NULL, L"control.exe", L"sysdm.cpl", NULL, SW_SHOWNORMAL);
+                break;
+            default:
+                if (ExpandEnvironmentStringsW(L"%SystemRoot%\\readme.txt", szPath, _countof(szPath)))
+                    ShellExecuteW(NULL, NULL, szPath, NULL, NULL, SW_SHOWNORMAL);
+                break;
+        }
+    }
+
+    VOID ActivatePane(int iHit)
+    {
+        RECT rcAnchor = m_rcAnchor;
+        HWND hwndOwner = m_hwndOwner;
+
+        if (iHit == TFY_QSHIT_PANEMUTE)
+        {
+            ToggleMute();
+            return;
+        }
+        if (iHit == TFY_QSHIT_PANECHANGE)
+        {
+            TfyQsOpenSettings(L"ms-settings:");
+            FadeOut();
+            return;
+        }
+        if (iHit >= TFY_QSHIT_PANELINK && iHit < TFY_QSHIT_PANELINK + TFY_PANE_LINKS)
+        {
+            OpenPaneLink(iHit - TFY_QSHIT_PANELINK);
+            FadeOut();
+            return;
+        }
+        if (iHit < TFY_QSHIT_PANETILE || iHit >= TFY_QSHIT_PANETILE + TFY_PANE_TILES)
+            return;
+        switch (iHit - TFY_QSHIT_PANETILE)
+        {
+            case TFY_PANE_NETWORK:
+                HandOffFlyout(m_hWnd);
+                FadeOut();
+                g_bTfyNetFromSettings = TRUE;
+                TrayNetwork_Toggle(hwndOwner, &rcAnchor);
+                return;
+            case TFY_PANE_VOLUME:
+                m_iPaneSlider = (m_iPaneSlider == TFY_PANE_VOLUME) ? -1 : TFY_PANE_VOLUME;
+                break;
+            case TFY_PANE_BRIGHTNESS:
+                if (m_nBrightness < 0)
+                    return;
+                m_iPaneSlider = (m_iPaneSlider == TFY_PANE_BRIGHTNESS) ? -1 : TFY_PANE_BRIGHTNESS;
+                break;
+            case TFY_PANE_NOTIFICATIONS:
+                PaneNotificationsMenu();
+                break;
+            case TFY_PANE_POWER:
+                PanePowerMenu();
+                return;
+            default:
+                PaneKeyboardMenu();
+                break;
+        }
+        Layout();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    int HitTest(POINT pt)
+    {
+        RECT rcSliderHit = m_rcSlider;
+
+        if (m_bPane)
+            return HitTestPane(pt);
+        for (UINT i = 0; i < m_cTiles; i++)
+        {
+            if (!PtInRect(&m_Tiles[i].rc, pt))
+                continue;
+            if (m_Tiles[i].bMore && (!m_Tiles[i].bToggle || PtInRect(&m_Tiles[i].rcMore, pt)))
+                return TFY_QSHIT_ARROW + (int)i;
+            return (int)i;
+        }
+        InflateRect(&rcSliderHit, Sc(4), Sc(14));
+        if (PtInRect(&rcSliderHit, pt))
+            return TFY_QSHIT_SLIDER;
+        if (m_nBrightness >= 0)
+        {
+            rcSliderHit = m_rcBrightSlider;
+            InflateRect(&rcSliderHit, Sc(4), Sc(14));
+            if (PtInRect(&rcSliderHit, pt))
+                return TFY_QSHIT_BRIGHTNESS;
+        }
+        if (PtInRect(&m_rcMute, pt))
+            return TFY_QSHIT_MUTE;
+        if (PtInRect(&m_rcSoundMore, pt))
+            return TFY_QSHIT_SOUNDMORE;
+        if (m_bBattery && PtInRect(&m_rcBattery, pt))
+            return TFY_QSHIT_BATTERY;
+        if (PtInRect(&m_rcSettings, pt))
+            return TFY_QSHIT_SETTINGS;
+        return TFY_QSHIT_NONE;
+    }
+
+    LPCWSTR TileGlyph(const TFYQSTILE *pTile)
+    {
+        switch (pTile->Kind)
+        {
+            case TFY_QSTILE_WIFI: return pTile->bOn ? L"wifi_1_20_regular" : L"wifi_off_20_regular";
+            case TFY_QSTILE_ETHERNET: return L"plug_connected_20_regular";
+            case TFY_QSTILE_BLUETOOTH: return L"bluetooth_20_regular";
+            default: return L"battery_saver_20_regular";
+        }
+    }
+
+    LPCWSTR TileLabel(const TFYQSTILE *pTile)
+    {
+        switch (pTile->Kind)
+        {
+            case TFY_QSTILE_WIFI: return L"Wi-Fi";
+            case TFY_QSTILE_ETHERNET: return L"Ethernet";
+            case TFY_QSTILE_BLUETOOTH: return L"Bluetooth";
+            default: return L"Power mode";
+        }
+    }
+
+    COLORREF CardFill(BOOL bHot, BOOL bPressed)
+    {
+        return TfyMix(m_Pal.PanelBg, m_Pal.PanelText, bPressed ? 16 : (bHot ? 34 : 24));
+    }
+
+    VOID DrawHoverPill(ShellFrame::Canvas &canvas, const RECT *prc, int iHit)
+    {
+        if (m_iHot == iHit)
+            canvas.FillRound(*prc, (float)Sc(6), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, m_iPressed == iHit ? 22 : 36));
+    }
+
+    VOID CenterGlyph(ShellFrame::Canvas &canvas, const RECT *prc, int size, LPCWSTR pszGlyph, COLORREF crGlyph)
+    {
+        RECT rc;
+
+        rc.left = (prc->left + prc->right - size) / 2;
+        rc.top = (prc->top + prc->bottom - size) / 2;
+        rc.right = rc.left + size;
+        rc.bottom = rc.top + size;
+        canvas.Icon(pszGlyph, rc, crGlyph);
+    }
+
+    VOID DrawTile(ShellFrame::Canvas &canvas, UINT i)
+    {
+        TFYQSTILE *pTile = &m_Tiles[i];
+        BOOL bMoreHot = m_iHot == TFY_QSHIT_ARROW + (int)i;
+        BOOL bToggleHot = m_iHot == (int)i && pTile->bEnabled;
+        BOOL bSplit = pTile->bToggle && pTile->bMore;
+        BOOL bActive = pTile->bOn && pTile->bEnabled;
+        COLORREF crBadge, crGlyph, crTitle;
+        RECT rcTitle, rcStatus, rcHot;
+
+        canvas.FillRound(pTile->rc, (float)Sc(18), CardFill(FALSE, FALSE));
+        if (bMoreHot || bToggleHot)
+        {
+            rcHot = pTile->rc;
+            if (bSplit && bMoreHot)
+                rcHot.left = pTile->rcMore.left;
+            else if (bSplit)
+                rcHot.right = pTile->rcMore.left;
+            canvas.Graphics().SetClip(Gdiplus::Rect(rcHot.left, rcHot.top, rcHot.right - rcHot.left,
+                                                    rcHot.bottom - rcHot.top));
+            canvas.FillRound(pTile->rc, (float)Sc(18), CardFill(TRUE, m_iPressed == m_iHot));
+            canvas.Graphics().ResetClip();
+        }
+        if (bSplit)
+        {
+            canvas.Line(pTile->rcMore.left, pTile->rc.top + Sc(14), pTile->rcMore.left, pTile->rc.bottom - Sc(14),
+                        TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 60));
+        }
+        if (pTile->bMore)
+            CenterGlyph(canvas, &pTile->rcMore, Sc(12), L"chevron_right_12_regular", m_Pal.PanelText);
+        if (bActive)
+        {
+            crBadge = bToggleHot ? TfyMix(m_Pal.AccentBg, RGB(255, 255, 255), 28) : m_Pal.AccentBg;
+            crGlyph = m_Pal.AccentText;
+        }
+        else
+        {
+            crBadge = TfyMix(m_Pal.PanelBg, m_Pal.PanelText, bToggleHot ? 70 : 52);
+            crGlyph = pTile->bEnabled ? m_Pal.PanelText : m_Pal.DimText;
+        }
+        canvas.FillRound(pTile->rcBadge, (float)Sc(6), crBadge);
+        CenterGlyph(canvas, &pTile->rcBadge, Sc(20), TileGlyph(pTile), crGlyph);
+
+        crTitle = pTile->bEnabled ? m_Pal.PanelText : m_Pal.DimText;
+        SetRect(&rcTitle, pTile->rcBadge.right + Sc(10), pTile->rc.top + Sc(11),
+                pTile->bMore ? pTile->rcMore.left - Sc(8) : pTile->rc.right - Sc(14), pTile->rc.top + Sc(30));
+        SetRect(&rcStatus, rcTitle.left, rcTitle.bottom, rcTitle.right, pTile->rc.bottom - Sc(10));
+        if (!pTile->szStatus[0])
+            OffsetRect(&rcTitle, 0, Sc(9));
+        canvas.Text(TileLabel(pTile), rcTitle, m_hFontTitle, crTitle,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (pTile->szStatus[0])
+            canvas.Text(pTile->szStatus, rcStatus, m_hFontSmall, m_Pal.DimText,
+                        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    VOID DrawSlider(ShellFrame::Canvas &canvas)
+    {
+        DrawSliderAt(canvas, m_rcSlider, m_nMaster, m_iHot == TFY_QSHIT_SLIDER || m_bDragSlider);
+    }
+
+    VOID DrawSliderAt(ShellFrame::Canvas &canvas, const RECT &rcSlider, int nPercent, BOOL bHot)
+    {
+        int xFill = rcSlider.left + MulDiv(nPercent, rcSlider.right - rcSlider.left, 100);
+        int cyMid = (rcSlider.top + rcSlider.bottom) / 2;
+        RECT rcFill = rcSlider, rcThumb, rcDot;
+        int rOuter = Sc(10), rInner = bHot ? Sc(7) : Sc(6);
+
+        canvas.FillRound(rcSlider, (float)Sc(2), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 90));
+        rcFill.right = max(xFill, rcFill.left + Sc(4));
+        canvas.FillRound(rcFill, (float)Sc(2), m_Pal.AccentBg);
+        SetRect(&rcThumb, xFill - rOuter, cyMid - rOuter, xFill + rOuter, cyMid + rOuter);
+        canvas.FillEllipse(rcThumb, TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 60));
+        SetRect(&rcDot, xFill - rInner, cyMid - rInner, xFill + rInner, cyMid + rInner);
+        canvas.FillEllipse(rcDot, m_Pal.AccentBg);
+    }
+
+    VOID DrawBrightness(ShellFrame::Canvas &canvas)
+    {
+        WCHAR szValue[8];
+        RECT rcValue;
+
+        if (m_nBrightness < 0)
+            return;
+        canvas.FillRound(m_rcBright, (float)Sc(18), CardFill(FALSE, FALSE));
+        canvas.Text(L"Brightness", m_rcBrightTitle, m_hFontTitle, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        CenterGlyph(canvas, &m_rcBrightIcon, Sc(20), L"brightness_high_20_regular", m_Pal.PanelText);
+        DrawSliderAt(canvas, m_rcBrightSlider, m_nBrightness, m_iHot == TFY_QSHIT_BRIGHTNESS || m_bDragBrightness);
+        SetRect(&rcValue, m_rcBrightSlider.right + Sc(8), m_rcBrightIcon.top, m_rcBright.right - Sc(8), m_rcBrightIcon.bottom);
+        StringCchPrintfW(szValue, _countof(szValue), L"%d", m_nBrightness);
+        canvas.Text(szValue, rcValue, m_hFont, m_Pal.PanelText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    VOID DrawSound(ShellFrame::Canvas &canvas)
+    {
+        LPCWSTR pszSpeaker;
+
+        canvas.FillRound(m_rcSound, (float)Sc(18), CardFill(FALSE, FALSE));
+        canvas.Text(L"Sound", m_rcSoundTitle, m_hFontTitle, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (m_bMute)
+            pszSpeaker = L"speaker_mute_20_regular";
+        else if (m_nMaster == 0)
+            pszSpeaker = L"speaker_0_20_regular";
+        else if (m_nMaster < 50)
+            pszSpeaker = L"speaker_1_20_regular";
+        else
+            pszSpeaker = L"speaker_2_20_regular";
+        DrawHoverPill(canvas, &m_rcMute, TFY_QSHIT_MUTE);
+        CenterGlyph(canvas, &m_rcMute, Sc(20), pszSpeaker, m_Pal.PanelText);
+        DrawSlider(canvas);
+        DrawHoverPill(canvas, &m_rcSoundMore, TFY_QSHIT_SOUNDMORE);
+        CenterGlyph(canvas, &m_rcSoundMore, Sc(12), L"chevron_right_12_regular", m_Pal.PanelText);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdcWnd = BeginPaint(&ps);
+        RECT rc;
+
+        GetClientRect(&rc);
+        if (m_bPane)
+        {
+            ShellFrame::Canvas canvas(hdcWnd, rc);
+
+            PaintPane(canvas, rc);
+        }
+        else
+        {
+            ShellFrame::Canvas canvas(hdcWnd, rc);
+
+            canvas.Fill(rc, m_Pal.PanelBg);
+            for (UINT i = 0; i < m_cTiles; i++)
+                DrawTile(canvas, i);
+            DrawBrightness(canvas);
+            DrawSound(canvas);
+            canvas.Fill(m_rcFooter, TfyMix(m_Pal.PanelBg, RGB(0, 0, 0), 60));
+            if (m_bBattery)
+            {
+                WCHAR szPercent[16];
+                RECT rcIcon = m_rcBattery, rcText = m_rcBattery;
+                UINT nBattery;
+
+                if (m_sps.ACLineStatus == 1)
+                    nBattery = IDI_FLU_BATTCHG;
+                else if (m_sps.BatteryLifePercent <= 10)
+                    nBattery = IDI_FLU_BATT0;
+                else if (m_sps.BatteryLifePercent <= 35)
+                    nBattery = IDI_FLU_BATT1;
+                else if (m_sps.BatteryLifePercent <= 60)
+                    nBattery = IDI_FLU_BATT2;
+                else if (m_sps.BatteryLifePercent <= 85)
+                    nBattery = IDI_FLU_BATT3;
+                else
+                    nBattery = IDI_FLU_BATT4;
+                DrawHoverPill(canvas, &m_rcBattery, TFY_QSHIT_BATTERY);
+                canvas.Graphics().Flush(Gdiplus::FlushIntentionSync);
+                rcIcon.right = rcIcon.left + Sc(32);
+                TfyDrawFluent(canvas.Dc(), &rcIcon, nBattery);
+                rcText.left = rcIcon.right;
+                StringCchPrintfW(szPercent, _countof(szPercent), L"%u%%",
+                                 (m_sps.BatteryLifePercent <= 100) ? m_sps.BatteryLifePercent : 0);
+                canvas.Text(szPercent, rcText, m_hFont, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
+            DrawHoverPill(canvas, &m_rcSettings, TFY_QSHIT_SETTINGS);
+            CenterGlyph(canvas, &m_rcSettings, Sc(20), L"settings_20_regular", m_Pal.PanelText);
+            canvas.Graphics().Flush(Gdiplus::FlushIntentionSync);
+            TfyDrawFlyoutFrame(canvas.Dc(), &rc, &m_Pal);
+        }
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHit = HitTest(pt);
+
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        if (m_bDragSlider)
+        {
+            ApplyVolume(DragPercent(pt, FALSE));
+            return 0;
+        }
+        if (m_bDragBrightness)
+        {
+            ApplyBrightness(DragPercent(pt, TRUE));
+            return 0;
+        }
+        if (iHit != m_iHot)
+        {
+            m_iHot = iHit;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot != TFY_QSHIT_NONE && !m_bDragSlider && !m_bDragBrightness)
+        {
+            m_iHot = TFY_QSHIT_NONE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnLButtonDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        m_iPressed = HitTest(pt);
+        if (m_iPressed == TFY_QSHIT_SLIDER)
+        {
+            m_bDragSlider = TRUE;
+            SetCapture();
+            ApplyVolume(DragPercent(pt, FALSE));
+        }
+        else if (m_iPressed == TFY_QSHIT_BRIGHTNESS)
+        {
+            m_bDragBrightness = TRUE;
+            SetCapture();
+            ApplyBrightness(DragPercent(pt, TRUE));
+        }
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    VOID ActivateTile(UINT i, BOOL bMore)
+    {
+        TFYQSTILE *pTile = &m_Tiles[i];
+        RECT rcAnchor = m_rcAnchor;
+        HWND hwndOwner = m_hwndOwner;
+
+        switch (pTile->Kind)
+        {
+            case TFY_QSTILE_BLUETOOTH:
+                if (bMore)
+                {
+                    HandOffFlyout(m_hWnd);
+                    FadeOut();
+                    TrayBluetooth_Toggle(hwndOwner, &rcAnchor);
+                    return;
+                }
+                if (!pTile->bEnabled || !TfyToggleDevices(m_hWnd, &m_Radios, !pTile->bOn))
+                    return;
+                break;
+            case TFY_QSTILE_POWER:
+                HandOffFlyout(m_hWnd);
+                FadeOut();
+                TrayPower_Toggle(hwndOwner, &rcAnchor);
+                return;
+            case TFY_QSTILE_ETHERNET:
+                if (bMore)
+                {
+                    TfyQsOpenSettings(L"ms-settings:network-ethernet");
+                    FadeOut();
+                    return;
+                }
+                if (!pTile->bEnabled || !TfyToggleDevices(m_hWnd, &m_Wired, !pTile->bOn))
+                    return;
+                break;
+            case TFY_QSTILE_WIFI:
+                if (bMore)
+                {
+                    HandOffFlyout(m_hWnd);
+                    FadeOut();
+                    TfyNetworkToggle(hwndOwner, &rcAnchor, FALSE);
+                    return;
+                }
+                if (!pTile->bEnabled)
+                    return;
+                m_bWifiOn = !m_bWifiOn;
+                TfyQsWlanSetRadio(m_bWifiOn);
+                break;
+        }
+        BuildTiles();
+        Layout();
+        InvalidateRect(NULL, FALSE);
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iPressed = m_iPressed;
+        int iHit = HitTest(pt);
+        RECT rcAnchor = m_rcAnchor;
+        HWND hwndOwner = m_hwndOwner;
+
+        m_iPressed = TFY_QSHIT_NONE;
+        if (m_bDragSlider || m_bDragBrightness)
+        {
+            m_bDragSlider = FALSE;
+            m_bDragBrightness = FALSE;
+            ReleaseCapture();
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+        InvalidateRect(NULL, FALSE);
+        if (iPressed != iHit || iHit == TFY_QSHIT_NONE)
+            return 0;
+
+        if (m_bPane)
+        {
+            ActivatePane(iHit);
+            return 0;
+        }
+        if (iHit >= 0 && iHit < (int)m_cTiles)
+            ActivateTile((UINT)iHit, FALSE);
+        else if (iHit >= TFY_QSHIT_ARROW && iHit < TFY_QSHIT_ARROW + (int)m_cTiles)
+            ActivateTile((UINT)(iHit - TFY_QSHIT_ARROW), TRUE);
+        else if (iHit == TFY_QSHIT_MUTE)
+            ToggleMute();
+        else if (iHit == TFY_QSHIT_SOUNDMORE)
+        {
+            HandOffFlyout(m_hWnd);
+            FadeOut();
+            TrayVolume_Toggle(hwndOwner, &rcAnchor);
+        }
+        else if (iHit == TFY_QSHIT_BATTERY)
+        {
+            HandOffFlyout(m_hWnd);
+            FadeOut();
+            TrayPower_Toggle(hwndOwner, &rcAnchor);
+        }
+        else if (iHit == TFY_QSHIT_SETTINGS)
+        {
+            TfyQsOpenSettings(L"ms-settings:");
+            FadeOut();
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        int nDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        ApplyVolume(m_nMaster + (nDelta > 0 ? 2 : -2));
+        return 0;
+    }
+
+    LRESULT OnDevicesChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        QueryDevices();
+        BuildTiles();
+        Layout();
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnSettingChange(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        SetTimer(TFY_TIMER_QSTHEME, 150, NULL);
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == TFY_TIMER_QSTHEME)
+        {
+            KillTimer(TFY_TIMER_QSTHEME);
+            StartMenu2_GetFlyoutPalette(&m_Pal);
+            RefreshFlyoutMaterial(m_hWnd, m_Pal.PanelBg);
+            BuildTiles();
+            Layout();
+            InvalidateRect(NULL, FALSE);
+            return 0;
+        }
+        if (wParam == TFY_TIMER_AUDIOLOAD)
+        {
+            if (m_AnimPhase == TFY_OPEN)
+                return 0;
+            KillTimer(TFY_TIMER_AUDIOLOAD);
+            if (!m_bLoaded)
+                LoadState();
+            return 0;
+        }
+        HandleFlyoutAnimation(m_hWnd, wParam);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_AUDIOLOAD);
+        KillTimer(TFY_TIMER_QSTHEME);
+        TrayMediaCard_Close();
+        if (m_hFont)
+        {
+            DeleteObject(m_hFont);
+            m_hFont = NULL;
+        }
+        if (m_hFontTitle)
+        {
+            DeleteObject(m_hFontTitle);
+            m_hFontTitle = NULL;
+        }
+        if (m_hFontSmall)
+        {
+            DeleteObject(m_hFontSmall);
+            m_hFontSmall = NULL;
+        }
+        if (m_hFontPaneTitle)
+        {
+            DeleteObject(m_hFontPaneTitle);
+            m_hFontPaneTitle = NULL;
+        }
+        if (m_hFontPane)
+        {
+            DeleteObject(m_hFontPane);
+            m_hFontPane = NULL;
+        }
+        if (m_hFontPaneSmall)
+        {
+            DeleteObject(m_hFontPaneSmall);
+            m_hFontPaneSmall = NULL;
+        }
+        if (m_bFrameStarted)
+        {
+            ShellFrame::Shutdown();
+            m_bFrameStarted = FALSE;
+        }
+        m_Fallback.Close();
+        if (::IsWindow(m_hwndOwner))
+            ::InvalidateRect(m_hwndOwner, NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnVolumeChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (!m_bDragSlider)
+        {
+            m_nMaster = (int)InterlockedCompareExchange(&g_TfyAudioPercent, 0, 0);
+            m_bMute = InterlockedCompareExchange(&g_TfyAudioMute, 0, 0) != 0;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    LRESULT OnBrightnessChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (!m_bDragBrightness && m_nBrightness >= 0)
+        {
+            m_nBrightness = (int)InterlockedCompareExchange(&g_TfyBrightness, 0, 0);
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    BEGIN_MSG_MAP(CTrayQuickSettingsWnd)
+        MESSAGE_HANDLER(TFY_WM_VOLUMECHANGED, OnVolumeChanged)
+        MESSAGE_HANDLER(TFY_WM_BRIGHTNESSCHANGED, OnBrightnessChanged)
+        MESSAGE_HANDLER(TFY_WM_DEVICESCHANGED, OnDevicesChanged)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_SETTINGCHANGE, OnSettingChange)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnLButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayQuickSettingsWnd *g_pTrayQuickSettings = NULL;
+static ULONGLONG g_QuickSettingsDismissTick = 0;
+
+void CTrayQuickSettingsWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayQuickSettings == this)
+        g_pTrayQuickSettings = NULL;
+    delete this;
+}
+
+VOID CTrayQuickSettingsWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    TrayMediaCard_Close();
+    g_QuickSettingsDismissTick = m_AnimT0;
+    if (::IsWindow(m_hwndOwner))
+        ::InvalidateRect(m_hwndOwner, NULL, FALSE);
+}
+
+BOOL TrayQuickSettings_IsOpen(VOID)
+{
+    return g_pTrayQuickSettings && g_pTrayQuickSettings->IsWindow() &&
+           g_pTrayQuickSettings->IsWindowVisible() && g_pTrayQuickSettings->m_AnimPhase != TFY_CLOSE;
+}
+
+VOID TrayQuickSettings_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_QuickSettingsDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+
+    if (g_pTrayQuickSettings && g_pTrayQuickSettings->IsWindow())
+    {
+        if (g_pTrayQuickSettings->IsWindowVisible() && g_pTrayQuickSettings->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayQuickSettings->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayQuickSettings->m_hWnd);
+        g_pTrayQuickSettings = NULL;
+    }
+
+    CTrayQuickSettingsWnd *pQuickSettings = new CTrayQuickSettingsWnd();
+    if (!pQuickSettings)
+        return;
+    if (!pQuickSettings->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pQuickSettings;
+        return;
+    }
+    g_pTrayQuickSettings = pQuickSettings;
+    pQuickSettings->Toggle(hwndOwner, prcAnchor);
+}
+
+#define TFY_TIMER_BTREFRESH 0x56
+#define TFY_BT_ROWS 6
+
+#define TFY_BTHIT_NONE   -1
+#define TFY_BTHIT_BACK   -2
+#define TFY_BTHIT_SWITCH -3
+#define TFY_BTHIT_LINK   -4
+
+static LPCWSTR
+TfyBluetoothGlyph(ULONG ulClass)
+{
+    switch (GET_COD_MAJOR(ulClass))
+    {
+        case COD_MAJOR_COMPUTER: return L"laptop_20_regular";
+        case COD_MAJOR_PHONE: return L"phone_laptop_20_regular";
+        case COD_MAJOR_AUDIO: return L"headphones_20_regular";
+        case COD_MAJOR_PERIPHERAL: return L"keyboard_20_regular";
+        case COD_MAJOR_IMAGING: return L"print_20_regular";
+        default: return L"bluetooth_20_regular";
+    }
+}
+
+class CTrayBluetoothWnd :
+    public CWindowImpl<CTrayBluetoothWnd, CWindow, CTrayFlyoutTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayBluetoothFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HFONT m_hFontHeader;
+    HFONT m_hFontRow;
+    HFONT m_hFontSmall;
+    BOOL m_bFrameStarted;
+    TFYDEVICES m_Radios;
+    TFYBTDEVICE m_Devices[16];
+    UINT m_cDevices;
+    int m_nScroll;
+    int m_iHot;
+    BOOL m_bTracking;
+    BOOL m_bLaunching;
+    RECT m_rcAnchor;
+    RECT m_rcBack;
+    RECT m_rcSwitch;
+    RECT m_rcList;
+    RECT m_rcLink;
+    int m_yFooter;
+    SIZE m_size;
+
+    CTrayBluetoothWnd() : m_hFontHeader(NULL), m_hFontRow(NULL), m_hFontSmall(NULL), m_bFrameStarted(FALSE),
+                          m_cDevices(0), m_nScroll(0), m_iHot(TFY_BTHIT_NONE), m_bTracking(FALSE),
+                          m_bLaunching(FALSE), m_yFooter(0)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_Radios, sizeof(m_Radios));
+        ZeroMemory(m_Devices, sizeof(m_Devices));
+        SetRectEmpty(&m_rcAnchor);
+        SetRectEmpty(&m_rcBack);
+        SetRectEmpty(&m_rcSwitch);
+        SetRectEmpty(&m_rcList);
+        SetRectEmpty(&m_rcLink);
+        ZeroMemory(&m_size, sizeof(m_size));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID Reload()
+    {
+        TfyQueryBluetoothRadios(&m_Radios);
+        m_cDevices = TfyDevicesOn(&m_Radios) ? TfyBluetoothDevices(m_Devices, _countof(m_Devices)) : 0;
+    }
+
+    VOID Layout()
+    {
+        const int cx = Sc(360);
+        int cRows = (int)min(m_cDevices, (UINT)TFY_BT_ROWS);
+        int y = Sc(56);
+
+        m_size.cx = cx;
+        SetRect(&m_rcBack, Sc(12), Sc(12), Sc(12) + Sc(32), Sc(12) + Sc(32));
+        SetRect(&m_rcSwitch, cx - Sc(20) - Sc(40), Sc(18), cx - Sc(20), Sc(18) + Sc(20));
+        if (m_nScroll > (int)m_cDevices - cRows)
+            m_nScroll = (int)m_cDevices - cRows;
+        if (m_nScroll < 0)
+            m_nScroll = 0;
+        SetRect(&m_rcList, Sc(8), y, cx - Sc(8), y + max(cRows, 2) * Sc(48));
+        y = m_rcList.bottom + Sc(6);
+        m_yFooter = y;
+        SetRect(&m_rcLink, Sc(16), y + Sc(8), cx - Sc(16), y + Sc(8) + Sc(32));
+        m_size.cy = y + Sc(48);
+    }
+
+    VOID Relayout()
+    {
+        POINT pt;
+
+        Layout();
+        TfyW11Position(::GetWindow(m_hWnd, GW_OWNER), &m_rcAnchor, m_size, FALSE, &pt);
+        m_ptFinal = pt;
+        if (m_AnimPhase == TFY_NONE)
+            SetWindowPos(NULL, pt.x, pt.y, m_size.cx, m_size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        else
+            SetWindowPos(NULL, 0, 0, m_size.cx, m_size.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(NULL, FALSE);
+    }
+
+    VOID Toggle(HWND hwndOwner, const RECT *prcAnchor)
+    {
+        POINT pt;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFontHeader)
+            m_hFontHeader = TfyCreateFont(14, FW_SEMIBOLD);
+        if (!m_hFontRow)
+            m_hFontRow = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontSmall)
+            m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+        if (!m_bFrameStarted)
+            m_bFrameStarted = ShellFrame::Startup();
+        m_rcAnchor = *prcAnchor;
+        Reload();
+        Layout();
+        TfyW11Position(hwndOwner, &m_rcAnchor, m_size, FALSE, &pt);
+        BeginFlyoutOpen(m_hWnd, pt.x, pt.y, m_size.cx, m_size.cy, m_Pal.PanelBg);
+    }
+
+    VOID FadeOut();
+
+    int HitTest(POINT pt)
+    {
+        if (PtInRect(&m_rcBack, pt))
+            return TFY_BTHIT_BACK;
+        if (m_Radios.cDevices && PtInRect(&m_rcSwitch, pt))
+            return TFY_BTHIT_SWITCH;
+        if (PtInRect(&m_rcLink, pt))
+            return TFY_BTHIT_LINK;
+        return TFY_BTHIT_NONE;
+    }
+
+    VOID PaintDevices(ShellFrame::Canvas &canvas)
+    {
+        LPCWSTR pszEmpty = NULL;
+
+        if (!m_Radios.cDevices)
+            pszEmpty = L"No Bluetooth adapter was found";
+        else if (!TfyDevicesOn(&m_Radios))
+            pszEmpty = L"Bluetooth is turned off";
+        else if (!m_cDevices)
+            pszEmpty = L"No devices are paired with this PC.";
+        if (pszEmpty)
+        {
+            canvas.Text(pszEmpty, m_rcList, m_hFontSmall, m_Pal.DimText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return;
+        }
+
+        for (int k = 0; k < TFY_BT_ROWS && m_nScroll + k < (int)m_cDevices; k++)
+        {
+            const TFYBTDEVICE *pDevice = &m_Devices[m_nScroll + k];
+            RECT rcRow = { m_rcList.left, m_rcList.top + k * Sc(48), m_rcList.right, m_rcList.top + (k + 1) * Sc(48) };
+            RECT rcBadge = { rcRow.left + Sc(8), rcRow.top + Sc(8), rcRow.left + Sc(40), rcRow.top + Sc(40) };
+            RECT rcGlyph = { rcBadge.left + Sc(6), rcBadge.top + Sc(6), rcBadge.right - Sc(6), rcBadge.bottom - Sc(6) };
+            RECT rcName = { rcBadge.right + Sc(12), rcRow.top + Sc(6), rcRow.right - Sc(8), rcRow.top + Sc(25) };
+            RECT rcStatus = { rcName.left, rcName.bottom, rcName.right, rcRow.bottom - Sc(5) };
+
+            canvas.FillRound(rcBadge, (float)Sc(6),
+                             pDevice->bConnected ? m_Pal.AccentBg : TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 40));
+            canvas.Icon(TfyBluetoothGlyph(pDevice->ulClass), rcGlyph,
+                        pDevice->bConnected ? m_Pal.AccentText : m_Pal.PanelText);
+            canvas.Text(pDevice->szName, rcName, m_hFontRow, m_Pal.PanelText,
+                        DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
+            canvas.Text(pDevice->bConnected ? L"Connected" : pDevice->bAuthenticated ? L"Paired" : L"Remembered",
+                        rcStatus, m_hFontSmall, m_Pal.DimText, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdcWnd = BeginPaint(&ps);
+        RECT rc;
+
+        GetClientRect(&rc);
+        {
+            ShellFrame::Canvas canvas(hdcWnd, rc);
+            RECT rcTitle = { m_rcBack.right + Sc(8), m_rcBack.top, m_rcSwitch.left - Sc(8), m_rcBack.bottom };
+            RECT rcArrow = { m_rcBack.left + Sc(8), m_rcBack.top + Sc(8), m_rcBack.right - Sc(8), m_rcBack.bottom - Sc(8) };
+            RECT rcSep = { 0, m_yFooter, rc.right, m_yFooter + 1 };
+            RECT rcLinkText = m_rcLink;
+
+            canvas.Fill(rc, m_Pal.PanelBg);
+            if (m_iHot == TFY_BTHIT_BACK)
+                canvas.FillRound(m_rcBack, (float)Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24));
+            canvas.Text(L"Bluetooth", rcTitle, m_hFontHeader, m_Pal.PanelText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            PaintDevices(canvas);
+            canvas.Fill(rcSep, TfyMix(m_Pal.PanelBg, m_Pal.Border, 140));
+            if (m_iHot == TFY_BTHIT_LINK)
+                canvas.FillRound(m_rcLink, (float)Sc(4), TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 24));
+            rcLinkText.left += Sc(4);
+            canvas.Text(L"More Bluetooth settings", rcLinkText, m_hFontRow, m_Pal.PanelText,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            canvas.Graphics().Flush(Gdiplus::FlushIntentionSync);
+            TfyDrawFluent(canvas.Dc(), &rcArrow, IDI_FLU_ARROWLEFT);
+            TfyDrawSwitch(canvas.Dc(), &m_rcSwitch, TfyDevicesOn(&m_Radios), m_iHot == TFY_BTHIT_SWITCH,
+                          m_Radios.cDevices != 0, &m_Pal);
+        }
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHot = HitTest(pt);
+
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        if (iHot != m_iHot)
+        {
+            m_iHot = iHot;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        if (m_iHot != TFY_BTHIT_NONE)
+        {
+            m_iHot = TFY_BTHIT_NONE;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseWheel(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        int nOld = m_nScroll;
+
+        m_nScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        Layout();
+        if (m_nScroll != nOld)
+            InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHit = HitTest(pt);
+
+        if (iHit == TFY_BTHIT_BACK)
+        {
+            HWND hwndOwner = ::GetWindow(m_hWnd, GW_OWNER);
+            RECT rcAnchor = m_rcAnchor;
+
+            HandOffFlyout(m_hWnd);
+            FadeOut();
+            TrayQuickSettings_Toggle(hwndOwner, &rcAnchor);
+        }
+        else if (iHit == TFY_BTHIT_SWITCH)
+        {
+            if (TfyToggleDevices(m_hWnd, &m_Radios, !TfyDevicesOn(&m_Radios)))
+            {
+                if (!TfyDevicesOn(&m_Radios))
+                    m_cDevices = 0;
+                Relayout();
+            }
+        }
+        else if (iHit == TFY_BTHIT_LINK)
+        {
+            m_bLaunching = TRUE;
+            ShellExecuteW(NULL, NULL, L"ms-settings:bluetooth", NULL, NULL, SW_SHOWNORMAL);
+            m_bLaunching = FALSE;
+            FadeOut();
+        }
+        return 0;
+    }
+
+    LRESULT OnDevicesChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        Reload();
+        Relayout();
+        if (TfyDevicesOn(&m_Radios))
+            SetTimer(TFY_TIMER_BTREFRESH, 1500, NULL);
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == TFY_TIMER_BTREFRESH)
+        {
+            KillTimer(TFY_TIMER_BTREFRESH);
+            Reload();
+            Relayout();
+            return 0;
+        }
+        HandleFlyoutAnimation(m_hWnd, wParam);
+        return 0;
+    }
+
+    LRESULT OnActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (LOWORD(wParam) == WA_INACTIVE && !m_bLaunching)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnKeyDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (wParam == VK_ESCAPE)
+            FadeOut();
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_BTREFRESH);
+        if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = NULL; }
+        if (m_hFontRow) { DeleteObject(m_hFontRow); m_hFontRow = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayBluetoothWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_MOUSEWHEEL, OnMouseWheel)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_ACTIVATE, OnActivate)
+        MESSAGE_HANDLER(WM_KEYDOWN, OnKeyDown)
+        MESSAGE_HANDLER(TFY_WM_DEVICESCHANGED, OnDevicesChanged)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayBluetoothWnd *g_pTrayBluetooth = NULL;
+static ULONGLONG g_BtDismissTick = 0;
+
+void CTrayBluetoothWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayBluetooth == this)
+        g_pTrayBluetooth = NULL;
+    delete this;
+}
+
+VOID CTrayBluetoothWnd::FadeOut()
+{
+    if (!BeginFlyoutClose(m_hWnd))
+        return;
+    g_BtDismissTick = m_AnimT0;
+    KillTimer(TFY_TIMER_BTREFRESH);
+}
+
+VOID TrayBluetooth_Toggle(IN HWND hwndOwner, IN const RECT *prcAnchor)
+{
+    if (GetTickCount64() - g_BtDismissTick < TFY_REOPEN_GUARD_MS)
+        return;
+    if (g_pTrayBluetooth && g_pTrayBluetooth->IsWindow())
+    {
+        if (g_pTrayBluetooth->IsWindowVisible() && g_pTrayBluetooth->m_AnimPhase != TFY_CLOSE)
+        {
+            g_pTrayBluetooth->FadeOut();
+            return;
+        }
+        ::DestroyWindow(g_pTrayBluetooth->m_hWnd);
+        g_pTrayBluetooth = NULL;
+    }
+
+    CTrayBluetoothWnd *pBluetooth = new CTrayBluetoothWnd();
+    if (!pBluetooth)
+        return;
+    if (!pBluetooth->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pBluetooth;
+        return;
+    }
+    g_pTrayBluetooth = pBluetooth;
+    pBluetooth->Toggle(hwndOwner, prcAnchor);
+}
+
+#define TFY_TIMER_MEDIAPOLL 0x55
+
+class CTrayMediaCardWnd :
+    public CWindowImpl<CTrayMediaCardWnd, CWindow, CTrayOsdTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayMediaFlyout", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HFONT m_hFontApp;
+    HFONT m_hFontTitle;
+    BOOL m_bFrameStarted;
+    BOOL m_bTracking;
+    TFYMEDIA m_Media;
+    SIZE m_size;
+    RECT m_rcIcon, m_rcApp, m_rcTitle, m_rcArtist, m_rcButtons[3];
+    int m_iHot;
+    int m_iPressed;
+
+    CTrayMediaCardWnd() : m_hFontApp(NULL), m_hFontTitle(NULL), m_bFrameStarted(FALSE), m_bTracking(FALSE),
+                          m_iHot(-1), m_iPressed(-1)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_Media, sizeof(m_Media));
+        ZeroMemory(&m_size, sizeof(m_size));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    VOID Layout(int cx)
+    {
+        int xMid = cx / 2, yMid = Sc(137);
+
+        m_size.cx = cx;
+        m_size.cy = Sc(178);
+        SetRect(&m_rcIcon, Sc(24), Sc(21), Sc(40), Sc(37));
+        SetRect(&m_rcApp, Sc(50), Sc(17), cx - Sc(16), Sc(41));
+        SetRect(&m_rcTitle, Sc(25), Sc(57), cx - Sc(25), Sc(78));
+        SetRect(&m_rcArtist, Sc(25), Sc(78), cx - Sc(25), Sc(97));
+        for (int i = 0; i < 3; i++)
+        {
+            int x = xMid + (i - 1) * Sc(66);
+            SetRect(&m_rcButtons[i], x - Sc(20), yMid - Sc(20), x + Sc(20), yMid + Sc(20));
+        }
+    }
+
+    BOOL Open(const RECT *prcQuickSettings)
+    {
+        if (!TfyMediaQuery(&m_Media))
+            return FALSE;
+
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        if (!m_hFontApp)
+            m_hFontApp = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontTitle)
+            m_hFontTitle = TfyCreateFont(14, FW_SEMIBOLD);
+        if (!m_bFrameStarted)
+            m_bFrameStarted = ShellFrame::Startup();
+        Layout(prcQuickSettings->right - prcQuickSettings->left);
+        BeginFlyoutOpen(m_hWnd, prcQuickSettings->left, prcQuickSettings->top - Sc(12) - m_size.cy,
+                        m_size.cx, m_size.cy, m_Pal.PanelBg, FALSE);
+        SetTimer(TFY_TIMER_MEDIAPOLL, 1000, NULL);
+        return TRUE;
+    }
+
+    int HitTest(POINT pt)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            if (PtInRect(&m_rcButtons[i], pt))
+                return i;
+        }
+        return -1;
+    }
+
+    VOID Refresh()
+    {
+        if (!TfyMediaQuery(&m_Media))
+        {
+            BeginFlyoutClose(m_hWnd);
+            return;
+        }
+        InvalidateRect(NULL, FALSE);
+    }
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        static const LPCWSTR s_Glyphs[3] = { L"previous_20_filled", NULL, L"next_20_filled" };
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(&ps);
+        RECT rc;
+
+        GetClientRect(&rc);
+        {
+            ShellFrame::Canvas canvas(hdc, rc);
+
+            canvas.Fill(rc, m_Pal.PanelBg);
+            canvas.Text(m_Media.szApp, m_rcApp, m_hFontApp, m_Pal.DimText,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            canvas.Text(m_Media.szTitle, m_rcTitle, m_hFontTitle, m_Pal.PanelText,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            canvas.Text(m_Media.szArtist, m_rcArtist, m_hFontApp, m_Pal.DimText,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            for (int i = 0; i < 3; i++)
+            {
+                LPCWSTR pszGlyph = s_Glyphs[i] ? s_Glyphs[i] :
+                                   (m_Media.bPlaying ? L"pause_20_filled" : L"play_20_filled");
+                RECT rcGlyph;
+
+                if (m_iHot == i)
+                {
+                    canvas.FillRound(m_rcButtons[i], (float)Sc(6),
+                                     TfyMix(m_Pal.PanelBg, m_Pal.PanelText, m_iPressed == i ? 22 : 36));
+                }
+                rcGlyph.left = (m_rcButtons[i].left + m_rcButtons[i].right - Sc(16)) / 2;
+                rcGlyph.top = (m_rcButtons[i].top + m_rcButtons[i].bottom - Sc(16)) / 2;
+                rcGlyph.right = rcGlyph.left + Sc(16);
+                rcGlyph.bottom = rcGlyph.top + Sc(16);
+                canvas.Icon(pszGlyph, rcGlyph, m_Pal.PanelText);
+            }
+            canvas.Graphics().Flush(Gdiplus::FlushIntentionSync);
+            if (m_Media.hIcon)
+            {
+                DrawIconEx(canvas.Dc(), m_rcIcon.left, m_rcIcon.top, m_Media.hIcon,
+                           m_rcIcon.right - m_rcIcon.left, m_rcIcon.bottom - m_rcIcon.top, 0, NULL, DI_NORMAL);
+            }
+        }
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        if (HandleFlyoutAnimation(m_hWnd, wParam))
+            return 0;
+        if (wParam == TFY_TIMER_MEDIAPOLL && m_AnimPhase != TFY_CLOSE)
+        {
+            SetTimer(TFY_TIMER_MEDIAPOLL, 1000, NULL);
+            Refresh();
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHit = HitTest(pt);
+
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            m_bTracking = TrackMouseEvent(&tme);
+        }
+        if (iHit != m_iHot)
+        {
+            m_iHot = iHit;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        m_iHot = -1;
+        m_iPressed = -1;
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnLButtonDown(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        m_iPressed = HitTest(pt);
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        static const UINT s_Commands[3] = { APPCOMMAND_MEDIA_PREVIOUSTRACK, APPCOMMAND_MEDIA_PLAY_PAUSE,
+                                            APPCOMMAND_MEDIA_NEXTTRACK };
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHit = HitTest(pt);
+
+        if (iHit >= 0 && iHit == m_iPressed && m_Media.hwndSession)
+        {
+            ::PostMessageW(m_Media.hwndSession, WM_APPCOMMAND, (WPARAM)m_hWnd,
+                           MAKELPARAM(0, FAPPCOMMAND_MOUSE | s_Commands[iHit]));
+            SetTimer(TFY_TIMER_MEDIAPOLL, 300, NULL);
+        }
+        m_iPressed = -1;
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnMouseActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return MA_NOACTIVATE;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        KillTimer(TFY_TIMER_MEDIAPOLL);
+        TfyMediaFree(&m_Media);
+        if (m_hFontApp) { DeleteObject(m_hFontApp); m_hFontApp = NULL; }
+        if (m_hFontTitle) { DeleteObject(m_hFontTitle); m_hFontTitle = NULL; }
+        if (m_bFrameStarted)
+        {
+            ShellFrame::Shutdown();
+            m_bFrameStarted = FALSE;
+        }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayMediaCardWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONDOWN, OnLButtonDown)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayMediaCardWnd *g_pTrayMediaCard = NULL;
+
+void CTrayMediaCardWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayMediaCard == this)
+        g_pTrayMediaCard = NULL;
+    delete this;
+}
+
+static VOID
+TrayMediaCard_Close(VOID)
+{
+    if (g_pTrayMediaCard && g_pTrayMediaCard->IsWindow())
+        g_pTrayMediaCard->BeginFlyoutClose(g_pTrayMediaCard->m_hWnd);
+}
+
+static VOID
+TrayMediaCard_Open(HWND hwndOwner, const RECT *prcQuickSettings)
+{
+    CTrayMediaCardWnd *pCard;
+
+    if (g_pTrayMediaCard && g_pTrayMediaCard->IsWindow())
+    {
+        ::DestroyWindow(g_pTrayMediaCard->m_hWnd);
+        g_pTrayMediaCard = NULL;
+    }
+    if (!TrayMedia_FindSession(NULL))
+        return;
+
+    pCard = new CTrayMediaCardWnd();
+    if (!pCard)
+        return;
+    if (!pCard->Create(hwndOwner, CWindow::rcDefault, NULL))
+    {
+        delete pCard;
+        return;
+    }
+    g_pTrayMediaCard = pCard;
+    if (!pCard->Open(prcQuickSettings))
+        ::DestroyWindow(pCard->m_hWnd);
+}
+
+static VOID
+TfyNotifRemove(UINT i)
+{
+    if (i >= g_cTfyNotifs)
+        return;
+    if (g_TfyNotifs[i].hIcon)
+        DestroyIcon(g_TfyNotifs[i].hIcon);
+    MoveMemory(&g_TfyNotifs[i], &g_TfyNotifs[i + 1], (g_cTfyNotifs - i - 1) * sizeof(g_TfyNotifs[0]));
+    g_cTfyNotifs--;
+    if (g_cTfyUnread > g_cTfyNotifs)
+        g_cTfyUnread = g_cTfyNotifs;
+    TfyNotifySink();
+}
+
+static VOID
+TfyNotifMarkRead(VOID)
+{
+    if (g_cTfyUnread)
+    {
+        g_cTfyUnread = 0;
+        TfyNotifySink();
+    }
+}
+
+typedef CWinTraits<WS_POPUP | WS_CLIPCHILDREN,
+                   WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE> CTrayPanelTraits;
+
+#define TFY_NC_HEADER 48
+#define TFY_NC_CARDGAP 8
+#define TFY_NC_PAD 12
+#define TFY_NC_MAX_VISIBLE 8
+
+class CTrayNotifCenterWnd :
+    public CWindowImpl<CTrayNotifCenterWnd, CWindow, CTrayPanelTraits>,
+    public CTrayFlyoutAnimation
+{
+public:
+    DECLARE_WND_CLASS_EX(L"TrayNotificationCenter", CS_DROPSHADOW, COLOR_WINDOW)
+
+    SM2_FLYOUT_PALETTE m_Pal;
+    HWND m_hwndCalendar;
+    HFONT m_hFontHeader;
+    HFONT m_hFontTitle;
+    HFONT m_hFont;
+    HFONT m_hFontSmall;
+    RECT m_rcClearAll;
+    RECT m_rcCards[TFY_NC_MAX_VISIBLE];
+    RECT m_rcDismiss[TFY_NC_MAX_VISIBLE];
+    UINT m_cCards;
+    int m_iHot;
+    BOOL m_bHotDismiss;
+    BOOL m_bHotClear;
+    BOOL m_bTracking;
+    SIZE m_size;
+    int m_cyMax;
+
+    CTrayNotifCenterWnd() : m_hwndCalendar(NULL), m_hFontHeader(NULL), m_hFontTitle(NULL),
+                            m_hFont(NULL), m_hFontSmall(NULL), m_cCards(0), m_iHot(-1),
+                            m_bHotDismiss(FALSE), m_bHotClear(FALSE), m_bTracking(FALSE), m_cyMax(0)
+    {
+        ZeroMemory(&m_Pal, sizeof(m_Pal));
+        ZeroMemory(&m_rcClearAll, sizeof(m_rcClearAll));
+        ZeroMemory(m_rcCards, sizeof(m_rcCards));
+        ZeroMemory(m_rcDismiss, sizeof(m_rcDismiss));
+        ZeroMemory(&m_size, sizeof(m_size));
+    }
+
+    int Sc(int v) const { return ShellScaleForDpi(v); }
+
+    int MeasureText(HDC hdc, HFONT hFont, LPCWSTR psz, int cx, UINT uFormat)
+    {
+        RECT rc = { 0, 0, cx, 0 };
+        HGDIOBJ hOld;
+
+        if (!psz || !*psz)
+            return 0;
+        hOld = SelectObject(hdc, hFont);
+        DrawTextW(hdc, psz, -1, &rc, uFormat | DT_CALCRECT | DT_NOPREFIX);
+        SelectObject(hdc, hOld);
+        return rc.bottom;
+    }
+
+    VOID Layout(int cx)
+    {
+        HDC hdc = GetDC();
+        int y = Sc(TFY_NC_HEADER);
+        int cxText = cx - 2 * Sc(TFY_NC_PAD) - 2 * Sc(TFY_NC_PAD);
+
+        m_size.cx = cx;
+        SetRect(&m_rcClearAll, cx - Sc(TFY_NC_PAD) - Sc(72), Sc(10), cx - Sc(TFY_NC_PAD), Sc(38));
+        m_cCards = 0;
+        for (UINT i = 0; hdc && i < g_cTfyNotifs && m_cCards < TFY_NC_MAX_VISIBLE; i++)
+        {
+            int cy = Sc(TFY_NC_PAD) + Sc(20) + Sc(6);
+            cy += MeasureText(hdc, m_hFontTitle, g_TfyNotifs[i].szTitle, cxText, DT_SINGLELINE | DT_END_ELLIPSIS);
+            cy += MeasureText(hdc, m_hFont, g_TfyNotifs[i].szText, cxText, DT_WORDBREAK);
+            cy += Sc(TFY_NC_PAD);
+            if (m_cyMax && y + cy + Sc(TFY_NC_PAD) > m_cyMax)
+                break;
+            SetRect(&m_rcCards[m_cCards], Sc(TFY_NC_PAD), y, cx - Sc(TFY_NC_PAD), y + cy);
+            SetRect(&m_rcDismiss[m_cCards], m_rcCards[m_cCards].right - Sc(32), y + Sc(6),
+                    m_rcCards[m_cCards].right - Sc(6), y + Sc(32));
+            y += cy + Sc(TFY_NC_CARDGAP);
+            m_cCards++;
+        }
+        if (hdc)
+            ReleaseDC(hdc);
+        if (!m_cCards)
+            y += Sc(56);
+        m_size.cy = y + Sc(TFY_NC_PAD) - (m_cCards ? Sc(TFY_NC_CARDGAP) : 0);
+    }
+
+    BOOL Place(BOOL bAnimate)
+    {
+        RECT rcCal;
+        MONITORINFO mi;
+        int yBottom;
+
+        if (!::IsWindow(m_hwndCalendar))
+            return FALSE;
+        if (g_pTrayCalendar && g_pTrayCalendar->m_hWnd == m_hwndCalendar)
+        {
+            SetRect(&rcCal, g_pTrayCalendar->m_ptFinal.x, g_pTrayCalendar->m_ptFinal.y,
+                    g_pTrayCalendar->m_ptFinal.x + g_pTrayCalendar->m_size.cx,
+                    g_pTrayCalendar->m_ptFinal.y + g_pTrayCalendar->m_size.cy);
+        }
+        else if (!::GetWindowRect(m_hwndCalendar, &rcCal))
+        {
+            return FALSE;
+        }
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromRect(&rcCal, MONITOR_DEFAULTTONEAREST), &mi);
+        yBottom = rcCal.top - Sc(12);
+        m_cyMax = yBottom - (mi.rcMonitor.top + Sc(12));
+        if (m_cyMax < Sc(TFY_NC_HEADER) + Sc(56))
+            return FALSE;
+        Layout(rcCal.right - rcCal.left);
+        if (bAnimate)
+        {
+            BeginFlyoutOpen(m_hWnd, rcCal.left, yBottom - m_size.cy, m_size.cx, m_size.cy,
+                            m_Pal.PanelBg, FALSE);
+            SetPropW(m_hWnd, DWM_PROP_CORNER_RADIUS, (HANDLE)(ULONG_PTR)TfyFlyoutRadius());
+        }
+        else
+        {
+            m_ptFinal.x = rcCal.left;
+            m_ptFinal.y = yBottom - m_size.cy;
+            SetWindowPos(NULL, rcCal.left, yBottom - m_size.cy, m_size.cx, m_size.cy,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InvalidateRect(NULL, FALSE);
+        return TRUE;
+    }
+
+    BOOL Open(HWND hwndCalendar)
+    {
+        StartMenu2_GetFlyoutPalette(&m_Pal);
+        m_hwndCalendar = hwndCalendar;
+        if (!m_hFontHeader) m_hFontHeader = TfyCreateFont(14, FW_SEMIBOLD);
+        if (!m_hFontTitle) m_hFontTitle = TfyCreateFont(12, FW_SEMIBOLD);
+        if (!m_hFont) m_hFont = TfyCreateFont(12, FW_NORMAL);
+        if (!m_hFontSmall) m_hFontSmall = TfyCreateFont(11, FW_NORMAL);
+        if (!Place(TRUE))
+            return FALSE;
+        TfyNotifMarkRead();
+        return TRUE;
+    }
+
+    VOID FadeOut();
+
+    LRESULT OnPaint(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        PAINTSTRUCT ps;
+        HDC hdcWnd = BeginPaint(&ps);
+        RECT rc, rcText;
+        HDC hdc;
+        HBITMAP hbm;
+        HGDIOBJ hbmOld, hFontOld;
+        HBRUSH hbr;
+        COLORREF crCard = TfyMix(m_Pal.PanelBg, m_Pal.PanelText, 14);
+
+        GetClientRect(&rc);
+        hdc = CreateCompatibleDC(hdcWnd);
+        hbm = hdc ? CreateCompatibleBitmap(hdcWnd, rc.right, rc.bottom) : NULL;
+        if (!hbm)
+        {
+            if (hdc)
+                DeleteDC(hdc);
+            EndPaint(&ps);
+            return 0;
+        }
+        hbmOld = SelectObject(hdc, hbm);
+        hFontOld = SelectObject(hdc, m_hFontHeader);
+        SetBkMode(hdc, TRANSPARENT);
+        hbr = CreateSolidBrush(m_Pal.PanelBg);
+        FillRect(hdc, &rc, hbr);
+        DeleteObject(hbr);
+
+        SetTextColor(hdc, m_Pal.PanelText);
+        SetRect(&rcText, Sc(16), 0, rc.right - Sc(100), Sc(TFY_NC_HEADER));
+        DrawTextW(hdc, L"Notifications", -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        if (g_cTfyNotifs)
+        {
+            if (m_bHotClear)
+                ShellDrawTrayPill(hdc, &m_rcClearAll, TRAY_PILL_HOT);
+            SelectObject(hdc, m_hFont);
+            DrawTextW(hdc, L"Clear all", -1, &m_rcClearAll, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        else
+        {
+            SelectObject(hdc, m_hFont);
+            SetTextColor(hdc, m_Pal.DimText);
+            SetRect(&rcText, 0, Sc(TFY_NC_HEADER), rc.right, Sc(TFY_NC_HEADER) + Sc(56));
+            DrawTextW(hdc, L"No new notifications", -1, &rcText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+
+        for (UINT i = 0; i < m_cCards && i < g_cTfyNotifs; i++)
+        {
+            const TFYNOTIF *pNotif = &g_TfyNotifs[i];
+            RECT rcCard = m_rcCards[i], rcRow;
+            WCHAR szTime[32];
+            int x = rcCard.left + Sc(TFY_NC_PAD);
+            int y = rcCard.top + Sc(TFY_NC_PAD);
+
+            TfyFillRound(hdc, &rcCard, TfyFlyoutRadius(),
+                         (m_iHot == (int)i) ? TfyMix(crCard, m_Pal.PanelText, 10) : crCard, m_Pal.PanelBg);
+            if (pNotif->hIcon)
+                DrawIconEx(hdc, x, y + Sc(2), pNotif->hIcon, Sc(16), Sc(16), 0, NULL, DI_NORMAL);
+
+            SelectObject(hdc, m_hFontSmall);
+            SetTextColor(hdc, m_Pal.DimText);
+            SetRect(&rcRow, x + Sc(24), y, rcCard.right - Sc(TFY_NC_PAD) - Sc(60), y + Sc(20));
+            DrawTextW(hdc, pNotif->szApp, -1, &rcRow, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (m_iHot == (int)i)
+            {
+                if (m_bHotDismiss)
+                    ShellDrawTrayPill(hdc, &m_rcDismiss[i], TRAY_PILL_HOT);
+                ShellDrawTrayGlyph(hdc, &m_rcDismiss[i], IDI_FLU_TRAYDISMISS);
+            }
+            else if (GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, &pNotif->stTime, NULL, szTime, _countof(szTime)))
+            {
+                SetRect(&rcRow, rcCard.right - Sc(TFY_NC_PAD) - Sc(80), y, rcCard.right - Sc(TFY_NC_PAD), y + Sc(20));
+                DrawTextW(hdc, szTime, -1, &rcRow, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            y += Sc(20) + Sc(6);
+
+            SelectObject(hdc, m_hFontTitle);
+            SetTextColor(hdc, m_Pal.PanelText);
+            SetRect(&rcRow, x, y, rcCard.right - Sc(TFY_NC_PAD), rcCard.bottom);
+            y += MeasureText(hdc, m_hFontTitle, pNotif->szTitle, rcRow.right - rcRow.left, DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextW(hdc, pNotif->szTitle, -1, &rcRow, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+            SelectObject(hdc, m_hFont);
+            SetTextColor(hdc, TfyMix(m_Pal.PanelText, m_Pal.PanelBg, 40));
+            SetRect(&rcRow, x, y, rcCard.right - Sc(TFY_NC_PAD), rcCard.bottom - Sc(TFY_NC_PAD));
+            DrawTextW(hdc, pNotif->szText, -1, &rcRow, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        }
+
+        TfyDrawFlyoutFrame(hdc, &rc, &m_Pal);
+        BitBlt(hdcWnd, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, hFontOld);
+        SelectObject(hdc, hbmOld);
+        DeleteObject(hbm);
+        DeleteDC(hdc);
+        EndPaint(&ps);
+        return 0;
+    }
+
+    LRESULT OnEraseBkgnd(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return 1;
+    }
+
+    LRESULT OnMouseActivate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        return MA_NOACTIVATE;
+    }
+
+    LRESULT OnMouseMove(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int iHot = -1;
+        BOOL bDismiss = FALSE, bClear = (g_cTfyNotifs && PtInRect(&m_rcClearAll, pt));
+
+        if (!m_bTracking)
+        {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+            TrackMouseEvent(&tme);
+            m_bTracking = TRUE;
+        }
+        for (UINT i = 0; i < m_cCards; i++)
+        {
+            if (PtInRect(&m_rcCards[i], pt))
+            {
+                iHot = (int)i;
+                bDismiss = PtInRect(&m_rcDismiss[i], pt);
+                break;
+            }
+        }
+        if (iHot != m_iHot || bDismiss != m_bHotDismiss || bClear != m_bHotClear)
+        {
+            m_iHot = iHot;
+            m_bHotDismiss = bDismiss;
+            m_bHotClear = bClear;
+            InvalidateRect(NULL, FALSE);
+        }
+        return 0;
+    }
+
+    LRESULT OnMouseLeave(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        m_bTracking = FALSE;
+        m_iHot = -1;
+        m_bHotDismiss = FALSE;
+        m_bHotClear = FALSE;
+        InvalidateRect(NULL, FALSE);
+        return 0;
+    }
+
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        if (g_cTfyNotifs && PtInRect(&m_rcClearAll, pt))
+        {
+            while (g_cTfyNotifs)
+                TfyNotifRemove(0);
+            Place(FALSE);
+            return 0;
+        }
+        for (UINT i = 0; i < m_cCards && i < g_cTfyNotifs; i++)
+        {
+            if (!PtInRect(&m_rcCards[i], pt))
+                continue;
+            if (!PtInRect(&m_rcDismiss[i], pt))
+            {
+                HWND hwndPager = TfyFindPager();
+                TRAYICONITEM Item;
+
+                ZeroMemory(&Item, sizeof(Item));
+                Item.hWnd = g_TfyNotifs[i].hWndOwner;
+                Item.uID = g_TfyNotifs[i].uID;
+                if (hwndPager && ::IsWindow(Item.hWnd))
+                    TfySendIconEvent(hwndPager, &Item, NIN_BALLOONUSERCLICK);
+            }
+            TfyNotifRemove(i);
+            m_iHot = -1;
+            Place(FALSE);
+            break;
+        }
+        return 0;
+    }
+
+    LRESULT OnTimer(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        HandleFlyoutAnimation(m_hWnd, wParam);
+        return 0;
+    }
+
+    LRESULT OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
+    {
+        KillTimer(TFY_TIMER_ANIM);
+        if (m_hFontHeader) { DeleteObject(m_hFontHeader); m_hFontHeader = NULL; }
+        if (m_hFontTitle) { DeleteObject(m_hFontTitle); m_hFontTitle = NULL; }
+        if (m_hFont) { DeleteObject(m_hFont); m_hFont = NULL; }
+        if (m_hFontSmall) { DeleteObject(m_hFontSmall); m_hFontSmall = NULL; }
+        return 0;
+    }
+
+    virtual void OnFinalMessage(HWND hWnd) override;
+
+    BEGIN_MSG_MAP(CTrayNotifCenterWnd)
+        MESSAGE_HANDLER(WM_PAINT, OnPaint)
+        MESSAGE_HANDLER(WM_ERASEBKGND, OnEraseBkgnd)
+        MESSAGE_HANDLER(WM_MOUSEACTIVATE, OnMouseActivate)
+        MESSAGE_HANDLER(WM_TIMER, OnTimer)
+        MESSAGE_HANDLER(WM_MOUSEMOVE, OnMouseMove)
+        MESSAGE_HANDLER(WM_MOUSELEAVE, OnMouseLeave)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
+        MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+    END_MSG_MAP()
+};
+
+static CTrayNotifCenterWnd *g_pTrayNotifCenter = NULL;
+
+void CTrayNotifCenterWnd::OnFinalMessage(HWND hWnd)
+{
+    if (g_pTrayNotifCenter == this)
+        g_pTrayNotifCenter = NULL;
+    delete this;
+}
+
+VOID CTrayNotifCenterWnd::FadeOut()
+{
+    BeginFlyoutClose(m_hWnd);
+}
+
+static VOID
+TrayNotifCenter_Open(HWND hwndCalendar)
+{
+    if (g_pTrayNotifCenter && g_pTrayNotifCenter->IsWindow())
+        ::DestroyWindow(g_pTrayNotifCenter->m_hWnd);
+    g_pTrayNotifCenter = NULL;
+
+    CTrayNotifCenterWnd *pCenter = new CTrayNotifCenterWnd();
+    if (!pCenter)
+        return;
+    if (!pCenter->Create(hwndCalendar, CWindow::rcDefault, NULL))
+    {
+        delete pCenter;
+        return;
+    }
+    g_pTrayNotifCenter = pCenter;
+    if (!pCenter->Open(hwndCalendar))
+        ::DestroyWindow(pCenter->m_hWnd);
+}
+
+static VOID
+TrayNotifCenter_Close(VOID)
+{
+    if (g_pTrayNotifCenter && g_pTrayNotifCenter->IsWindow())
+        g_pTrayNotifCenter->FadeOut();
+}
+
+static VOID
+TrayNotifCenter_Refresh(VOID)
+{
+    if (g_pTrayNotifCenter && g_pTrayNotifCenter->IsWindow() &&
+        g_pTrayNotifCenter->m_AnimPhase != TFY_CLOSE)
+    {
+        g_pTrayNotifCenter->Place(FALSE);
+        TfyNotifMarkRead();
+    }
+}
+
+VOID TrayFlyoutsAux_Destroy(VOID)
+{
+    if (g_pTrayQuickSettings && g_pTrayQuickSettings->IsWindow())
+        ::DestroyWindow(g_pTrayQuickSettings->m_hWnd);
+    g_pTrayQuickSettings = NULL;
+    if (g_pTrayOverflow && g_pTrayOverflow->IsWindow())
+        ::DestroyWindow(g_pTrayOverflow->m_hWnd);
+    g_pTrayOverflow = NULL;
+    if (g_pTrayPower && g_pTrayPower->IsWindow())
+        ::DestroyWindow(g_pTrayPower->m_hWnd);
+    g_pTrayPower = NULL;
+    if (g_pTrayVolume && g_pTrayVolume->IsWindow())
+        ::DestroyWindow(g_pTrayVolume->m_hWnd);
+    g_pTrayVolume = NULL;
+    if (g_pTrayOsd && g_pTrayOsd->IsWindow())
+        ::DestroyWindow(g_pTrayOsd->m_hWnd);
+    g_pTrayOsd = NULL;
+    if (g_pTrayNetwork && g_pTrayNetwork->IsWindow())
+        ::DestroyWindow(g_pTrayNetwork->m_hWnd);
+    g_pTrayNetwork = NULL;
+    if (g_pTrayBluetooth && g_pTrayBluetooth->IsWindow())
+        ::DestroyWindow(g_pTrayBluetooth->m_hWnd);
+    g_pTrayBluetooth = NULL;
+}

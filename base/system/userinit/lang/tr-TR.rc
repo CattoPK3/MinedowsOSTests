@@ -1,0 +1,9 @@
+/* TRANSLATORS: 2013-2014, 2016 Erdem Ersoy (eersoy93) (erdemersoy [at] erdemersoy [dot] net); 2018 Ercan Ersoy (ercanersoy) (ercanersoy [at] ercanersoy [dot] net)*/
+
+LANGUAGE LANG_TURKISH, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit, kabuğu başlatmada başarısız oldu!"
+    IDS_INSTALLER_FAIL "Userinit, Kurulumu başlatmada başarısız oldu!"
+END

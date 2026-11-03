@@ -1,0 +1,7 @@
+LANGUAGE LANG_NORWEGIAN, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit mislykket å starte skall!"
+    IDS_INSTALLER_FAIL "Userinit failed to start the installer!"
+END

@@ -1,0 +1,12 @@
+/*
+ * TRANSLATION: ??
+                2020 - Catalin Gabriel Draghita (catalingabriel.reactos@outlook.com)
+ */
+
+LANGUAGE LANG_SPANISH, SUBLANG_NEUTRAL
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "¡Userinit no pudo iniciar el shell con éxito!"
+    IDS_INSTALLER_FAIL "¡Userinit no pudo iniciar el instalador!"
+END

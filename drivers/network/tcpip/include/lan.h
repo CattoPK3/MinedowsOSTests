@@ -1,0 +1,130 @@
+/*
+ * COPYRIGHT:   See COPYING in the top level directory
+ * PROJECT:     ReactOS TCP/IP protocol driver
+ * FILE:        include/lan.h
+ * PURPOSE:     LAN adapter definitions
+ */
+
+#pragma once
+
+/* Media we support */
+#define MEDIA_ETH 0
+
+#define MAX_MEDIA 1
+
+#define IEEE_802_ADDR_LENGTH 6
+
+/* Ethernet header layout */
+typedef struct ETH_HEADER {
+    UCHAR DstAddr[IEEE_802_ADDR_LENGTH]; /* Destination MAC address */
+    UCHAR SrcAddr[IEEE_802_ADDR_LENGTH]; /* Source MAC address */
+    USHORT EType;                        /* Ethernet protocol type */
+} ETH_HEADER, *PETH_HEADER;
+
+#define MAX_MEDIA_ETH sizeof(ETH_HEADER)
+
+/* Broadcast masks */
+#define BCAST_ETH_MASK 0x01
+
+/* Broadcast values to check against */
+#define BCAST_ETH_CHECK 0x01
+
+/* Offset of broadcast address */
+#define BCAST_ETH_OFFSET 0x00
+
+/* Max packets queued for a single adapter */
+#define IP_MAX_RECV_BACKLOG 0x20
+
+/* Per adapter information */
+#define LAN_MAX_MULTICAST 32
+
+typedef struct LAN_ADAPTER {
+    LIST_ENTRY ListEntry;                   /* Entry on list */
+    KSPIN_LOCK Lock;                        /* Lock for this structure */
+    LIST_ENTRY ReconfigureQueue;            /* Status indications in arrival order */
+    BOOLEAN ReconfigureActive;              /* One worker drains this adapter's queue */
+    EX_RUNDOWN_REF WorkRundown;             /* Protects queued adapter work */
+    EX_RUNDOWN_REF RequestRundown;
+    volatile LONG Closing;                  /* New callbacks must not queue work */
+    BOOLEAN Listed;                         /* Adapter is on the global list */
+    UCHAR State, OldState;                  /* State of the adapter */
+    BOOLEAN CompletingReset;                /* Reset is finishing */
+    KEVENT Event;                           /* Opening event */
+    PVOID Context;                          /* Upper layer context information */
+    NDIS_HANDLE NdisHandle;                 /* NDIS binding handle */
+    NDIS_STATUS NdisStatus;                 /* NDIS status of last request */
+    NDIS_MEDIUM Media;                      /* Media type */
+    UCHAR HWAddress[IEEE_802_ADDR_LENGTH];  /* Local HW address */
+    UINT HWAddressLength;                   /* Length of HW address */
+    UCHAR BCastMask;                        /* Mask for checking broadcast */
+    UCHAR BCastCheck;                       /* Value to check against */
+    UCHAR BCastOffset;                      /* Offset in frame to check against */
+    UCHAR HeaderSize;                       /* Size of link-level header */
+    UINT MTU;                               /* Maximum Transfer Unit */
+    UINT MinFrameSize;                      /* Minimum frame size in bytes */
+    UINT MaxPacketSize;                     /* Maximum packet size when sending */
+    UINT Speed;                             /* Link speed */
+    ULONG64 LinkSpeed;
+    NDIS_HANDLE NblPool;
+    volatile LONG Paused;
+    volatile LONG PendingSends;
+    KEVENT SendsDoneEvent;
+    UINT PacketFilter;                      /* Packet filter for this adapter */
+    UCHAR MulticastList[LAN_MAX_MULTICAST][IEEE_802_ADDR_LENGTH];
+    ULONG MulticastRefs[LAN_MAX_MULTICAST];
+    ULONG MulticastCount;
+} LAN_ADAPTER, *PLAN_ADAPTER;
+
+/* LAN adapter state constants */
+#define LAN_STATE_OPENING   0
+#define LAN_STATE_RESETTING 1
+#define LAN_STATE_STARTED   2
+#define LAN_STATE_STOPPED   3
+
+/* Size of out lookahead buffer */
+#define LOOKAHEAD_SIZE  128
+
+/* Ethernet types. We swap constants so we can compare values at runtime
+   without swapping them there */
+#define ETYPE_IPv4 WH2N(0x0800)
+#define ETYPE_IPv6 WH2N(0x86DD)
+#define ETYPE_ARP  WH2N(0x0806)
+
+/* Protocols */
+#define LAN_PROTO_IPv4 0x0000 /* Internet Protocol version 4 */
+#define LAN_PROTO_IPv6 0x0001 /* Internet Protocol version 6 */
+#define LAN_PROTO_ARP  0x0002 /* Address Resolution Protocol */
+
+
+NDIS_STATUS LANRegisterAdapter(
+    NDIS_HANDLE BindContext,
+    PNDIS_BIND_PARAMETERS BindParameters);
+
+NDIS_STATUS LANUnregisterAdapter(
+    PLAN_ADAPTER Adapter);
+
+NTSTATUS LANRegisterProtocol(
+    PNDIS_STRING Name);
+
+VOID NTAPI
+LANUnregisterProtocol(VOID);
+
+VOID LANStartup(VOID);
+VOID LANShutdown(VOID);
+
+NTSTATUS TcpipLanGetDwordOid( PIP_INTERFACE Interface, NDIS_OID Oid,
+                              PULONG Result );
+
+NDIS_STATUS LANUpdateMulticastList(
+    PVOID Context,
+    const UCHAR *Address,
+    BOOLEAN Add);
+
+NDIS_STATUS NDISCall(
+    PLAN_ADAPTER Adapter,
+    NDIS_REQUEST_TYPE Type,
+    NDIS_OID OID,
+    PVOID Buffer,
+    UINT Length);
+
+/* EOF */

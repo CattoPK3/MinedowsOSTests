@@ -1,0 +1,7 @@
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SHELL_FAIL "Userinit はシェルを開始できませんでした！"
+    IDS_INSTALLER_FAIL "Userinit はインストーラーの開始に失敗しました！"
+END

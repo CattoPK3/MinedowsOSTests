@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/CMakeFiles/host-tools-complete.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-build.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-configure.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-download.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-install.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-mkdir.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-patch.rule"
+		},
+		{
+			"file" : "C:/LiberNT/10.0-044/output-MinGW-amd64-debug/host-tools/src/host-tools-stamp/host-tools-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"host-tools"
+		],
+		"name" : "host-tools"
+	}
+}
