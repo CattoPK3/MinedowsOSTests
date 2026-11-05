@@ -245,6 +245,7 @@ typedef struct _VOLENTRY
     DWORD SerialNumber;
 
     WCHAR DriveLetter;
+    PWSTR DriveNumber;
 
     PWSTR pszLabel;
     PWSTR pszFilesystem;
@@ -614,6 +615,29 @@ AssignNextDriveLetter(
 BOOL
 DeleteDriveLetter(
     _In_ WCHAR DriveLetter);
+
+BOOL
+AssignDriveNumber(
+    _In_ PWSTR DeviceName,
+    _In_ PWSTR DriveNumber);
+
+BOOL
+IsValidDriveNumber(
+    _In_opt_z_ PCWSTR DriveNumber);
+
+VOID
+NotifyDriveNumberChange(
+    _In_z_ PCWSTR DriveNumber,
+    _In_ BOOL Added);
+
+VOID
+NotifyDriveLetterChange(
+    _In_ WCHAR DriveLetter,
+    _In_ BOOL Added);
+
+BOOL
+DeleteDriveNumber(
+    _In_ PWSTR DriveNumber);
 
 /* offline.c */
 EXIT_CODE

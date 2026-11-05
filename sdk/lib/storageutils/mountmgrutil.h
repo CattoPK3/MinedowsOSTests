@@ -32,6 +32,20 @@ BOOL
 StorageUtilDeleteDriveLetter(
     _In_ WCHAR DriveLetter);
 
+BOOL
+StorageUtilAssignDriveNumber(
+    _In_z_ PCWSTR DeviceName,
+    _In_z_ PCWSTR DriveNumber);
+
+BOOL
+StorageUtilGetDriveNumber(
+    _In_z_ PCWSTR DeviceName,
+    _Outptr_result_maybenull_z_ PWSTR *DriveNumber);
+
+BOOL
+StorageUtilDeleteDriveNumber(
+    _In_z_ PCWSTR DriveNumber);
+
 #ifdef __cplusplus
 }
 #endif

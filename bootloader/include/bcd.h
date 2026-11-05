@@ -24,6 +24,8 @@ typedef enum _BCD_ELEMENT
     BcdLibraryInteger_SerialDebuggerPort     = 0x15000013,
     BcdLibraryInteger_SerialDebuggerBaudRate = 0x15000014,
     BcdLibraryString_LoadOptionsString       = 0x12000030,
+    BcdLibraryBoolean_DisableIntegrityChecks = 0x16000048,
+    BcdLibraryBoolean_AllowPrereleaseSignatures = 0x16000049,
 
     BcdOSLoaderDevice_OSDevice               = 0x21000001,
     BcdOSLoaderString_SystemRoot             = 0x22000002,

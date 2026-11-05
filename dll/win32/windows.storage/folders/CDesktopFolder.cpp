@@ -388,6 +388,17 @@ HRESULT CDesktopFolder::_ParseDisplayNameByParent(
         bPath = TRUE;
         pidlParent.Attach(_ILCreateMyComputer());
     }
+    else if (wch >= L'0' && wch <= L'9')
+    {
+        UINT DriveChars = 0;
+        while (lpszDisplayName[DriveChars] >= L'0' && lpszDisplayName[DriveChars] <= L'9')
+            DriveChars++;
+        if (DriveChars != 0 && lpszDisplayName[DriveChars] == L':')
+        {
+            bPath = TRUE;
+            pidlParent.Attach(_ILCreateMyComputer());
+        }
+    }
     else if (PathIsUNCW(lpszDisplayName)) // "\\\\..."
     {
         bPath = TRUE;

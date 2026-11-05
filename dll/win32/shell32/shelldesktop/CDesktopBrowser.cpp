@@ -29,8 +29,59 @@
 #include <dbt.h>
 #include <atlsimpcoll.h>
 #include <shdocvw_undoc.h>
-
 WINE_DEFAULT_DEBUG_CHANNEL(desktop);
+
+static BOOL
+GetNumberedDrives(
+    _Out_ CSimpleArray<CComBSTR> &Drives)
+{
+    DWORD RequiredLength = GetLogicalDriveStringsW(0, NULL);
+    PWSTR Buffer;
+    DWORD Result;
+
+    if (RequiredLength == 0)
+        return FALSE;
+
+    Buffer = (PWSTR)HeapAlloc(GetProcessHeap(),
+                              0,
+                              ((SIZE_T)RequiredLength + 1) * sizeof(WCHAR));
+    if (Buffer == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    Result = GetLogicalDriveStringsW(RequiredLength + 1, Buffer);
+    if (Result == 0)
+    {
+        HeapFree(GetProcessHeap(), 0, Buffer);
+        return FALSE;
+    }
+
+    for (PCWSTR Path = Buffer; *Path; Path += wcslen(Path) + 1)
+    {
+        ULONG DigitCount = 0;
+        while (Path[DigitCount] >= L'0' && Path[DigitCount] <= L'9')
+            DigitCount++;
+
+        if (DigitCount != 0 &&
+            Path[DigitCount] == L':' &&
+            Path[DigitCount + 1] == L'\\' &&
+            Path[DigitCount + 2] == UNICODE_NULL)
+        {
+            CComBSTR Drive(Path);
+            if (Drive.m_str == NULL || !Drives.Add(Drive))
+            {
+                HeapFree(GetProcessHeap(), 0, Buffer);
+                SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                return FALSE;
+            }
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, Buffer);
+    return TRUE;
+}
 
 static const WCHAR szProgmanClassName[]  = L"Progman";
 static const WCHAR szProgmanWindowName[] = L"Program Manager";
@@ -62,6 +113,7 @@ private:
     CComPtr<IOleWindow>        m_ChangeNotifyServer;
     HWND                       m_hwndChangeNotifyServer;
     DWORD m_dwDrives;
+    CSimpleArray<CComBSTR> m_NumberedDrives;
     LONG m_lShellWindowsCookie;
     CComObject<CDesktopAutomation> *m_pAutomation;
     CSimpleArray<CComBSTR> m_PropertyNames;
@@ -333,9 +385,12 @@ CDesktopBrowser::CDesktopBrowser():
     m_hWndShellView(NULL),
     m_hwndChangeNotifyServer(NULL),
     m_dwDrives(::GetLogicalDrives()),
+    m_NumberedDrives(),
     m_lShellWindowsCookie(0),
     m_pAutomation(NULL)
 {
+    if (!GetNumberedDrives(m_NumberedDrives))
+        ERR("GetNumberedDrives failed with error %lu\n", GetLastError());
     SetTopBrowser();
 }
 
@@ -1317,6 +1372,8 @@ LRESULT CDesktopBrowser::OnDeviceChange(UINT uMsg, WPARAM wParam, LPARAM lParam,
         return 0;
 
     DWORD dwDrives = ::GetLogicalDrives();
+    CSimpleArray<CComBSTR> NumberedDrives;
+    BOOL NumberedDriveQuerySucceeded = GetNumberedDrives(NumberedDrives);
     for (INT iDrive = 0; iDrive <= 'Z' - 'A'; ++iDrive)
     {
         WCHAR szPath[MAX_PATH];
@@ -1330,6 +1387,50 @@ LRESULT CDesktopBrowser::OnDeviceChange(UINT uMsg, WPARAM wParam, LPARAM lParam,
         {
             PathBuildRootW(szPath, iDrive);
             SHChangeNotify(SHCNE_DRIVEREMOVED, SHCNF_PATHW, szPath, NULL);
+        }
+    }
+
+    if (!NumberedDriveQuerySucceeded)
+    {
+        ERR("GetNumberedDrives failed with error %lu\n", GetLastError());
+    }
+    else
+    {
+        for (INT iDrive = 0; iDrive < NumberedDrives.GetSize(); ++iDrive)
+        {
+            BOOL Found = FALSE;
+            for (INT iOldDrive = 0; iOldDrive < m_NumberedDrives.GetSize(); ++iOldDrive)
+            {
+                if (_wcsicmp(NumberedDrives[iDrive], m_NumberedDrives[iOldDrive]) == 0)
+                {
+                    Found = TRUE;
+                    break;
+                }
+            }
+            if (!Found)
+                SHChangeNotify(SHCNE_DRIVEADD, SHCNF_PATHW, NumberedDrives[iDrive], NULL);
+        }
+
+        for (INT iDrive = 0; iDrive < m_NumberedDrives.GetSize(); ++iDrive)
+        {
+            BOOL Found = FALSE;
+            for (INT iNewDrive = 0; iNewDrive < NumberedDrives.GetSize(); ++iNewDrive)
+            {
+                if (_wcsicmp(m_NumberedDrives[iDrive], NumberedDrives[iNewDrive]) == 0)
+                {
+                    Found = TRUE;
+                    break;
+                }
+            }
+            if (!Found)
+                SHChangeNotify(SHCNE_DRIVEREMOVED, SHCNF_PATHW, m_NumberedDrives[iDrive], NULL);
+        }
+
+        m_NumberedDrives.RemoveAll();
+        for (INT iDrive = 0; iDrive < NumberedDrives.GetSize(); ++iDrive)
+        {
+            if (!m_NumberedDrives.Add(NumberedDrives[iDrive]))
+                ERR("Failed to refresh the numbered-drive snapshot\n");
         }
     }
 

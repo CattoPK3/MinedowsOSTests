@@ -310,11 +310,15 @@ SymbolicName=MSG_COMMAND_ASSIGN
 Severity=Informational
 Facility=System
 Language=English
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -324,9 +328,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -343,15 +347,19 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=German
-    Weist dem Volume mit dem Fokus einen Laufwerkbuchstaben oder
-    den Pfadnamen des eingebundenen Ordners zu.
+    Weist dem Volume mit dem Fokus einen Laufwerkbuchstaben, eine
+    Laufwerksnummer oder den Pfadnamen des eingebundenen Ordners zu.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  Der Laufwerkbuchstabe, den Sie dem Volume zuweisen
                 möchten.
+
+    NUMBER=<N> Die dezimale Laufwerksnummer, die dem Volume zugewiesen wird
+                und den aktuellen Laufwerkbuchstaben ersetzt.
 
     MOUNT=<PATH>
                 Der Pfadname des eingebundenen Ordners, den Sie dem Volume
@@ -362,10 +370,10 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 treten. Ohne den NOERR-Parameter wird "DiskPart" bei
                 einem Fehler mit dem entsprechenden Fehlercode beendet.
 
-    Wenn kein Laufwerkbuchstabe oder eingebundener Ordner angegeben ist,
-    wird der nächste verfügbare Laufwerkbuchstabe zugewiesen. Ein Fehler
-    wird generiert, wenn der Laufwerkbuchstabe oder Bereitstellungspunkt
-    bereits verwendet wird.
+    Wenn kein Laufwerkbuchstabe, keine Laufwerksnummer und kein eingebundener
+    Ordner angegeben ist, wird der nächste verfügbare Laufwerkbuchstabe
+    zugewiesen. Ein Fehler wird generiert, wenn der Laufwerksname oder der
+    Bereitstellungspunkt bereits verwendet wird.
 
     Mit dem Befehl "ASSIGN" können Sie den Laufwerkbuchstaben ändern,
     der einem Wechseldatenträger zugeordnet ist.
@@ -383,13 +391,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Beispiel:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Polish
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -399,9 +412,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -418,13 +431,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Portugese
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -434,9 +452,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -453,13 +471,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Romanian
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -469,9 +492,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -488,13 +511,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Russian
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -504,9 +532,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -523,13 +551,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Albanian
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -539,9 +572,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -558,13 +591,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Turkish
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -574,9 +612,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -593,13 +631,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Chinese
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -609,9 +652,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -628,13 +671,18 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 Language=Taiwanese
-    Assigns a drive letter or mounted folder pathname to the volume with focus.
+    Assigns a drive letter, number, or mounted folder pathname to the volume
+    with focus.
 
-Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
+Syntax:  ASSIGN [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH>] [NOERR]
 
     LETTER=<D>  The drive letter to assign to the volume.
+
+    NUMBER=<N> The decimal drive number to assign to the volume, replacing its
+                current drive letter.
 
     MOUNT=<PATH>
                 The mounted folder pathname to assign to the volume.
@@ -644,9 +692,9 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder is specified, the next available drive
-    letter is assigned. If the drive letter or mounted folder is already in use,
-    an error is generated.
+    If no drive letter, number, or mounted folder is specified, the next
+    available drive letter is assigned. If the drive name or mounted folder is
+    already in use, an error is generated.
 
     By using the ASSIGN command, you can change the drive letter associated
     with a removable drive.
@@ -663,6 +711,7 @@ Syntax:  ASSIGN [LETTER=<D> | MOUNT=<PATH>] [NOERR]
 Example:
 
     ASSIGN LETTER=D
+    ASSIGN NUMBER=1
 .
 
 
@@ -8165,12 +8214,14 @@ SymbolicName=MSG_COMMAND_REMOVE
 Severity=Informational
 Facility=System
 Language=English
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8184,7 +8235,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8196,10 +8247,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8211,16 +8261,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=German
-    Entfernt einen Laufwerkbuchstaben oder Pfadnamen für eingebundene Ordner
-    vom Volume, das den Fokus hat.
+    Entfernt einen Laufwerkbuchstaben, eine Laufwerksnummer oder einen
+    Pfadnamen für eingebundene Ordner vom Volume, das den Fokus hat.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PFAD> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PFAD> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  Der Laufwerkbuchstabe, der entfernt werden soll.
+
+    NUMBER=<N> Die dezimale Laufwerksnummer, die entfernt werden soll.
 
     MOUNT=<PFAD>
                 Der Pfad des eingebundenen Ordners, der entfernt werden
@@ -8253,11 +8306,11 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PFAD> | ALL] [DISMOUNT] [NOERR]
                 aufgetreten. Ohne den Parameter NOERR wird DiskPart bei
                 einem Fehler mit entsprechendem Fehlercode beendet.
 
-    Wurde kein Laufwerkbuchstabe oder Pfad für einen eingebundenen Ordner
-    angegeben, wird von DiskPart der erste erkannte Laufwerkbuchstabe oder Pfad
-    für eingebundene Ordner entfernt. Bei Verwendung des Parameters ALL
-    werden alle aktuellen Laufwerkbuchstaben und Pfade für eingebundene Ordner
-    entfernt. Bei Verwendung des Parameters DISMOUNT werden von DiskPart alle
+    Wurde kein Laufwerkbuchstabe oder keine Laufwerksnummer angegeben, wird von
+    DiskPart der Laufwerkbuchstabe oder, falls kein Laufwerkbuchstabe zugewiesen
+    ist, die Laufwerksnummer entfernt. Bei Verwendung des Parameters ALL werden
+    alle aktuellen Laufwerkbuchstaben und Pfade für eingebundene Ordner entfernt.
+    Bei Verwendung des Parameters DISMOUNT werden von DiskPart alle
     geöffneten Handles für das Volume geschlossen, bevor die Bereitstellung des
     Volumes aufgehoben und dieses in den Offlinezustand versetzt wird.
 
@@ -8270,16 +8323,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PFAD> | ALL] [DISMOUNT] [NOERR]
 Beispiel:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Polish
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8293,7 +8349,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8305,10 +8361,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8320,16 +8375,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Portugese
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8343,7 +8401,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8355,10 +8413,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8370,16 +8427,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Romanian
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8393,7 +8453,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8405,10 +8465,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8420,16 +8479,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Russian
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8443,7 +8505,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8455,10 +8517,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8470,16 +8531,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Albanian
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8493,7 +8557,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8505,10 +8569,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8520,16 +8583,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Turkish
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8543,7 +8609,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8555,10 +8621,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8570,16 +8635,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Chinese
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8593,7 +8661,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8605,10 +8673,9 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8620,16 +8687,19 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .
 Language=Taiwanese
-    Removes a drive letter or mounted folder pathname from the volume
+    Removes a drive letter, number, or mounted folder pathname from the volume
     with focus.
 
-Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
+Syntax:  REMOVE [LETTER=<D> | NUMBER=<N> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 
     LETTER=<D>  The drive letter to be removed.
+
+    NUMBER=<N> The decimal drive number to be removed.
 
     MOUNT=<PATH>
                 The mounted folder path to be removed.
@@ -8643,7 +8713,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 the volume taken offline. If other processes are using
                 the volume, DiskPart closes any open handles before
                 dismounting the file system and taking the volume offline.
-                You can bring the volume online by assigning it a driver
+                You can bring the volume online by assigning it a drive
                 letter, by creating a mounted folder path to the volume, or
                 by using the ONLINE command. DISMOUNT will fail if used
                 on a volume that has any remaining drive letters or mounted
@@ -8655,10 +8725,10 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
                 Without the NOERR parameter, an error causes DiskPart to exit
                 with an error code.
 
-    If no drive letter or mounted folder path is specified, DiskPart removes
-    the first drive letter or mounted folder path it encounters. If the ALL
-    parameter is used, all current drive letters and mounted folder paths
-    are removed. If the DISMOUNT parameter is used, DiskPart closes all open
+    If no drive letter or number is specified, DiskPart removes the drive letter,
+    or the number if no drive letter is assigned. If the ALL parameter is used,
+    all current drive letters and mounted folder paths are removed. If the
+    DISMOUNT parameter is used, DiskPart closes all open
     handles to the volume and then dismounts the volume and takes it offline.
 
     The REMOVE command can be used to change the drive letter associated with a
@@ -8670,6 +8740,7 @@ Syntax:  REMOVE [LETTER=<D> | MOUNT=<PATH> | ALL] [DISMOUNT] [NOERR]
 Example:
 
     REMOVE LETTER=K
+    REMOVE NUMBER=1
     REMOVE MOUNT=G:\\MountH
     REMOVE ALL DISMOUNT
 .

@@ -208,9 +208,15 @@ DkMatchBcdPartition(
     _Out_ PDK_DEVICE Device)
 {
     Disk->DiskIndex = Index;
-    return BcdDevice->Type == BcdDeviceGptPartition ?
-           GptFindPartition(Disk, BcdDevice->Disk, BcdDevice->Partition, Device) :
-           DkFindMbrPartition(Disk, BcdDevice->Signature, BcdDevice->PartitionOffset, Device);
+    if (BcdDevice->Type == BcdDeviceGptPartition)
+    {
+        if (GptFindPartition(Disk, BcdDevice->Disk, BcdDevice->Partition, Device))
+            return TRUE;
+
+        return GptFindPartition(Disk, NULL, BcdDevice->Partition, Device);
+    }
+
+    return DkFindMbrPartition(Disk, BcdDevice->Signature, BcdDevice->PartitionOffset, Device);
 }
 
 BOOLEAN

@@ -10,11 +10,73 @@
 
 #include <mountmgr.h>
 #include <mountmgrutil.h>
+#include <shlobj.h>
 
 #define NDEBUG
 #include <debug.h>
 
 /* FUNCTIONS ******************************************************************/
+
+BOOL
+IsValidDriveNumber(
+    _In_opt_z_ PCWSTR DriveNumber)
+{
+    SIZE_T Index;
+
+    if (DriveNumber == NULL || DriveNumber[0] == UNICODE_NULL)
+        return FALSE;
+
+    for (Index = 0; DriveNumber[Index] != UNICODE_NULL; Index++)
+    {
+        if (DriveNumber[Index] < L'0' || DriveNumber[Index] > L'9')
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+VOID
+NotifyDriveNumberChange(
+    _In_z_ PCWSTR DriveNumber,
+    _In_ BOOL Added)
+{
+    SIZE_T NumberLength;
+    PWSTR DrivePath;
+
+    if (!IsValidDriveNumber(DriveNumber))
+        return;
+
+    NumberLength = wcslen(DriveNumber);
+    DrivePath = HeapAlloc(GetProcessHeap(), 0, (NumberLength + 4) * sizeof(WCHAR));
+    if (DrivePath == NULL)
+    {
+        DPRINT1("Failed to allocate a numbered-drive notification path\n");
+        return;
+    }
+
+    CopyMemory(DrivePath, DriveNumber, NumberLength * sizeof(WCHAR));
+    DrivePath[NumberLength] = L':';
+    DrivePath[NumberLength + 1] = L'\\';
+    DrivePath[NumberLength + 2] = UNICODE_NULL;
+    SHChangeNotify(Added ? SHCNE_DRIVEADD : SHCNE_DRIVEREMOVED,
+                   SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                   DrivePath,
+                   NULL);
+    HeapFree(GetProcessHeap(), 0, DrivePath);
+}
+
+VOID
+NotifyDriveLetterChange(
+    _In_ WCHAR DriveLetter,
+    _In_ BOOL Added)
+{
+    WCHAR DrivePath[] = { L'A', L':', L'\\', UNICODE_NULL };
+    DrivePath[0] = towupper(DriveLetter);
+    SHChangeNotify(Added ? SHCNE_DRIVEADD : SHCNE_DRIVEREMOVED,
+                   SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                   DrivePath,
+                   NULL);
+}
 
 static
 NTSTATUS
@@ -204,4 +266,21 @@ DeleteDriveLetter(
 {
     DPRINT("DeleteDriveLetter(%c)\n", DriveLetter);
     return StorageUtilDeleteDriveLetter(DriveLetter);
+}
+
+BOOL
+AssignDriveNumber(
+    _In_ PWSTR DeviceName,
+    _In_ PWSTR DriveNumber)
+{
+    DPRINT("AssignDriveNumber(%S %S)\n", DeviceName, DriveNumber);
+    return StorageUtilAssignDriveNumber(DeviceName, DriveNumber);
+}
+
+BOOL
+DeleteDriveNumber(
+    _In_ PWSTR DriveNumber)
+{
+    DPRINT("DeleteDriveNumber(%S)\n", DriveNumber);
+    return StorageUtilDeleteDriveNumber(DriveNumber);
 }

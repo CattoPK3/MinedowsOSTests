@@ -368,6 +368,8 @@ PrintVolume(
     WCHAR szVolumeTypeBuffer[30];
     WCHAR szInfoBuffer[16];
     WCHAR szSizeBuffer[8];
+    WCHAR DriveLetterBuffer[2];
+    PCWSTR DriveDisplay;
     INT nVolumeType;
 
     switch (VolumeEntry->VolumeType)
@@ -400,10 +402,25 @@ PrintVolume(
     else if (VolumeEntry->IsBoot)
         LoadStringW(GetModuleHandle(NULL), IDS_INFO_BOOT, szInfoBuffer, ARRAYSIZE(szInfoBuffer));
 
+    if (VolumeEntry->DriveNumber != NULL)
+    {
+        DriveDisplay = VolumeEntry->DriveNumber;
+    }
+    else if (VolumeEntry->DriveLetter != UNICODE_NULL)
+    {
+        DriveLetterBuffer[0] = VolumeEntry->DriveLetter;
+        DriveLetterBuffer[1] = UNICODE_NULL;
+        DriveDisplay = DriveLetterBuffer;
+    }
+    else
+    {
+        DriveDisplay = L"";
+    }
+
     ConResPrintf(StdOut, IDS_LIST_VOLUME_FORMAT,
                  (CurrentVolume == VolumeEntry) ? L'*' : L' ',
                  VolumeEntry->VolumeNumber,
-                 (VolumeEntry->DriveLetter != UNICODE_NULL) ? VolumeEntry->DriveLetter : L' ',
+                 DriveDisplay,
                  (VolumeEntry->pszLabel) ? VolumeEntry->pszLabel : L"",
                  (VolumeEntry->pszFilesystem) ? VolumeEntry->pszFilesystem : L"",
                  szVolumeTypeBuffer,

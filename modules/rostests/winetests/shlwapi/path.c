@@ -1670,6 +1670,18 @@ static void test_PathIsRelativeW(void)
     }
 }
 
+#ifdef __REACTOS__
+static void test_PathIsRelativeNumberedDrives(void)
+{
+    ok(!pPathIsRelativeA("12:\\"), "Numbered drive root must be absolute\n");
+    ok(!pPathIsRelativeA("12:folder"), "Numbered drive-relative path must be absolute\n");
+    ok(pPathIsRelativeA("12folder:\\"), "A non-drive numeric prefix must be relative\n");
+    ok(!pPathIsRelativeW(L"12:\\"), "Numbered drive root must be absolute\n");
+    ok(!pPathIsRelativeW(L"12:folder"), "Numbered drive-relative path must be absolute\n");
+    ok(pPathIsRelativeW(L"12folder:\\"), "A non-drive numeric prefix must be relative\n");
+}
+#endif
+
 static void test_PathStripPathA(void)
 {
     const char const_path[] = "test";
@@ -1812,6 +1824,9 @@ START_TEST(path)
     test_PathUnExpandEnvStrings();
     test_PathIsRelativeA();
     test_PathIsRelativeW();
+#ifdef __REACTOS__
+    test_PathIsRelativeNumberedDrives();
+#endif
     test_PathStripPathA();
     test_PathUndecorate();
     test_PathRemoveBlanks();

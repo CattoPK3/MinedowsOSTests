@@ -9,6 +9,7 @@
 /* INCLUDES *******************************************************************/
 
 #include "diskpart.h"
+#include <mountmgrutil.h>
 
 #define NDEBUG
 #include <debug.h>
@@ -2145,6 +2146,11 @@ AddVolumeToList(
         }
     }
 
+    if (!StorageUtilGetDriveNumber(VolumeEntry->DeviceName, &VolumeEntry->DriveNumber))
+        DPRINT1("StorageUtilGetDriveNumber(%S) failed (Error %lu)\n",
+                VolumeEntry->DeviceName,
+                GetLastError());
+
     IsVolumeSystem(VolumeEntry);
     IsVolumeBoot(VolumeEntry);
 
@@ -2210,6 +2216,9 @@ DestroyVolumeList(VOID)
 
         if (VolumeEntry->pszFilesystem)
             RtlFreeHeap(RtlGetProcessHeap(), 0, VolumeEntry->pszFilesystem);
+
+        if (VolumeEntry->DriveNumber)
+            HeapFree(GetProcessHeap(), 0, VolumeEntry->DriveNumber);
 
         if (VolumeEntry->pExtents)
             RtlFreeHeap(RtlGetProcessHeap(), 0, VolumeEntry->pExtents);

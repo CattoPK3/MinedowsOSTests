@@ -22,6 +22,8 @@ static const struct
     {BcdOSLoaderBoolean_BootLogInitialization, L" BOOTLOG"},
     {BcdOSLoaderBoolean_VerboseObjectLoadMode, L" SOS"},
     {BcdOSLoaderBoolean_EmsEnabled,            L" REDIRECT"},
+    {BcdLibraryBoolean_DisableIntegrityChecks, L" DISABLEINTEGRITYCHECKS"},
+    {BcdLibraryBoolean_AllowPrereleaseSignatures, L" TESTSIGNING"},
 };
 
 static const PCWSTR OslSafeBootModes[] =

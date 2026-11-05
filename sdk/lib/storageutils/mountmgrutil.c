@@ -11,6 +11,7 @@
 #include <strsafe.h>
 #include <mountmgr.h>
 #include <wctype.h>
+#include <limits.h>
 
 static HANDLE
 StorageUtilOpenMountManager(VOID)
@@ -22,6 +23,57 @@ StorageUtilOpenMountManager(VOID)
                        OPEN_EXISTING,
                        FILE_ATTRIBUTE_NORMAL,
                        NULL);
+}
+
+static BOOL
+StorageUtilBuildDriveNumberLink(
+    _In_z_ PCWSTR DriveNumber,
+    _Outptr_result_z_ PWSTR *DosDeviceName,
+    _Out_ PULONG DosDeviceNameLength)
+{
+    static const WCHAR Prefix[] = L"\\DosDevices\\";
+    SIZE_T NumberLength;
+    SIZE_T NameChars;
+    SIZE_T Index;
+    PWSTR Name;
+
+    if (DriveNumber == NULL || DriveNumber[0] == UNICODE_NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    NumberLength = wcslen(DriveNumber);
+    for (Index = 0; Index < NumberLength; Index++)
+    {
+        if (DriveNumber[Index] < L'0' || DriveNumber[Index] > L'9')
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+
+    NameChars = ARRAYSIZE(Prefix) - 1 + NumberLength + 1;
+    if (NameChars > USHRT_MAX / sizeof(WCHAR))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    Name = HeapAlloc(GetProcessHeap(), 0, (NameChars + 1) * sizeof(WCHAR));
+    if (Name == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    CopyMemory(Name, Prefix, (ARRAYSIZE(Prefix) - 1) * sizeof(WCHAR));
+    CopyMemory(Name + ARRAYSIZE(Prefix) - 1, DriveNumber, NumberLength * sizeof(WCHAR));
+    Name[NameChars - 1] = L':';
+    Name[NameChars] = UNICODE_NULL;
+    *DosDeviceName = Name;
+    *DosDeviceNameLength = (ULONG)(NameChars * sizeof(WCHAR));
+    return TRUE;
 }
 
 BOOL
@@ -66,6 +118,75 @@ StorageUtilAssignDriveLetter(
     CopyMemory((PBYTE)InputBuffer + InputBuffer->DeviceNameOffset,
                DeviceName,
                DeviceNameLength);
+
+    MountMgrHandle = StorageUtilOpenMountManager();
+    if (MountMgrHandle == INVALID_HANDLE_VALUE)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        return FALSE;
+    }
+
+    BytesReturned = 0;
+    Success = DeviceIoControl(MountMgrHandle,
+                              IOCTL_MOUNTMGR_CREATE_POINT,
+                              InputBuffer,
+                              InputBufferLength,
+                              NULL,
+                              0,
+                              &BytesReturned,
+                              NULL);
+    CloseHandle(MountMgrHandle);
+    HeapFree(GetProcessHeap(), 0, InputBuffer);
+    return Success;
+}
+
+BOOL
+StorageUtilAssignDriveNumber(
+    _In_z_ PCWSTR DeviceName,
+    _In_z_ PCWSTR DriveNumber)
+{
+    PWSTR DosDeviceName;
+    ULONG DosDeviceNameLength;
+    ULONG DeviceNameLength;
+    ULONG InputBufferLength;
+    PMOUNTMGR_CREATE_POINT_INPUT InputBuffer;
+    HANDLE MountMgrHandle;
+    DWORD BytesReturned;
+    BOOL Success;
+
+    if (DeviceName == NULL ||
+        !StorageUtilBuildDriveNumberLink(DriveNumber, &DosDeviceName, &DosDeviceNameLength))
+        return FALSE;
+
+    DeviceNameLength = (ULONG)(wcslen(DeviceName) * sizeof(WCHAR));
+    if (DeviceNameLength > USHRT_MAX ||
+        DosDeviceNameLength > ULONG_MAX - DeviceNameLength - sizeof(MOUNTMGR_CREATE_POINT_INPUT))
+    {
+        HeapFree(GetProcessHeap(), 0, DosDeviceName);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    InputBufferLength = DosDeviceNameLength + DeviceNameLength + sizeof(MOUNTMGR_CREATE_POINT_INPUT);
+    InputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, InputBufferLength);
+    if (InputBuffer == NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, DosDeviceName);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    InputBuffer->SymbolicLinkNameOffset = sizeof(MOUNTMGR_CREATE_POINT_INPUT);
+    InputBuffer->SymbolicLinkNameLength = (USHORT)DosDeviceNameLength;
+    InputBuffer->DeviceNameOffset = sizeof(MOUNTMGR_CREATE_POINT_INPUT) + DosDeviceNameLength;
+    InputBuffer->DeviceNameLength = (USHORT)DeviceNameLength;
+    CopyMemory((PBYTE)InputBuffer + InputBuffer->SymbolicLinkNameOffset,
+               DosDeviceName,
+               DosDeviceNameLength);
+    CopyMemory((PBYTE)InputBuffer + InputBuffer->DeviceNameOffset,
+               DeviceName,
+               DeviceNameLength);
+    HeapFree(GetProcessHeap(), 0, DosDeviceName);
 
     MountMgrHandle = StorageUtilOpenMountManager();
     if (MountMgrHandle == INVALID_HANDLE_VALUE)
@@ -273,6 +394,186 @@ StorageUtilDeleteDriveLetter(
                DosDeviceName,
                DosDeviceNameLength);
     OutputBuffer->Size = OutputBufferLength;
+
+    MountMgrHandle = StorageUtilOpenMountManager();
+    if (MountMgrHandle == INVALID_HANDLE_VALUE)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, OutputBuffer);
+        return FALSE;
+    }
+
+    BytesReturned = 0;
+    Success = DeviceIoControl(MountMgrHandle,
+                              IOCTL_MOUNTMGR_DELETE_POINTS,
+                              InputBuffer,
+                              InputBufferLength,
+                              OutputBuffer,
+                              OutputBufferLength,
+                              &BytesReturned,
+                              NULL);
+    CloseHandle(MountMgrHandle);
+    HeapFree(GetProcessHeap(), 0, InputBuffer);
+    HeapFree(GetProcessHeap(), 0, OutputBuffer);
+    return Success;
+}
+
+BOOL
+StorageUtilGetDriveNumber(
+    _In_z_ PCWSTR DeviceName,
+    _Outptr_result_maybenull_z_ PWSTR *DriveNumber)
+{
+    static const WCHAR Prefix[] = L"\\DosDevices\\";
+    ULONG DeviceNameLength;
+    ULONG InputBufferLength;
+    ULONG OutputBufferLength = 0x1000;
+    PMOUNTMGR_MOUNT_POINT InputBuffer;
+    PMOUNTMGR_MOUNT_POINTS OutputBuffer;
+    PMOUNTMGR_MOUNT_POINT Point;
+    PWSTR LinkName;
+    ULONG LinkChars;
+    ULONG NumberLength;
+    ULONG Index;
+    ULONG DigitIndex;
+    HANDLE MountMgrHandle;
+    DWORD BytesReturned;
+    BOOL Success;
+
+    if (DeviceName == NULL || DriveNumber == NULL)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    *DriveNumber = NULL;
+    DeviceNameLength = (ULONG)(wcslen(DeviceName) * sizeof(WCHAR));
+    if (DeviceNameLength > USHRT_MAX ||
+        DeviceNameLength > ULONG_MAX - sizeof(MOUNTMGR_MOUNT_POINT))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    InputBufferLength = sizeof(MOUNTMGR_MOUNT_POINT) + DeviceNameLength;
+    InputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, InputBufferLength);
+    OutputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, OutputBufferLength);
+    if (InputBuffer == NULL || OutputBuffer == NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, OutputBuffer);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    InputBuffer->DeviceNameOffset = sizeof(MOUNTMGR_MOUNT_POINT);
+    InputBuffer->DeviceNameLength = (USHORT)DeviceNameLength;
+    CopyMemory((PBYTE)InputBuffer + InputBuffer->DeviceNameOffset, DeviceName, DeviceNameLength);
+
+    MountMgrHandle = StorageUtilOpenMountManager();
+    if (MountMgrHandle == INVALID_HANDLE_VALUE)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, OutputBuffer);
+        return FALSE;
+    }
+
+    BytesReturned = 0;
+    Success = DeviceIoControl(MountMgrHandle,
+                              IOCTL_MOUNTMGR_QUERY_POINTS,
+                              InputBuffer,
+                              InputBufferLength,
+                              OutputBuffer,
+                              OutputBufferLength,
+                              &BytesReturned,
+                              NULL);
+    CloseHandle(MountMgrHandle);
+
+    if (Success)
+    {
+        for (Index = 0; Index < OutputBuffer->NumberOfMountPoints; Index++)
+        {
+            Point = &OutputBuffer->MountPoints[Index];
+            LinkName = (PWSTR)((PBYTE)OutputBuffer + Point->SymbolicLinkNameOffset);
+            LinkChars = Point->SymbolicLinkNameLength / sizeof(WCHAR);
+
+            if (LinkChars <= ARRAYSIZE(Prefix) ||
+                _wcsnicmp(LinkName, Prefix, ARRAYSIZE(Prefix) - 1) != 0 ||
+                LinkName[LinkChars - 1] != L':')
+                continue;
+
+            NumberLength = LinkChars - (ARRAYSIZE(Prefix) - 1) - 1;
+            if (NumberLength == 0)
+                continue;
+
+            for (DigitIndex = 0; DigitIndex < NumberLength; DigitIndex++)
+            {
+                if (LinkName[ARRAYSIZE(Prefix) - 1 + DigitIndex] < L'0' ||
+                    LinkName[ARRAYSIZE(Prefix) - 1 + DigitIndex] > L'9')
+                    break;
+            }
+
+            if (DigitIndex != NumberLength)
+                continue;
+
+            *DriveNumber = HeapAlloc(GetProcessHeap(),
+                                     0,
+                                     (NumberLength + 1) * sizeof(WCHAR));
+            if (*DriveNumber == NULL)
+            {
+                SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                Success = FALSE;
+                break;
+            }
+
+            CopyMemory(*DriveNumber,
+                       LinkName + ARRAYSIZE(Prefix) - 1,
+                       NumberLength * sizeof(WCHAR));
+            (*DriveNumber)[NumberLength] = UNICODE_NULL;
+            break;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, InputBuffer);
+    HeapFree(GetProcessHeap(), 0, OutputBuffer);
+    return Success;
+}
+
+BOOL
+StorageUtilDeleteDriveNumber(
+    _In_z_ PCWSTR DriveNumber)
+{
+    PWSTR DosDeviceName;
+    ULONG DosDeviceNameLength;
+    ULONG InputBufferLength;
+    ULONG OutputBufferLength = 0x1000;
+    PMOUNTMGR_MOUNT_POINT InputBuffer;
+    PMOUNTMGR_MOUNT_POINTS OutputBuffer;
+    HANDLE MountMgrHandle;
+    DWORD BytesReturned;
+    BOOL Success;
+
+    if (!StorageUtilBuildDriveNumberLink(DriveNumber, &DosDeviceName, &DosDeviceNameLength))
+        return FALSE;
+
+    InputBufferLength = sizeof(MOUNTMGR_MOUNT_POINT) + DosDeviceNameLength;
+    InputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, InputBufferLength);
+    OutputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, OutputBufferLength);
+    if (InputBuffer == NULL || OutputBuffer == NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, DosDeviceName);
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, OutputBuffer);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    InputBuffer->SymbolicLinkNameOffset = sizeof(MOUNTMGR_MOUNT_POINT);
+    InputBuffer->SymbolicLinkNameLength = (USHORT)DosDeviceNameLength;
+    CopyMemory((PBYTE)InputBuffer + InputBuffer->SymbolicLinkNameOffset,
+               DosDeviceName,
+               DosDeviceNameLength);
+    OutputBuffer->Size = OutputBufferLength;
+    HeapFree(GetProcessHeap(), 0, DosDeviceName);
 
     MountMgrHandle = StorageUtilOpenMountManager();
     if (MountMgrHandle == INVALID_HANDLE_VALUE)

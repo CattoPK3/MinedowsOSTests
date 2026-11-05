@@ -1144,9 +1144,33 @@ MountMgrValidateBackPointer(IN PASSOCIATED_DEVICE_ENTRY AssociatedDeviceEntry,
     return STATUS_SUCCESS;
 }
 
-/*
- * @implemented
- */
+static
+BOOLEAN
+MountMgrIsDriveNumber(
+    _In_ PUNICODE_STRING SymbolicLinkName,
+    _Out_ PULONG NumberChars)
+{
+    static const WCHAR Prefix[] = L"\\DosDevices\\";
+    ULONG LinkChars;
+    ULONG Index;
+
+    LinkChars = SymbolicLinkName->Length / sizeof(WCHAR);
+    if (LinkChars <= ARRAYSIZE(Prefix) ||
+        _wcsnicmp(SymbolicLinkName->Buffer, Prefix, ARRAYSIZE(Prefix) - 1) != 0 ||
+        SymbolicLinkName->Buffer[LinkChars - 1] != L':')
+        return FALSE;
+
+    *NumberChars = LinkChars - (ARRAYSIZE(Prefix) - 1) - 1;
+    for (Index = 0; Index < *NumberChars; Index++)
+    {
+        WCHAR Digit = SymbolicLinkName->Buffer[ARRAYSIZE(Prefix) - 1 + Index];
+        if (Digit < L'0' || Digit > L'9')
+            return FALSE;
+    }
+
+    return *NumberChars != 0;
+}
+
 NTSTATUS
 MountMgrQueryVolumePaths(IN PDEVICE_EXTENSION DeviceExtension,
                          IN PDEVICE_INFORMATION DeviceInformation,
@@ -1161,11 +1185,14 @@ MountMgrQueryVolumePaths(IN PDEVICE_EXTENSION DeviceExtension,
     PDEVICE_INFORMATION_ENTRY DeviceInfoEntry;
     PASSOCIATED_DEVICE_ENTRY AssociatedDeviceEntry;
     PMOUNTMGR_VOLUME_PATHS * Paths = NULL, * CurrentPath;
-    ULONG OutputPathLength, NumberOfPaths, ReturnedPaths;
+    ULONG OutputPathLength, NumberOfPaths, ReturnedPaths, NumberChars;
+    BOOLEAN IsDriveLetter;
 
     /* We return at least null char */
     OutputPathLength = sizeof(UNICODE_NULL);
+    NumberChars = 0;
 
+    IsDriveLetter = FALSE;
     for (Entry = DeviceInformation->SymbolicLinksListHead.Flink;
          Entry != &(DeviceInformation->SymbolicLinksListHead);
          Entry = Entry->Flink)
@@ -1177,6 +1204,7 @@ MountMgrQueryVolumePaths(IN PDEVICE_EXTENSION DeviceExtension,
         {
             /* We'll return the letter */
             OutputPathLength = 4 * sizeof(WCHAR);
+            IsDriveLetter = TRUE;
             break;
         }
     }
@@ -1185,6 +1213,22 @@ MountMgrQueryVolumePaths(IN PDEVICE_EXTENSION DeviceExtension,
     if (Entry == &(DeviceInformation->SymbolicLinksListHead))
     {
         SymlinkInformation = NULL;
+
+        for (Entry = DeviceInformation->SymbolicLinksListHead.Flink;
+             Entry != &(DeviceInformation->SymbolicLinksListHead);
+             Entry = Entry->Flink)
+        {
+            SymlinkInformation = CONTAINING_RECORD(Entry, SYMLINK_INFORMATION, SymbolicLinksListEntry);
+            if (MountMgrIsDriveNumber(&SymlinkInformation->Name, &NumberChars) &&
+                SymlinkInformation->Online)
+            {
+                OutputPathLength = (NumberChars + 3) * sizeof(WCHAR);
+                break;
+            }
+        }
+
+        if (Entry == &(DeviceInformation->SymbolicLinksListHead))
+            SymlinkInformation = NULL;
     }
 
     /* Do we have any device info to return? */
@@ -1204,13 +1248,21 @@ MountMgrQueryVolumePaths(IN PDEVICE_EXTENSION DeviceExtension,
 
             /* Set size */
             (*VolumePaths)->MultiSzLength = OutputPathLength;
-            /* If we have a drive letter, return it */
-            if (SymlinkInformation != NULL)
+            if (SymlinkInformation != NULL && IsDriveLetter)
             {
                 (*VolumePaths)->MultiSz[0] = SymlinkInformation->Name.Buffer[LETTER_POSITION];
                 (*VolumePaths)->MultiSz[1] = L':';
                 (*VolumePaths)->MultiSz[2] = UNICODE_NULL;
                 (*VolumePaths)->MultiSz[3] = UNICODE_NULL;
+            }
+            else if (SymlinkInformation != NULL)
+            {
+                RtlCopyMemory((*VolumePaths)->MultiSz,
+                             SymlinkInformation->Name.Buffer + ARRAYSIZE(L"\\DosDevices\\") - 1,
+                             NumberChars * sizeof(WCHAR));
+                (*VolumePaths)->MultiSz[NumberChars] = L':';
+                (*VolumePaths)->MultiSz[NumberChars + 1] = UNICODE_NULL;
+                (*VolumePaths)->MultiSz[NumberChars + 2] = UNICODE_NULL;
             }
             else
             {

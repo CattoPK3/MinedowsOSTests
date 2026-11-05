@@ -173,6 +173,8 @@ if(MSVC)
 endif()
 
 add_custom_target(bootloader DEPENDS bootmgfw)
+add_cd_file(TARGET bootmgfw DESTINATION reactos/Boot/EFI FOR all)
+add_cd_file(TARGET bootmgfw DESTINATION reactos/Boot/EFI NAME_ON_CD bootmgr.efi FOR all)
 
 if(ARCH STREQUAL "ppc")
     add_custom_command(TARGET bootmgfw

@@ -21,6 +21,7 @@
 static const PCWSTR BmStorePaths[] =
 {
     L"\\EFI\\LiberNT\\Boot\\BCD",
+    L"\\EFI\\Microsoft\\Boot\\BCD",
     L"\\Boot\\BCD",
 };
 

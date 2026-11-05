@@ -349,6 +349,7 @@ Execute(LPTSTR Full, LPTSTR First, LPTSTR Rest, PARSED_COMMAND *Cmd)
     TCHAR *FirstEnd;
     TCHAR szFullName[MAX_PATH];
     TCHAR szFullCmdLine[CMDLINE_LENGTH];
+    BOOL bDriveChange;
 
     TRACE ("Execute: \'%s\' \'%s\'\n", debugstr_aw(First), debugstr_aw(Rest));
 
@@ -381,18 +382,37 @@ Execute(LPTSTR Full, LPTSTR First, LPTSTR Rest, PARSED_COMMAND *Cmd)
     _tcscpy(first, First);
 
     /* check for a drive change */
-    if ((_istalpha (first[0])) && (!_tcscmp (first + 1, _T(":"))))
+    bDriveChange = FALSE;
+    if (_istalpha(first[0]) && first[1] == _T(':') && first[2] == _T('\0'))
+    {
+        bDriveChange = TRUE;
+    }
+    else if (first[0] >= _T('0') && first[0] <= _T('9'))
+    {
+        TCHAR *p = first;
+        while (*p >= _T('0') && *p <= _T('9'))
+            p++;
+        bDriveChange = (*p == _T(':') && p[1] == _T('\0'));
+    }
+
+    if (bDriveChange)
     {
         BOOL working = TRUE;
         if (!SetCurrentDirectory(first))
         {
             /* Guess they changed disc or something, handle that gracefully and get to root */
-            TCHAR str[4];
-            str[0]=first[0];
-            str[1]=_T(':');
-            str[2]=_T('\\');
-            str[3]=0;
-            working = SetCurrentDirectory(str);
+            TCHAR str[MAX_PATH];
+            DWORD len = (DWORD)_tcslen(first);
+            if (len + 2 <= ARRAYSIZE(str))
+            {
+                _tcscpy(str, first);
+                _tcscat(str, _T("\\"));
+                working = SetCurrentDirectory(str);
+            }
+            else
+            {
+                working = FALSE;
+            }
         }
 
         if (!working) ConErrResPuts (STRING_FREE_ERROR1);

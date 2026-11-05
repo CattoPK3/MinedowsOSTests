@@ -514,8 +514,27 @@ static
 BOOL
 BasepIsDriveRootPath(IN LPCWSTR lpszPath)
 {
-    return lpszPath[0] != UNICODE_NULL && lpszPath[1] == L':' &&
-           lpszPath[2] == L'\\' && lpszPath[3] == UNICODE_NULL;
+    ULONG DriveChars;
+
+    if (lpszPath == NULL || lpszPath[0] == UNICODE_NULL)
+        return FALSE;
+
+    if (lpszPath[0] >= L'0' && lpszPath[0] <= L'9')
+    {
+        for (DriveChars = 1;
+             lpszPath[DriveChars] >= L'0' && lpszPath[DriveChars] <= L'9';
+             DriveChars++)
+        {
+        }
+    }
+    else
+    {
+        DriveChars = 1;
+    }
+
+    return lpszPath[DriveChars] == L':' &&
+           lpszPath[DriveChars + 1] == L'\\' &&
+           lpszPath[DriveChars + 2] == UNICODE_NULL;
 }
 
 static

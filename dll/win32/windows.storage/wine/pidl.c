@@ -1773,22 +1773,61 @@ HRESULT _ILCreateFromPathW(LPCWSTR szPath, LPITEMIDLIST* ppidl)
 
 LPITEMIDLIST _ILCreateDrive(LPCWSTR lpszNew)
 {
+    SIZE_T DriveChars;
+    SIZE_T Index;
+    SIZE_T PidlDataSize;
     LPITEMIDLIST pidlOut;
 
     TRACE("(%s)\n",debugstr_w(lpszNew));
 
-    pidlOut = _ILAlloc(PT_DRIVE, sizeof(DriveStruct));
+    if (lpszNew == NULL)
+        return NULL;
+
+    DriveChars = lstrlenW(lpszNew);
+    if (DriveChars < 3 || lpszNew[DriveChars - 2] != L':' || lpszNew[DriveChars - 1] != L'\\')
+        return NULL;
+
+    if ((lpszNew[0] >= L'A' && lpszNew[0] <= L'Z') ||
+        (lpszNew[0] >= L'a' && lpszNew[0] <= L'z'))
+    {
+        if (DriveChars != 3)
+            return NULL;
+    }
+    else
+    {
+        for (Index = 0; Index < DriveChars - 2; Index++)
+        {
+            if (lpszNew[Index] < L'0' || lpszNew[Index] > L'9')
+                return NULL;
+        }
+    }
+
+    PidlDataSize = max(sizeof(DriveStruct), DriveChars + 3);
+    if (PidlDataSize > USHRT_MAX - 3)
+        return NULL;
+
+    pidlOut = _ILAlloc(PT_DRIVE, (unsigned int)PidlDataSize);
     if (pidlOut)
     {
-        LPSTR pszDest;
-
-        pszDest = _ILGetTextPointer(pidlOut);
-        if (pszDest)
+        LPSTR pszDest = _ILGetTextPointer(pidlOut);
+        if (pszDest == NULL)
         {
-            strcpy(pszDest, "x:\\");
-            pszDest[0]=towupper(lpszNew[0]);
-            TRACE("-- create Drive: %s\n", debugstr_a(pszDest));
+            ILFree(pidlOut);
+            return NULL;
         }
+
+        for (Index = 0; Index < DriveChars; Index++)
+        {
+            if (lpszNew[Index] > 0x7F)
+            {
+                ILFree(pidlOut);
+                return NULL;
+            }
+            pszDest[Index] = (CHAR)lpszNew[Index];
+        }
+        pszDest[DriveChars] = '\0';
+        pszDest[0] = (CHAR)towupper(lpszNew[0]);
+        TRACE("-- create Drive: %s\n", debugstr_a(pszDest));
     }
     return pidlOut;
 }
@@ -4615,20 +4654,61 @@ HRESULT _ILCreateFromPathW(LPCWSTR szPath, LPITEMIDLIST* ppidl)
 
 LPITEMIDLIST _ILCreateDrive(LPCWSTR lpszNew)
 {
+    SIZE_T DriveChars;
+    SIZE_T Index;
+    SIZE_T PidlDataSize;
     LPITEMIDLIST pidlOut;
 
     TRACE("(%s)\n",debugstr_w(lpszNew));
 
-    pidlOut = _ILAlloc(PT_DRIVE, sizeof(DriveStruct));
+    if (lpszNew == NULL)
+        return NULL;
+
+    DriveChars = lstrlenW(lpszNew);
+    if (DriveChars < 3 || lpszNew[DriveChars - 2] != L':' || lpszNew[DriveChars - 1] != L'\\')
+        return NULL;
+
+    if ((lpszNew[0] >= L'A' && lpszNew[0] <= L'Z') ||
+        (lpszNew[0] >= L'a' && lpszNew[0] <= L'z'))
+    {
+        if (DriveChars != 3)
+            return NULL;
+    }
+    else
+    {
+        for (Index = 0; Index < DriveChars - 2; Index++)
+        {
+            if (lpszNew[Index] < L'0' || lpszNew[Index] > L'9')
+                return NULL;
+        }
+    }
+
+    PidlDataSize = max(sizeof(DriveStruct), DriveChars + 3);
+    if (PidlDataSize > USHRT_MAX - 3)
+        return NULL;
+
+    pidlOut = _ILAlloc(PT_DRIVE, (unsigned int)PidlDataSize);
     if (pidlOut)
     {
         LPSTR pszDest = _ILGetTextPointer(pidlOut);
-        if (pszDest)
+        if (pszDest == NULL)
         {
-            lstrcpyA(pszDest, "x:\\");
-            pszDest[0] = toupper(lpszNew[0]);
-            TRACE("-- create Drive: %s\n", debugstr_a(pszDest));
+            ILFree(pidlOut);
+            return NULL;
         }
+
+        for (Index = 0; Index < DriveChars; Index++)
+        {
+            if (lpszNew[Index] > 0x7F)
+            {
+                ILFree(pidlOut);
+                return NULL;
+            }
+            pszDest[Index] = (CHAR)lpszNew[Index];
+        }
+        pszDest[DriveChars] = '\0';
+        pszDest[0] = toupper((UCHAR)pszDest[0]);
+        TRACE("-- create Drive: %s\n", debugstr_a(pszDest));
     }
     return pidlOut;
 }

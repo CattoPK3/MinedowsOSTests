@@ -19,11 +19,180 @@
  */
 
 #include <k32.h>
+#include <mountmgr.h>
 
 #define NDEBUG
 #include <debug.h>
 
 #define MAX_DOS_DRIVES 26
+
+static BOOL
+BasepIsNumberedDriveLink(
+    _In_reads_(LinkChars) PCWSTR LinkName,
+    _In_ ULONG LinkChars,
+    _Out_ PULONG NumberChars)
+{
+    static const WCHAR Prefix[] = L"\\DosDevices\\";
+    ULONG Index;
+
+    if (LinkChars <= ARRAYSIZE(Prefix) ||
+        _wcsnicmp(LinkName, Prefix, ARRAYSIZE(Prefix) - 1) != 0 ||
+        LinkName[LinkChars - 1] != L':')
+        return FALSE;
+
+    *NumberChars = LinkChars - (ARRAYSIZE(Prefix) - 1) - 1;
+    for (Index = 0; Index < *NumberChars; Index++)
+    {
+        WCHAR Digit = LinkName[ARRAYSIZE(Prefix) - 1 + Index];
+        if (Digit < L'0' || Digit > L'9')
+            return FALSE;
+    }
+
+    return *NumberChars != 0;
+}
+
+static PWSTR
+BasepQueryLogicalDriveStrings(
+    _Out_ PDWORD StringLength)
+{
+    static const WCHAR Prefix[] = L"\\DosDevices\\";
+    DWORD DriveMap;
+    DWORD NumberOfLetterDrives = 0;
+    DWORD NumberLength;
+    DWORD Index;
+    DWORD PointIndex;
+    DWORD QueryBufferLength = 0x10000;
+    DWORD BytesReturned;
+    DWORD InputLength = sizeof(MOUNTMGR_MOUNT_POINT);
+    PMOUNTMGR_MOUNT_POINT InputBuffer;
+    PMOUNTMGR_MOUNT_POINTS Points;
+    HANDLE MountMgrHandle;
+    BOOL QuerySucceeded;
+    ULONG LinkChars;
+    ULONG LinkNumberChars;
+    PWSTR LinkName;
+    PWSTR DriveStrings;
+    DWORD RequiredLength;
+    DWORD Position;
+
+    *StringLength = 0;
+    DriveMap = GetLogicalDrives();
+    for (Index = 0; Index < MAX_DOS_DRIVES; Index++)
+    {
+        if (DriveMap & (1 << Index))
+            NumberOfLetterDrives++;
+    }
+
+    RequiredLength = NumberOfLetterDrives * 4;
+    InputBuffer = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, InputLength);
+    Points = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, QueryBufferLength);
+    if (InputBuffer == NULL || Points == NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, Points);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+
+    MountMgrHandle = CreateFileW(MOUNTMGR_DOS_DEVICE_NAME,
+                                 GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 NULL,
+                                 OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL,
+                                 NULL);
+    if (MountMgrHandle != INVALID_HANDLE_VALUE)
+    {
+        BytesReturned = 0;
+        QuerySucceeded = DeviceIoControl(MountMgrHandle,
+                                         IOCTL_MOUNTMGR_QUERY_POINTS,
+                                         InputBuffer,
+                                         InputLength,
+                                         Points,
+                                         QueryBufferLength,
+                                         &BytesReturned,
+                                         NULL);
+        CloseHandle(MountMgrHandle);
+    }
+    else
+    {
+        QuerySucceeded = FALSE;
+    }
+
+    if (QuerySucceeded)
+    {
+        for (PointIndex = 0; PointIndex < Points->NumberOfMountPoints; PointIndex++)
+        {
+            PMOUNTMGR_MOUNT_POINT Point = &Points->MountPoints[PointIndex];
+            LinkName = (PWSTR)((PBYTE)Points + Point->SymbolicLinkNameOffset);
+            LinkChars = Point->SymbolicLinkNameLength / sizeof(WCHAR);
+
+            if (!BasepIsNumberedDriveLink(LinkName, LinkChars, &LinkNumberChars))
+                continue;
+
+            NumberLength = LinkNumberChars + 3;
+            if (RequiredLength > MAXDWORD - NumberLength)
+            {
+                HeapFree(GetProcessHeap(), 0, InputBuffer);
+                HeapFree(GetProcessHeap(), 0, Points);
+                SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                return NULL;
+            }
+
+            RequiredLength += NumberLength;
+        }
+    }
+
+    DriveStrings = HeapAlloc(GetProcessHeap(),
+                             HEAP_ZERO_MEMORY,
+                             ((SIZE_T)RequiredLength + 1) * sizeof(WCHAR));
+    if (DriveStrings == NULL)
+    {
+        HeapFree(GetProcessHeap(), 0, InputBuffer);
+        HeapFree(GetProcessHeap(), 0, Points);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+
+    Position = 0;
+    for (Index = 0; Index < MAX_DOS_DRIVES; Index++)
+    {
+        if (!(DriveMap & (1 << Index)))
+            continue;
+
+        DriveStrings[Position++] = (WCHAR)(L'A' + Index);
+        DriveStrings[Position++] = L':';
+        DriveStrings[Position++] = L'\\';
+        DriveStrings[Position++] = UNICODE_NULL;
+    }
+
+    if (QuerySucceeded)
+    {
+        for (PointIndex = 0; PointIndex < Points->NumberOfMountPoints; PointIndex++)
+        {
+            PMOUNTMGR_MOUNT_POINT Point = &Points->MountPoints[PointIndex];
+            LinkName = (PWSTR)((PBYTE)Points + Point->SymbolicLinkNameOffset);
+            LinkChars = Point->SymbolicLinkNameLength / sizeof(WCHAR);
+
+            if (!BasepIsNumberedDriveLink(LinkName, LinkChars, &LinkNumberChars))
+                continue;
+
+            RtlCopyMemory(DriveStrings + Position,
+                          LinkName + ARRAYSIZE(Prefix) - 1,
+                          LinkNumberChars * sizeof(WCHAR));
+            Position += LinkNumberChars;
+            DriveStrings[Position++] = L':';
+            DriveStrings[Position++] = L'\\';
+            DriveStrings[Position++] = UNICODE_NULL;
+        }
+    }
+
+    DriveStrings[Position] = UNICODE_NULL;
+    *StringLength = Position;
+    HeapFree(GetProcessHeap(), 0, InputBuffer);
+    HeapFree(GetProcessHeap(), 0, Points);
+    return DriveStrings;
+}
 
 /*
  * @implemented
@@ -34,34 +203,25 @@ WINAPI
 GetLogicalDriveStringsA(IN DWORD nBufferLength,
                         IN LPSTR lpBuffer)
 {
-    DWORD drive, count;
-    DWORD dwDriveMap;
-    LPSTR p;
+    DWORD StringLength;
+    DWORD Index;
+    PWSTR DriveStrings;
 
-    dwDriveMap = GetLogicalDrives();
+    DriveStrings = BasepQueryLogicalDriveStrings(&StringLength);
+    if (DriveStrings == NULL)
+        return 0;
 
-    for (drive = count = 0; drive < MAX_DOS_DRIVES; drive++)
+    if (StringLength + 1 > nBufferLength)
     {
-        if (dwDriveMap & (1<<drive))
-            count++;
+        HeapFree(GetProcessHeap(), 0, DriveStrings);
+        return StringLength + 1;
     }
 
+    for (Index = 0; Index <= StringLength; Index++)
+        lpBuffer[Index] = (CHAR)DriveStrings[Index];
 
-    if ((count * 4) + 1 > nBufferLength) return ((count * 4) + 1);
-
-    p = lpBuffer;
-
-    for (drive = 0; drive < MAX_DOS_DRIVES; drive++)
-        if (dwDriveMap & (1<<drive))
-        {
-            *p++ = 'A' + (UCHAR)drive;
-            *p++ = ':';
-            *p++ = '\\';
-            *p++ = '\0';
-        }
-    *p = '\0';
-
-    return (count * 4);
+    HeapFree(GetProcessHeap(), 0, DriveStrings);
+    return StringLength;
 }
 
 /*
@@ -73,32 +233,22 @@ WINAPI
 GetLogicalDriveStringsW(IN DWORD nBufferLength,
                         IN LPWSTR lpBuffer)
 {
-    DWORD drive, count;
-    DWORD dwDriveMap;
-    LPWSTR p;
+    DWORD StringLength;
+    PWSTR DriveStrings;
 
-    dwDriveMap = GetLogicalDrives();
+    DriveStrings = BasepQueryLogicalDriveStrings(&StringLength);
+    if (DriveStrings == NULL)
+        return 0;
 
-    for (drive = count = 0; drive < MAX_DOS_DRIVES; drive++)
+    if (StringLength + 1 > nBufferLength)
     {
-        if (dwDriveMap & (1<<drive))
-            count++;
+        HeapFree(GetProcessHeap(), 0, DriveStrings);
+        return StringLength + 1;
     }
 
-    if ((count * 4) + 1 > nBufferLength) return ((count * 4) + 1);
-
-    p = lpBuffer;
-    for (drive = 0; drive < MAX_DOS_DRIVES; drive++)
-        if (dwDriveMap & (1<<drive))
-        {
-            *p++ = (WCHAR)('A' + drive);
-            *p++ = (WCHAR)':';
-            *p++ = (WCHAR)'\\';
-            *p++ = (WCHAR)'\0';
-        }
-    *p = (WCHAR)'\0';
-
-    return (count * 4);
+    RtlCopyMemory(lpBuffer, DriveStrings, (StringLength + 1) * sizeof(WCHAR));
+    HeapFree(GetProcessHeap(), 0, DriveStrings);
+    return StringLength;
 }
 
 /*

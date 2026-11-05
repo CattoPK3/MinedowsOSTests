@@ -107,21 +107,54 @@ OslSelectEntry(VOID)
     ULONG Chars, Size, Count, Default, Start, i;
 
     Options = FwGetLoadOptions(&Chars);
-    for (i = 0; Options && i < Chars && Options[i] != UNICODE_NULL; i++)
+    if (Options && Chars * sizeof(WCHAR) >= sizeof(BOOT_APPLICATION_PARAMETER_BLOCK))
     {
-        if (i != 0 && Options[i - 1] != L' ')
-            continue;
+        const BOOT_APPLICATION_PARAMETER_BLOCK* Block =
+            (const BOOT_APPLICATION_PARAMETER_BLOCK*)Options;
 
-        for (Start = i; i < Chars && Options[i] != UNICODE_NULL && Options[i] != L' '; i++)
-            ;
+        if (Block->Signature[0] == BOOT_APPLICATION_SIGNATURE)
+        {
+            if (Block->AppEntryOffset != 0 &&
+                Block->AppEntryOffset + sizeof(GUID) <= Block->Size)
+            {
+                const GUID* EntryGuid =
+                    (const GUID*)((const UCHAR*)Block + Block->AppEntryOffset);
+                RtlStringCchPrintfW(Id,
+                                    RTL_NUMBER_OF(Id),
+                                    L"{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+                                    EntryGuid->Data1,
+                                    EntryGuid->Data2,
+                                    EntryGuid->Data3,
+                                    EntryGuid->Data4[0],
+                                    EntryGuid->Data4[1],
+                                    EntryGuid->Data4[2],
+                                    EntryGuid->Data4[3],
+                                    EntryGuid->Data4[4],
+                                    EntryGuid->Data4[5],
+                                    EntryGuid->Data4[6],
+                                    EntryGuid->Data4[7]);
+            }
+        }
+    }
 
-        if (Options[Start] == L'{')
-            RtlStringCchCopyNW(Id, RTL_NUMBER_OF(Id), &Options[Start], i - Start);
-        else if (Options[Start] == L'\\')
-            RtlStringCchCopyNW(StorePath, RTL_NUMBER_OF(StorePath), &Options[Start], i - Start);
-        else if (i - Start > OSL_STARTUP_PREFIX_CHARS &&
-                 _wcsnicmp(&Options[Start], BM_STARTUP_OPTION, OSL_STARTUP_PREFIX_CHARS) == 0)
-            OslParseStartup(&Options[Start + OSL_STARTUP_PREFIX_CHARS], i - Start - OSL_STARTUP_PREFIX_CHARS);
+    if (Id[0] == UNICODE_NULL)
+    {
+        for (i = 0; Options && i < Chars && Options[i] != UNICODE_NULL; i++)
+        {
+            if (i != 0 && Options[i - 1] != L' ')
+                continue;
+
+            for (Start = i; i < Chars && Options[i] != UNICODE_NULL && Options[i] != L' '; i++)
+                ;
+
+            if (Options[Start] == L'{')
+                RtlStringCchCopyNW(Id, RTL_NUMBER_OF(Id), &Options[Start], i - Start);
+            else if (Options[Start] == L'\\')
+                RtlStringCchCopyNW(StorePath, RTL_NUMBER_OF(StorePath), &Options[Start], i - Start);
+            else if (i - Start > OSL_STARTUP_PREFIX_CHARS &&
+                     _wcsnicmp(&Options[Start], BM_STARTUP_OPTION, OSL_STARTUP_PREFIX_CHARS) == 0)
+                OslParseStartup(&Options[Start + OSL_STARTUP_PREFIX_CHARS], i - Start - OSL_STARTUP_PREFIX_CHARS);
+        }
     }
 
     if (StorePath[0] != UNICODE_NULL)
@@ -129,6 +162,26 @@ OslSelectEntry(VOID)
 
     for (i = 0; i < RTL_NUMBER_OF(OslStorePaths) && !Store; i++)
         Store = BcdReadStoreFile(NULL, OslStorePaths[i], &Size);
+
+    if (!Store)
+    {
+        FW_VOLUME_SCAN Scan;
+        PVOID Device;
+
+        for (i = 0; i < RTL_NUMBER_OF(OslStorePaths) && !Store; i++)
+        {
+            RtlZeroMemory(&Scan, sizeof(Scan));
+            while (FwScanFileVolumes(OslStorePaths[i], &Scan, &Device))
+            {
+                if (Device)
+                {
+                    Store = BcdReadStoreFile(Device, OslStorePaths[i], &Size);
+                    if (Store)
+                        break;
+                }
+            }
+        }
+    }
 
     if (!Store || !BcdOpenStore(Store, Size))
     {
@@ -153,6 +206,15 @@ OslSelectEntry(VOID)
     {
         FwPrint(L"The Boot Configuration Data store has no operating system entry.\r\n");
         return NULL;
+    }
+
+    if (Count > 1)
+    {
+        for (i = 0; i < Count; i++)
+        {
+            if (wcsstr(OslEntries[i].Description, L"LiberNT") != NULL)
+                return &OslEntries[i];
+        }
     }
 
     return &OslEntries[Default];
@@ -349,8 +411,11 @@ OslMain(VOID)
     }
     else if (!DkOpenBcdDevice(&OslParameters.OsDevice, &OsDevice))
     {
-        FwPrint(L"The operating system device was not found.\r\n");
-        return;
+        if (!DkLocateBootPartition(&OsDevice) && !FwGetBootDevice(&OsDevice))
+        {
+            FwPrint(L"The operating system device was not found.\r\n");
+            return;
+        }
     }
     else
     {

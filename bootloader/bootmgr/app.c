@@ -85,6 +85,21 @@ BmStartApplication(
     if (BcdDevice.Type == BcdDeviceBoot)
     {
         Image = FwReadBootFile(Path, &Size);
+        if (!Image)
+        {
+            FW_VOLUME_SCAN Scan;
+            PVOID ScanDevice;
+            RtlZeroMemory(&Scan, sizeof(Scan));
+            while (FwScanFileVolumes(Path, &Scan, &ScanDevice))
+            {
+                if (ScanDevice)
+                {
+                    Image = FwReadDeviceFile(ScanDevice, Path, &Size);
+                    if (Image)
+                        break;
+                }
+            }
+        }
     }
     else if (DkOpenBcdDevice(&BcdDevice, &Device))
     {

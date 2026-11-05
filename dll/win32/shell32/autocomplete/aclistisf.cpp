@@ -326,11 +326,26 @@ STDMETHODIMP CACListISF::Expand(LPCOLESTR pszExpand)
     pszExpand = szExpanded;
 
     // get full path
-    if (szExpanded[0] && szExpanded[1] == L':' && szExpanded[2] == 0)
+    UINT DriveChars = 0;
+    if (((L'A' <= szExpanded[0] && szExpanded[0] <= L'Z') ||
+         (L'a' <= szExpanded[0] && szExpanded[0] <= L'z')) &&
+        szExpanded[1] == L':' && szExpanded[2] == 0)
+    {
+        DriveChars = 1;
+    }
+    else
+    {
+        while (szExpanded[DriveChars] >= L'0' && szExpanded[DriveChars] <= L'9')
+            DriveChars++;
+        if (!DriveChars || szExpanded[DriveChars] != L':' || szExpanded[DriveChars + 1])
+            DriveChars = 0;
+    }
+
+    if (DriveChars && DriveChars + 2 < _countof(szExpanded))
     {
         // 'C:' --> 'C:\'
-        szExpanded[2] = L'\\';
-        szExpanded[3] = 0;
+        szExpanded[DriveChars + 1] = L'\\';
+        szExpanded[DriveChars + 2] = 0;
     }
     else
     {

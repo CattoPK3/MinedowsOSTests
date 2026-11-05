@@ -1011,22 +1011,44 @@ BOOL WINAPI PathIsUNCW(const WCHAR *path)
 
 BOOL WINAPI PathIsRelativeA(const char *path)
 {
+    const char *p;
+
     TRACE("%s\n", wine_dbgstr_a(path));
 
     if (!path || !*path || IsDBCSLeadByte(*path))
         return TRUE;
 
-    return !(*path == '\\' || (*path && path[1] == ':'));
+    if (*path == '\\' || path[1] == ':')
+        return FALSE;
+
+    if (*path < '0' || *path > '9')
+        return TRUE;
+
+    for (p = path; *p >= '0' && *p <= '9'; ++p)
+        ;
+
+    return *p != ':';
 }
 
 BOOL WINAPI PathIsRelativeW(const WCHAR *path)
 {
+    const WCHAR *p;
+
     TRACE("%s\n", wine_dbgstr_w(path));
 
     if (!path || !*path)
         return TRUE;
 
-    return !(*path == '\\' || (*path && path[1] == ':'));
+    if (*path == '\\' || path[1] == ':')
+        return FALSE;
+
+    if (*path < L'0' || *path > L'9')
+        return TRUE;
+
+    for (p = path; *p >= L'0' && *p <= L'9'; ++p)
+        ;
+
+    return *p != L':';
 }
 
 BOOL WINAPI PathIsUNCServerShareA(const char *path)

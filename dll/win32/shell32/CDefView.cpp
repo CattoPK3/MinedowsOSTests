@@ -3871,6 +3871,13 @@ LRESULT CDefView::OnChangeNotify(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &
         return FALSE;
     }
 
+    if (_ILIsDesktop(m_pidlParent) &&
+        (lEvent == SHCNE_DRIVEADD || lEvent == SHCNE_DRIVEREMOVED))
+    {
+        SHChangeNotification_Unlock(hLock);
+        return TRUE;
+    }
+
     // Translate child IDLs.
     // SHSimpleIDListFromPathW creates fake PIDLs (lacking some attributes)
     HRESULT hr;

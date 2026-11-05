@@ -17,6 +17,7 @@ remove_main(
     _In_ PWSTR *argv)
 {
     PWSTR pszSuffix = NULL;
+    PWSTR DriveNumber = NULL;
     WCHAR DriveLetter = UNICODE_NULL;
     INT i, nExclusive = 0;
     BOOL bResult;
@@ -26,12 +27,6 @@ remove_main(
     if (CurrentVolume == NULL)
     {
         ConResPuts(StdOut, IDS_SELECT_NO_VOLUME);
-        return EXIT_SUCCESS;
-    }
-
-    if (CurrentVolume->DriveLetter == UNICODE_NULL)
-    {
-        ConResPuts(StdOut, IDS_REMOVE_NO_LETTER);
         return EXIT_SUCCESS;
     }
 
@@ -68,6 +63,16 @@ remove_main(
             ConPuts(StdOut, L"The MOUNT option is not supported yet!\n");
             nExclusive++;
         }
+        else if (HasPrefix(argv[i], L"number=", &pszSuffix))
+        {
+            if (!IsValidDriveNumber(pszSuffix))
+            {
+                ConResPuts(StdErr, IDS_ERROR_INVALID_ARGS);
+                return EXIT_SUCCESS;
+            }
+            DriveNumber = pszSuffix;
+            nExclusive++;
+        }
         else if (_wcsicmp(argv[i], L"all") == 0)
         {
             ConPuts(StdOut, L"The ALL option is not supported yet!\n");
@@ -100,9 +105,38 @@ remove_main(
         return EXIT_SUCCESS;
     }
 
+    if (CurrentVolume->DriveLetter == UNICODE_NULL && CurrentVolume->DriveNumber == NULL)
+    {
+        ConResPuts(StdOut, IDS_REMOVE_NO_LETTER);
+        return EXIT_SUCCESS;
+    }
+
     DPRINT("VolumeName: %S\n", CurrentVolume->VolumeName);
     DPRINT("DeviceName: %S\n", CurrentVolume->DeviceName);
     DPRINT("DriveLetter: %C\n", CurrentVolume->DriveLetter);
+
+    if (DriveNumber != NULL)
+    {
+        if (CurrentVolume->DriveNumber == NULL ||
+            wcscmp(DriveNumber, CurrentVolume->DriveNumber) != 0)
+        {
+            ConResPuts(StdOut, IDS_REMOVE_WRONG_LETTER);
+            return EXIT_SUCCESS;
+        }
+
+        bResult = DeleteDriveNumber(DriveNumber);
+        if (bResult == FALSE)
+        {
+            ConResPuts(StdOut, IDS_REMOVE_FAIL);
+            return EXIT_SUCCESS;
+        }
+
+        HeapFree(GetProcessHeap(), 0, CurrentVolume->DriveNumber);
+        CurrentVolume->DriveNumber = NULL;
+        NotifyDriveNumberChange(DriveNumber, FALSE);
+        ConResPuts(StdOut, IDS_REMOVE_SUCCESS);
+        return EXIT_SUCCESS;
+    }
 
     if (DriveLetter != UNICODE_NULL)
     {
@@ -122,7 +156,25 @@ remove_main(
     }
     else
     {
-        DriveLetter = CurrentVolume->DriveLetter;
+        if (CurrentVolume->DriveLetter != UNICODE_NULL)
+        {
+            DriveLetter = CurrentVolume->DriveLetter;
+        }
+        else
+        {
+            bResult = DeleteDriveNumber(CurrentVolume->DriveNumber);
+            if (bResult == FALSE)
+            {
+                ConResPuts(StdOut, IDS_REMOVE_FAIL);
+                return EXIT_SUCCESS;
+            }
+
+            NotifyDriveNumberChange(CurrentVolume->DriveNumber, FALSE);
+            HeapFree(GetProcessHeap(), 0, CurrentVolume->DriveNumber);
+            CurrentVolume->DriveNumber = NULL;
+            ConResPuts(StdOut, IDS_REMOVE_SUCCESS);
+            return EXIT_SUCCESS;
+        }
     }
 
     bResult = DeleteDriveLetter(DriveLetter);

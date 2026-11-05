@@ -58,6 +58,28 @@ PRTLP_CURDIR_REF RtlpCurDirRef;
 
 /* PRIVATE FUNCTIONS **********************************************************/
 
+static ULONG
+RtlpGetDrivePrefixLength(
+    _In_reads_(CharCount) PCWSTR Path,
+    _In_ ULONG CharCount)
+{
+    ULONG Index;
+
+    if (CharCount < 2)
+        return 0;
+
+    if (Path[1] == L':')
+        return 2;
+
+    if (Path[0] < L'0' || Path[0] > L'9')
+        return 0;
+
+    for (Index = 1; Index < CharCount && Path[Index] >= L'0' && Path[Index] <= L'9'; Index++)
+        ;
+
+    return (Index < CharCount && Path[Index] == L':') ? Index + 1 : 0;
+}
+
 RTL_PATH_TYPE
 NTAPI
 RtlDetermineDosPathNameType_Ustr(IN PCUNICODE_STRING PathString)
@@ -85,9 +107,11 @@ RtlDetermineDosPathNameType_Ustr(IN PCUNICODE_STRING PathString)
     }
     else
     {
-        if ((Chars < 2) || (Path[1] != L':')) return RtlPathTypeRelative;                          /* x              */
-        if ((Chars < 3) || !(IS_PATH_SEPARATOR(Path[2]))) return RtlPathTypeDriveRelative;         /* x:             */
-        return RtlPathTypeDriveAbsolute;                                                           /* x:\            */
+        ULONG DrivePrefixLength = RtlpGetDrivePrefixLength(Path, Chars);
+        if (!DrivePrefixLength) return RtlPathTypeRelative;
+        if (Chars <= DrivePrefixLength || !IS_PATH_SEPARATOR(Path[DrivePrefixLength]))
+            return RtlPathTypeDriveRelative;
+        return RtlPathTypeDriveAbsolute;
     }
 }
 
@@ -538,14 +562,10 @@ RtlGetLengthWithoutLastFullDosOrNtPathElement(IN ULONG Flags,
     switch (PathType)
     {
     case RtlPathTypeLocalDevice:
-        // Handle \\\\?\\C:\\ with the last ':' or '\\' missing:
-        if (Path->Length / sizeof(WCHAR) < 7 ||
-            Path->Buffer[5] != ':' ||
-            !IS_PATH_SEPARATOR(Path->Buffer[6]))
-        {
+        if ((Path->Length / sizeof(WCHAR) < 7) ||
+            (RtlDetermineDosPathNameType_U(Path->Buffer + 4) != RtlPathTypeDriveAbsolute))
             return STATUS_INVALID_PARAMETER;
-        }
-        break;
+    break;
     case RtlPathTypeRooted:
         // "\\??\\"
         break;
@@ -769,12 +789,16 @@ RtlGetFullPathName_Ustr(
     PCUNICODE_STRING    CurDirName;
     UNICODE_STRING      EnvVarName, EnvVarValue;
     WCHAR EnvVarNameBuffer[4];
+    PWCHAR AllocatedEnvVarName = NULL;
 
     ULONG  PrefixCut    = 0;    // Where the path really starts (after the skipped prefix)
     PWCHAR Prefix       = NULL; // pointer to the string to be inserted as the new path prefix
     ULONG  PrefixLength = 0;
     PWCHAR Source;
     ULONG  SourceLength;
+    ULONG DrivePrefixChars;
+    ULONG CurrentDrivePrefixChars;
+    ULONG EnvVarNameChars;
 
 
     /* For now, assume the name is valid */
@@ -892,42 +916,65 @@ RtlGetFullPathName_Ustr(
 
         case RtlPathTypeDriveAbsolute:      /* c:\foo  */
         {
-            ASSERT(FileNameBuffer[1] == L':');
-            ASSERT(IS_PATH_SEPARATOR(FileNameBuffer[2]));
-
-            // FileNameBuffer[0] = RtlpUpcaseUnicodeChar(FileNameBuffer[0]);
+            DrivePrefixChars = RtlpGetDrivePrefixLength(FileNameBuffer, FileNameChars);
+            ASSERT(DrivePrefixChars != 0);
+            ASSERT(IS_PATH_SEPARATOR(FileNameBuffer[DrivePrefixChars]));
             Prefix = FileNameBuffer;
-            PrefixLength = 3 * sizeof(WCHAR);
-            Source += 3;
-            SourceLength -= 3 * sizeof(WCHAR);
+            PrefixLength = (DrivePrefixChars + 1) * sizeof(WCHAR);
+            Source += DrivePrefixChars + 1;
+            SourceLength -= (DrivePrefixChars + 1) * sizeof(WCHAR);
 
-            PrefixCut = 3;
+            PrefixCut = DrivePrefixChars + 1;
             break;
         }
 
         case RtlPathTypeDriveRelative:      /* c:foo   */
         {
-            WCHAR CurDrive, NewDrive;
+            UNICODE_STRING CurrentDrive, NewDrive;
+            PWCHAR EnvVarNameBufferPtr;
 
-            Source += 2;
-            SourceLength -= 2 * sizeof(WCHAR);
+            DrivePrefixChars = RtlpGetDrivePrefixLength(FileNameBuffer, FileNameChars);
+            ASSERT(DrivePrefixChars != 0);
+            Source += DrivePrefixChars;
+            SourceLength -= DrivePrefixChars * sizeof(WCHAR);
 
-            CurDrive = RtlpUpcaseUnicodeChar(CurDirName->Buffer[0]);
-            NewDrive = RtlpUpcaseUnicodeChar(FileNameBuffer[0]);
+            CurrentDrivePrefixChars = RtlpGetDrivePrefixLength(CurDirName->Buffer,
+                                                               CurDirName->Length / sizeof(WCHAR));
+            CurrentDrive.Buffer = CurDirName->Buffer;
+            CurrentDrive.Length = (USHORT)((CurrentDrivePrefixChars ? CurrentDrivePrefixChars - 1 : 0) * sizeof(WCHAR));
+            CurrentDrive.MaximumLength = CurrentDrive.Length;
+            NewDrive.Buffer = FileNameBuffer;
+            NewDrive.Length = (USHORT)((DrivePrefixChars - 1) * sizeof(WCHAR));
+            NewDrive.MaximumLength = NewDrive.Length;
 
-            if ((NewDrive != CurDrive) || CurDirName->Buffer[1] != L':')
+            if (!CurrentDrivePrefixChars || !RtlEqualUnicodeString(&NewDrive, &CurrentDrive, TRUE))
             {
-                EnvVarNameBuffer[0] = L'=';
-                EnvVarNameBuffer[1] = NewDrive;
-                EnvVarNameBuffer[2] = L':';
-                EnvVarNameBuffer[3] = UNICODE_NULL;
+                EnvVarNameChars = DrivePrefixChars + 2;
+                if (EnvVarNameChars > USHRT_MAX / sizeof(WCHAR))
+                    goto Quit;
 
-                EnvVarName.Length = 3 * sizeof(WCHAR);
+                if (EnvVarNameChars <= ARRAYSIZE(EnvVarNameBuffer))
+                {
+                    EnvVarNameBufferPtr = EnvVarNameBuffer;
+                }
+                else
+                {
+                    AllocatedEnvVarName = RtlAllocateHeap(RtlGetProcessHeap(),
+                                                          0,
+                                                          EnvVarNameChars * sizeof(WCHAR));
+                    if (!AllocatedEnvVarName)
+                        goto Quit;
+                    EnvVarNameBufferPtr = AllocatedEnvVarName;
+                }
+
+                EnvVarNameBufferPtr[0] = L'=';
+                RtlCopyMemory(&EnvVarNameBufferPtr[1], FileNameBuffer, DrivePrefixChars * sizeof(WCHAR));
+                EnvVarNameBufferPtr[DrivePrefixChars + 1] = UNICODE_NULL;
+
+                EnvVarName.Length = (USHORT)((DrivePrefixChars + 1) * sizeof(WCHAR));
                 EnvVarName.MaximumLength = EnvVarName.Length + sizeof(WCHAR);
-                EnvVarName.Buffer = EnvVarNameBuffer;
+                EnvVarName.Buffer = EnvVarNameBufferPtr;
 
-                // FIXME: Is it possible to use the user-given buffer ?
-                // RtlInitEmptyUnicodeString(&EnvVarValue, NULL, Size);
                 EnvVarValue.Length = 0;
                 EnvVarValue.MaximumLength = (USHORT)Size;
                 EnvVarValue.Buffer = RtlAllocateHeap(RtlGetProcessHeap(), 0, Size);
@@ -935,6 +982,11 @@ RtlGetFullPathName_Ustr(
                 {
                     Prefix       = NULL;
                     PrefixLength = 0;
+                    if (AllocatedEnvVarName)
+                    {
+                        RtlFreeHeap(RtlGetProcessHeap(), 0, AllocatedEnvVarName);
+                        AllocatedEnvVarName = NULL;
+                    }
                     goto Quit;
                 }
 
@@ -962,51 +1014,55 @@ RtlGetFullPathName_Ustr(
                     default:
                         DPRINT("RtlQueryEnvironmentVariable_U(\"%wZ\") returned 0x%08lx\n", &EnvVarName, Status);
 
-                        EnvVarNameBuffer[0] = NewDrive;
-                        EnvVarNameBuffer[1] = L':';
-                        EnvVarNameBuffer[2] = L'\\';
-                        EnvVarNameBuffer[3] = UNICODE_NULL;
-                        Prefix       = EnvVarNameBuffer;
-                        PrefixLength = 3 * sizeof(WCHAR);
+                        RtlCopyMemory(EnvVarNameBufferPtr, FileNameBuffer, DrivePrefixChars * sizeof(WCHAR));
+                        EnvVarNameBufferPtr[DrivePrefixChars] = L'\\';
+                        EnvVarNameBufferPtr[DrivePrefixChars + 1] = UNICODE_NULL;
+                        Prefix       = EnvVarNameBufferPtr;
+                        PrefixLength = (DrivePrefixChars + 1) * sizeof(WCHAR);
 
                         RtlFreeHeap(RtlGetProcessHeap(), 0, EnvVarValue.Buffer);
                         EnvVarValue.Buffer = NULL;
                         break;
                 }
-                PrefixCut = 3;
+                PrefixCut = DrivePrefixChars + 1;
                 break;
             }
-            /* Fall through */
-            DPRINT("RtlPathTypeDriveRelative - Using fall-through to RtlPathTypeRelative\n");
+
+            Prefix       = CurDirName->Buffer;
+            PrefixLength = CurDirName->Length;
+            PrefixCut = CurrentDrivePrefixChars + 1;
+            break;
         }
 
         case RtlPathTypeRelative:           /* foo     */
         {
             Prefix       = CurDirName->Buffer;
             PrefixLength = CurDirName->Length;
-            if (CurDirName->Buffer[1] != L':')
+            CurrentDrivePrefixChars = RtlpGetDrivePrefixLength(CurDirName->Buffer,
+                                                               CurDirName->Length / sizeof(WCHAR));
+            if (!CurrentDrivePrefixChars)
             {
                 PrefixCut = RtlpSkipUNCPrefix(CurDirName->Buffer);
             }
             else
             {
-                PrefixCut = 3;
+                PrefixCut = CurrentDrivePrefixChars + 1;
             }
             break;
         }
 
         case RtlPathTypeRooted:             /* \xxx    */
         {
-            if (CurDirName->Buffer[1] == L':')
+            CurrentDrivePrefixChars = RtlpGetDrivePrefixLength(CurDirName->Buffer,
+                                                               CurDirName->Length / sizeof(WCHAR));
+            if (CurrentDrivePrefixChars)
             {
-                // The path starts with "C:\"
-                ASSERT(CurDirName->Buffer[1] == L':');
-                ASSERT(IS_PATH_SEPARATOR(CurDirName->Buffer[2]));
+                ASSERT(IS_PATH_SEPARATOR(CurDirName->Buffer[CurrentDrivePrefixChars]));
 
                 Prefix = CurDirName->Buffer;
-                PrefixLength = 3 * sizeof(WCHAR); // Skip "C:\"
+                PrefixLength = (CurrentDrivePrefixChars + 1) * sizeof(WCHAR);
 
-                PrefixCut = 3;      // Source index location incremented of + 3
+                PrefixCut = CurrentDrivePrefixChars + 1;
             }
             else
             {
@@ -1051,6 +1107,11 @@ RtlGetFullPathName_Ustr(
 
     /* Some cleanup */
     Prefix = NULL;
+    if (AllocatedEnvVarName)
+    {
+        RtlFreeHeap(RtlGetProcessHeap(), 0, AllocatedEnvVarName);
+        AllocatedEnvVarName = NULL;
+    }
     if (EnvVarValue.Buffer)
     {
         RtlFreeHeap(RtlGetProcessHeap(), 0, EnvVarValue.Buffer);
@@ -1073,7 +1134,10 @@ RtlGetFullPathName_Ustr(
         /*
          * For UNC paths, the file part is after the \\share\dir part of the path.
          */
-        PrefixCut = (*PathType == RtlPathTypeUncAbsolute ? PrefixCut : 3);
+        if (*PathType == RtlPathTypeDriveAbsolute)
+            PrefixCut = RtlpGetDrivePrefixLength(Buffer, reqsize) + 1;
+        else if (*PathType != RtlPathTypeUncAbsolute)
+            PrefixCut = 3;
 
         if (ptr && *ptr && (ptr >= Buffer + PrefixCut))
         {
@@ -1087,6 +1151,11 @@ RtlGetFullPathName_Ustr(
     }
 
 Quit:
+    if (AllocatedEnvVarName)
+        RtlFreeHeap(RtlGetProcessHeap(), 0, AllocatedEnvVarName);
+    if (EnvVarValue.Buffer)
+        RtlFreeHeap(RtlGetProcessHeap(), 0, EnvVarValue.Buffer);
+
     /* Release PEB lock */
     RtlReleasePebLock();
 
@@ -1643,9 +1712,32 @@ RtlDetermineDosPathNameType_U(IN PCWSTR Path)
     }
     else
     {
-        if (!(Path[0]) || (Path[1] != L':')) return RtlPathTypeRelative;          /* x              */
-        if (IS_PATH_SEPARATOR(Path[2])) return RtlPathTypeDriveAbsolute;          /* x:\            */
-        return RtlPathTypeDriveRelative;                                          /* x:             */
+        ULONG DrivePrefixLength;
+        ULONG Index;
+
+        if (!(Path[0]))
+            return RtlPathTypeRelative;
+
+        if (Path[1] == L':')
+        {
+            DrivePrefixLength = 2;
+        }
+        else
+        {
+            if (Path[0] < L'0' || Path[0] > L'9')
+                return RtlPathTypeRelative;
+
+            for (Index = 1; Path[Index] >= L'0' && Path[Index] <= L'9'; Index++)
+                ;
+
+            if (Path[Index] != L':')
+                return RtlPathTypeRelative;
+            DrivePrefixLength = Index + 1;
+        }
+
+        if (IS_PATH_SEPARATOR(Path[DrivePrefixLength]))
+            return RtlPathTypeDriveAbsolute;
+        return RtlPathTypeDriveRelative;
     }
 }
 

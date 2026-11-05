@@ -270,6 +270,8 @@ FwGetBootDeviceHandle(VOID)
 {
     EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
     EFI_HANDLE Image = GlobalImageHandle;
+    EFI_HANDLE Fallback = NULL;
+    VOID* DummyFs;
     ULONG Depth;
 
     for (Depth = 0; Depth < 4 && Image; Depth++)
@@ -282,12 +284,22 @@ FwGetBootDeviceHandle(VOID)
         }
 
         if (LoadedImage->DeviceHandle)
-            return LoadedImage->DeviceHandle;
+        {
+            if (!Fallback)
+                Fallback = LoadedImage->DeviceHandle;
+
+            if (!EFI_ERROR(GlobalSystemTable->BootServices->HandleProtocol(LoadedImage->DeviceHandle,
+                                                                           &FwFileSystemGuid,
+                                                                           &DummyFs)))
+            {
+                return LoadedImage->DeviceHandle;
+            }
+        }
 
         Image = LoadedImage->ParentHandle;
     }
 
-    return NULL;
+    return Fallback;
 }
 
 BOOLEAN

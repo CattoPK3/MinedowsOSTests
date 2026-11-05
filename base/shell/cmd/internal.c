@@ -154,15 +154,23 @@ GetRootPath(
     OUT LPTSTR OutPath,
     IN INT size)
 {
+    if (InPath[0] >= _T('0') && InPath[0] <= _T('9'))
+    {
+        INT DriveChars = 0;
+        while (InPath[DriveChars] >= _T('0') && InPath[DriveChars] <= _T('9'))
+            DriveChars++;
+        if (DriveChars != 0 && InPath[DriveChars] == _T(':'))
+        {
+            DWORD Length = GetFullPathName(InPath, size, OutPath, NULL);
+            return Length == 0 || Length >= (DWORD)size;
+        }
+    }
+
     if (InPath[0] && InPath[1] == _T(':'))
     {
         INT t = 0;
 
-        if ((InPath[0] >= _T('0')) && (InPath[0] <= _T('9')))
-        {
-            t = (InPath[0] - _T('0')) + 28;
-        }
-        else if ((InPath[0] >= _T('a')) && (InPath[0] <= _T('z')))
+        if ((InPath[0] >= _T('a')) && (InPath[0] <= _T('z')))
         {
             t = (InPath[0] - _T('a')) + 1;
         }
