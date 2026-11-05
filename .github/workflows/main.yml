@@ -11,11 +11,10 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout LiberNT
+      - name: Checkout MinedowsOS
         uses: actions/checkout@v4
         with:
-          repository: LiberNT/LiberNT
-          ref: main-nt10
+          repository: KRR1751/MinedowsOS
           submodules: recursive
 
       - name: Install build dependencies
@@ -46,7 +45,7 @@ jobs:
 
           ./configure.sh
 
-          ninja -C output-Clang-amd64-debug -j2 \
+          ninja -C output-Clang-amd64-debug -j($nproc) \
             bootcd \
             liberntimg
 
