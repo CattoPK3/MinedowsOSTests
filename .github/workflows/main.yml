@@ -1,0 +1,68 @@
+name: LiberNT Build (AMD64 Debug build)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout LiberNT
+        uses: actions/checkout@v4
+        with:
+          repository: LiberNT/LiberNT
+          ref: main-nt10
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            cmake \
+            ninja-build \
+            build-essential \
+            flex \
+            bison \
+            curl \
+            xz-utils
+
+      - name: Install RosBE
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/LiberNT/libernt-build-toolchain/main/rosbe-unix-bootstrap.sh \
+            | sh
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source "$HOME/.local/opt/rosbe/rosbe-env.sh"
+
+          ./configure.sh
+
+          ninja -C output-Clang-amd64-debug -j2 \
+            bootcd \
+            liberntimg
+
+      - name: Upload bootcd.iso
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiberNT-bootcd-iso
+          path: output-Clang-amd64-debug/bootcd.iso
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload LiberNT.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiberNT-disk-image
+          path: output-Clang-amd64-debug/LiberNT.img
+          if-no-files-found: error
+          compression-level: 0
+
