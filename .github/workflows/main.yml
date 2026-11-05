@@ -34,13 +34,18 @@ jobs:
         run: |
           curl -fsSL https://raw.githubusercontent.com/LiberNT/libernt-build-toolchain/main/rosbe-unix-bootstrap.sh | sh
 
+
       - name: Configure and build
         shell: bash
         run: |
           set -eo pipefail
           source "$HOME/.local/opt/rosbe/rosbe-env.sh"
-          chmod +x ./configure.sh
-          find scripts -type f -exec chmod +x {} +
+
+          # Upstream lost exec bits: restore them on all scripts
+          find . -path ./.git -prune -o -type f \
+            \( -name '*.py' -o -name '*.sh' -o -name '*.pl' -o -name 'feeds' \) \
+            -exec chmod +x {} +
+
           ./configure.sh
           ninja -C output-Clang-amd64-debug -j"$(nproc)" bootcd liberntimg
 
