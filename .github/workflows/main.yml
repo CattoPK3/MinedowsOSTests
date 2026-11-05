@@ -11,12 +11,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout MinedowsOS
-        uses: actions/checkout@v4
-        with:
-          repository: KRR1751/MinedowsOS
-          submodules: recursive
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -39,16 +33,12 @@ jobs:
       - name: Configure and build
         shell: bash
         run: |
-          chmod +x ./configure.sh
-          set -euo pipefail
-
+          set -eo pipefail
           source "$HOME/.local/opt/rosbe/rosbe-env.sh"
-
+          chmod +x ./configure.sh
+          find scripts -type f -exec chmod +x {} +
           ./configure.sh
-
-          ninja -C output-Clang-amd64-debug -j($nproc) \
-            bootcd \
-            liberntimg
+          ninja -C output-Clang-amd64-debug -j"$(nproc)" bootcd liberntimg
 
       - name: Upload bootcd.iso
         uses: actions/upload-artifact@v4
