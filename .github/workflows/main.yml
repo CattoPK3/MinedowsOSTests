@@ -30,6 +30,14 @@ jobs:
             https://raw.githubusercontent.com/LiberNT/libernt-build-toolchain/main/rosbe-unix-bootstrap.sh \
             | sh
 
+      - name: Where am I?
+        run: |
+          pwd
+          git remote -v
+          git log --oneline -3
+          ls -la | head -50
+          ls -la scripts 2>&1 | head -30
+
       - name: Configure and build
         shell: bash
         run: |
