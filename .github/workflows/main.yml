@@ -39,6 +39,7 @@ jobs:
       - name: Configure and build
         shell: bash
         run: |
+          chmod +x ./configure.sh
           set -euo pipefail
 
           source "$HOME/.local/opt/rosbe/rosbe-env.sh"
