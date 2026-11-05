@@ -11,24 +11,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git \
-            cmake \
-            ninja-build \
-            build-essential \
-            flex \
-            bison \
-            curl \
-            xz-utils
-
-      - name: Install RosBE
-        run: |
-          curl -fsSL \
-            https://raw.githubusercontent.com/LiberNT/libernt-build-toolchain/main/rosbe-unix-bootstrap.sh \
-            | sh
+      - name: Checkout MinedowsOS
+        uses: actions/checkout@v4
+        with:
+          repository: KRR1751/MinedowsOS
+          submodules: recursive
 
       - name: Where am I?
         run: |
@@ -37,6 +24,15 @@ jobs:
           git log --oneline -3
           ls -la | head -50
           ls -la scripts 2>&1 | head -30
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake ninja-build build-essential flex bison curl xz-utils
+
+      - name: Install RosBE
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/LiberNT/libernt-build-toolchain/main/rosbe-unix-bootstrap.sh | sh
 
       - name: Configure and build
         shell: bash
@@ -63,4 +59,3 @@ jobs:
           path: output-Clang-amd64-debug/LiberNT.img
           if-no-files-found: error
           compression-level: 0
-
