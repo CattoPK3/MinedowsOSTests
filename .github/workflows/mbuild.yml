@@ -1,4 +1,4 @@
-name: LiberNT Build (AMD64 Debug build)
+name: Manual Build (AMD64 Debug build)
 
 on:
   workflow_dispatch:
