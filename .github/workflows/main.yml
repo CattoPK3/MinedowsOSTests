@@ -11,12 +11,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout MinedowsOS
-        uses: actions/checkout@v4
-        with:
-          repository: KRR1751/MinedowsOS
-          submodules: recursive
-
       - name: Where am I?
         run: |
           pwd
