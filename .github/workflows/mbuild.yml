@@ -15,12 +15,6 @@ jobs:
         with:
           submodules: recursive
       
-      - name: Where am I?
-        run: |
-          pwd
-          ls -la | head -50
-          ls -la scripts 2>&1 | head -30
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -52,11 +46,6 @@ jobs:
         run: |
           set -eo pipefail
           source "$HOME/.local/opt/rosbe/rosbe-env.sh"
-
-          # Upstream lost exec bits: restore them on all scripts
-          find . -path ./.git -prune -o -type f \
-            \( -name '*.py' -o -name '*.sh' -o -name '*.pl' -o -name 'feeds' \) \
-            -exec chmod +x {} +
 
           ./configure.sh
           ninja -C output-Clang-amd64-debug -j"$(nproc)" bootcd liberntimg
